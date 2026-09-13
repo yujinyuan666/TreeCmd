@@ -7,7 +7,8 @@
 
 ## 1. 三十秒速览
 
-**部署形态**：单服务器 · 一个节点一个进程 · 手工放 `node.yaml` 后启动 · 证书由你自己的脚本管理。
+**部署形态**：单服务器 · 一个节点一个进程 · 手工放 `node.yaml` 后启动 · **证书由程序签发与续期**
+（父给子/其它客户端签发 + 运行期续签；**根节点的自签材料**部署时准备一次）。
 
 **角色不用手写，由配置推导出来：**
 
@@ -37,13 +38,13 @@ parents:
 
 | 路径 | 内容 | 谁来放 | 叶子 | 中继 | 根 |
 |---|---|---|---|---|---|
-| `keys/id_ed25519` | 本节点**私钥** | `treecmd-node -genkey` 或你的脚本 | 必需 | 必需 | 必需 |
+| `keys/id_ed25519` | 本节点**私钥** | `treecmd-node -genkey` | 必需 | 必需 | 必需 |
 | `keys/id_ed25519.pub` | 本节点**公钥** | 同上（成对） | 必需 | 必需 | 必需 |
-| `certs/node.crt` | 本节点**身份证书** | 你的脚本，或向父入网换取¹ | 必需¹ | 必需¹ | 必需 |
-| `certs/node.crt.ca` | 本节点**CA 证书**（给子签发） | 你的脚本，或父在入网时一并签发 | — | 必需 | 必需 |
-| `certs/ca.key` | 本节点**CA 私钥**（给子签发）² | `-genkey -with-ca` 或你的脚本 | — | 必需 | 必需 |
-| `trust/*.crt` | **信任锚**（校验父与对端） | 你的证书脚本投放 | 必需 | 必需 | 可选³ |
-| `enroll.token` | **入网许可**（与父端一致，`chmod 600`） | 你的脚本投放 | 需要入网时 | 需要入网时 | — |
+| `certs/node.crt` | 本节点**身份证书** | 根：自签；其余：**向父入网换取**¹（程序签发） | 必需¹ | 必需¹ | 必需 |
+| `certs/node.crt.ca` | 本节点**CA 证书**（给子签发） | 父在入网时一并签发（程序签发） | — | 必需 | 必需 |
+| `certs/ca.key` | 本节点**CA 私钥**（给子签发）² | `treecmd-node -genkey -with-ca` | — | 必需 | 必需 |
+| `trust/*.crt` | **信任锚**（校验父与对端） | 部署时投放（根自签的 CA 证书） | 必需 | 必需 | 可选³ |
+| `enroll.token` | **入网许可**（与父端一致，`chmod 600`） | 部署时投放（两边内容必须一致） | 需要入网时 | 需要入网时 | — |
 
 > ¹ 叶子 / 中继可以先**不放**身份证书：启动会以"待入网"状态起来，向父申请，由父用它自己的 CA 私钥签发后写入 `certs/node.crt`。**根没有父可签发，所以必须自带。**
 > ² CA 私钥**必须是你自己预置的** —— 父不可能把自己的私钥给你。这就是 `-genkey` 要加 `-with-ca` 的原因。
@@ -76,7 +77,7 @@ treecmd-node -genkey -keydir keys -with-ca       # 根 / 中继（有下级，�
 # ① 根：生成密钥对（含 CA）→ 放信任锚 → 自检 → 启动
 cd /srv/treecmd/root
 treecmd-node -genkey -keydir keys -with-ca
-mkdir -p trust certs && cp /你脚本产出的/root_ca.crt trust/
+mkdir -p trust certs && cp <根节点自签产出的 CA 证书> trust/
 cp ../../examples/root.yaml node.yaml        # 改成你的 node.id / listen
 treecmd-node -check -config node.yaml        # 只读自检：不监听、不连接、不落盘
 treecmd-node -config node.yaml
@@ -141,7 +142,7 @@ sleep 2 && curl -s "127.0.0.1:18443/v1/commands/$CID" | python3 -m json.tool
 | `security.enrollment.token` / `token_path` / `challenge_ttl` | **SIGHUP 即刻生效**，不重注册（换 token 不需要重注册） |
 | `node.id`、`parents[]`、`node.labels`、`node.capabilities`、`security.identity_*`、`security.ca_*`、`security.enrollment.enabled|allow_ids`、`registration.backfill` | **SIGHUP ⇒ 自动触发全量重注册**（这些进 `config_hash`，旧会话作废并重连） |
 
-**证书相关（不由 `node.yaml` 控制，由你的脚本触发）：**
+**证书相关（不由 `node.yaml` 控制；签发与续期在程序里，文件被替换时由外部触发重载）：**
 
 | 变更 | 生效范围 |
 |---|---|
@@ -156,7 +157,7 @@ sleep 2 && curl -s "127.0.0.1:18443/v1/commands/$CID" | python3 -m json.tool
 
 | 信号 | 作用 |
 |---|---|
-| `SIGUSR1` | **立即重载证书**（你的脚本换证后发这个，秒级生效；不发也会被轮询发现） |
+| `SIGUSR1` | **立即重载证书**（证书文件被替换后发这个，秒级生效；不发也会被轮询发现） |
 | `SIGHUP` | **配置热更**（重读 `node.yaml`；只改运行参数就原地生效，改了 `config_hash` 字段则全量重注册） |
 | `SIGINT` / `SIGTERM` | 优雅退出 |
 
@@ -173,7 +174,7 @@ sleep 2 && curl -s "127.0.0.1:18443/v1/commands/$CID" | python3 -m json.tool
 | `identity private key ... (私钥必须预置，程序绝不生成)` | 缺私钥文件 | `treecmd-node -genkey -keydir keys` |
 | `identity public key ... (公钥必须预置)` | 缺公钥文件 | 同上（与私钥成对生成） |
 | `does not match private key` / `does not match certificate` | 私钥、公钥、证书三者不配套 | 重新生成密钥对，或换成与该证书配套的密钥 |
-| `cert identity "X" != node id "Y"` | `node.id` 与证书里的身份不一致 | 让两者统一（改 `node.id`，或让脚本按这个 ID 重签） |
+| `cert identity "X" != node id "Y"` | `node.id` 与证书里的身份不一致 | 让两者统一（改 `node.id`，或让签发方按这个 ID 重签） |
 | `CA certificate ... missing（该节点有子节点，必须有 CA 材料）` | 根 / 中继缺 CA 证书 | 用 `-genkey -with-ca` 重新生成，或由脚本投放 `certs/node.crt.ca` |
 | `CA private key missing（本节点有子节点，必须预置）` | 根 / 中继缺 CA 私钥 | 同上（`-with-ca`） |
 | `security.ca_cert_paths: ... no such file or directory` | 信任锚路径不存在 / 目录是空的 | 投放 CA 证书到 `trust/`，或把 `ca_cert_paths` 指向正确位置 |

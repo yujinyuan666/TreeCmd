@@ -357,7 +357,7 @@ func printSampleConfig(role string) error {
 	var header, body string
 	switch role {
 	case "root":
-		header = `# 根节点：没有父，证书（含 CA）必须由你自己的脚本提供（自签 CA 的完整命令见 docs/手动部署指南.md）。
+		header = `# 根节点：没有父可以签发，证书（含 CA）必须自备（自签 CA 的完整命令见 docs/手动部署指南.md）。
 # 它是全树信任锚的持有者（自己的 CA 证书）与最终聚合终点。`
 		body = `node:
   id: 0198f0c0-0000-7000-8000-000000000001     # UUIDv7（等于证书身份）。**也可以留空**：首次启动会自动生成并写回本文件

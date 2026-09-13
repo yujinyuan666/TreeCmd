@@ -380,7 +380,7 @@ func loadRootIdentity(cfg *config.Config, key ed25519.PrivateKey) (*identity.Ide
 	}
 	idChain, err := identity.LoadCertChainFile(cfg.Security.IdentityCertPath)
 	if err != nil {
-		return nil, fmt.Errorf("REFUSE TO START: identity certificate %s: %w (根节点没有父可签发：证书必须自带，或放进 certs/ 由你的脚本投放)",
+		return nil, fmt.Errorf("REFUSE TO START: identity certificate %s: %w (根节点没有父可签发：证书必须自带；自签命令见 docs/手动部署指南.md)",
 			cfg.Security.IdentityCertPath, err)
 	}
 	if cfg.Security.CAKeyPath == "" {

@@ -120,7 +120,7 @@ security:
     # 【可选 · 默认 true】关掉 = 本节点不接受任何入网请求（已自带证书的树可以关）
     enabled: true
     # 【可选】入网许可：父端比对此串；子端提交同一串。两种给法，token_path 优先：
-    #   token_path: 从文件读（推荐，权限 600，便于你的脚本投放 / 轮换）
+    #   token_path: 从文件读（推荐，权限 600，便于部署时投放 / 轮换）
     #   token:      直接写在配置里
     token_path: enroll.token
     # token: <与子节点一致的许可串>
