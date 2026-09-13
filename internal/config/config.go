@@ -569,8 +569,8 @@ func (c *Config) applyDefaults(baseDir string) {
 		mark("identity_cert_path", sec.IdentityCertPath)
 	}
 	if sec.CAKeyPath == "" {
-		sec.CAKeyPath = "certs/ca.key"
-		mark("ca_key_path（有子节点才需要，缺文件不影响叶子启动）", sec.CAKeyPath)
+		sec.CAKeyPath = "keys/ca"
+		mark("ca_key_path（有子节点才需要，缺文件不影响叶子启动；与 -genkey -keydir keys 的产出同名）", sec.CAKeyPath)
 	}
 	if len(sec.CACertPaths) == 0 {
 		// 信任锚：约定目录 trust/（你的证书脚本往这里投 CA 即可，换 CA 也不用改配置）

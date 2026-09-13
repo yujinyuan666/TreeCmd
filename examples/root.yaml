@@ -90,7 +90,7 @@ security:
   # 【可选 · 默认 <身份证书>.ca】建议显式写出来，别依赖推导
   ca_cert_path: certs/node.crt.ca
   # 【可选 · 默认 certs/ca.key】给子节点签发的 CA 私钥；缺文件时：叶子不受影响，根/中继拒绝启动
-  ca_key_path: certs/ca.key
+  ca_key_path: keys/ca
 
   # ===== 信任锚：校验父与其它对端用 =====
   # 【非根必填】可以给**文件**，也可以给**目录**（目录下 *.crt / *.pem 全部加载）。

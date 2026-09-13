@@ -78,9 +78,9 @@ security:
 
   # ===== ② 我自己的 CA 材料：**中继有下级，必须有** =====
   # 用于给"我的子节点"签证书（含运行期入网）。缺了它们中继拒绝启动。
-  # 默认推导：ca_cert_path = <身份证书>.ca、ca_key_path = certs/ca.key
+  # 默认推导：ca_cert_path = <身份证书>.ca、ca_key_path = keys/ca
   ca_cert_path: certs/node.crt.ca
-  ca_key_path: certs/ca.key
+  ca_key_path: keys/ca
   # 若走"入网"拿到身份证书，父会把 CA 证书一并签发下来写入 certs/node.crt.ca；
   # 但 **CA 私钥必须是你自己预置的**（父不可能给你它的私钥）—— 这就是要 -with-ca 的原因。
 

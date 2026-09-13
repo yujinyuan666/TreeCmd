@@ -386,9 +386,11 @@ security:
     on_change: reconnect     # reconnect=本节点证书/私钥变了就主动重连；lazy=只对新连接生效
     # paths: []              # 留空 = 自动监视身份私钥/公钥/证书 + CA 证书/私钥 + 信任锚
 
-  # 运行期入网签发：根不需要（没有父），留空即可
+  # 运行期入网签发：**根必须开启** —— 根没有父，自己不用入网，
+  # 但它是**签发方**：子节点上线时向根申请证书，关闭了根就会拒绝一切申请（ERR_ENROLL_DISABLED）。
   enrollment:
-    enabled: false
+    enabled: true               # 允许子节点/其它客户端来换取证书
+    token_path: enroll.token    # 入网许可；两边内容必须一致（也可直接写 token:）
 
 api:
   http_addr: 127.0.0.1:18443                    # 提交指令 / 查结果 / 健康检查
@@ -434,7 +436,7 @@ parents:
 #   identity_pubkey_path: keys/id_ed25519.pub
 #   identity_cert_path: certs/node.crt
 #   ca_cert_paths: [trust]        # 信任锚目录
-#   ca_key_path: certs/ca.key     # 只有"还有下级"的中继才需要
+#   ca_key_path: keys/ca          # 只有"还有下级"的中继才需要
 #   cert_reload: { enabled: true, interval: 30s, on_change: reconnect }
 #   enrollment: { enabled: true, token_path: enroll.token }`
 	case "relay":

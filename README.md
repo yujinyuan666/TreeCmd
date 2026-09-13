@@ -60,9 +60,13 @@ curl -s 'localhost:18443/v1/health?depth=-1&detail=true&timeout=20s'   # 逐层�
 > 补充：**根节点仍然必须自带证书**（没有父可以签发它）。"根 + 无证书"会拒绝启动，
 > 与 id 写没写无关 —— id 可以从证书取，证书本身没有就只能自带。
 
-### 手工部署（三种便捷入口）
+### 手工部署（四个便捷入口）
 
 ```bash
+# 根节点**首次启动前**：生成它自己的信任锚材料（一次性 bootstrap，见 docs/手动部署指南.md 第二节）
+# 根没有父，没有谁能给它签发证书，所以这一步必须在根的第一次启动之前做一次
+./scripts/init_root.sh <节点目录> <根节点ID>
+
 # 生成带注释的样例配置：root（完整）/ child（最小：只需要"我是谁 + 父地址"）/ relay / leaf
 ./bin/treecmd-node -print-sample-config child > node.yaml
 
@@ -161,6 +165,7 @@ examples/                   手工部署样例（阅读版）
   root.yaml                 根节点：全字段详解（每个字段标了必填/可选/默认值）
   relay.yaml                中继节点：唯一同时要"上行 + 下行"两侧材料的角色
   child.yaml                叶子节点：最小形态（只需"我是谁 + 父地址"）+ 约定与默认值全表
+scripts/init_root.sh        根节点首次启动前的自签材料（一次性 bootstrap；其后签发与续期都归程序）
 scripts/start_node.sh       单节点起停 / 自检 / 换证重载（SIGUSR1）/ 配置热更（SIGHUP）
 docs/                       手动部署指南、差异处理方案、项目功能完整介绍、代码注释规范
 ```
