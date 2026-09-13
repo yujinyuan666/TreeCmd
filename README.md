@@ -83,6 +83,20 @@ curl -s 'localhost:18443/v1/health?depth=-1&detail=true&timeout=20s'   # 逐层�
 ./scripts/start_node.sh stop   <node.yaml>
 ```
 
+### 可视化测试台（`test/`）
+
+只想"看着"一棵树跑起来，不用手工敲 curl：
+
+```bash
+cd test
+./demo.sh start     # 起 根 + 直接叶子 + 中继 + 中继下的叶子（3 层）+ 网页控制台
+# 浏览器开 http://127.0.0.1:8899/  —— 提交指令、跟进度、看 TREE 聚合结果、扫全树健康、看指标
+./demo.sh stop
+```
+
+控制台是单文件网页（零依赖、可离线），配一个**只转发本机**的本地代理解决跨源；
+`./demo.sh start` 起的是一棵**真实进程树**，不是 mock。细节见 `test/README.md`。
+
 **子节点的配置可以只有两项**（其余按约定补全：`keys/id_ed25519`、`certs/node.crt`、`trust/`、`enroll.token`…）：
 
 ```yaml
@@ -169,6 +183,10 @@ examples/                   手工部署样例（阅读版）
   child.yaml                叶子节点：最小形态（只需"我是谁 + 父地址"）+ 约定与默认值全表
 scripts/init_root.sh        根节点首次启动前的自签材料（一次性 bootstrap；其后签发与续期都归程序）
 scripts/start_node.sh       单节点起停 / 自检 / 换证重载（SIGUSR1）/ 配置热更（SIGHUP）
+test/                       可视化测试台：本地网页 + 反向代理 + 一键起演示树（见 test/README.md）
+  index.html                单文件控制台（零依赖、可离线）：总览 / 拓扑 / 健康 / 指令 / 指标
+  serve.py                  本地静态服务 + /api 反向代理（默认只转发本机，零依赖）
+  demo.sh                   一键起"根 + 直接叶子 + 中继 + 中继下的叶子"（3 层）+ 起控制台
 docs/                       手动部署指南、差异处理方案、项目功能完整介绍、代码注释规范
 ```
 

@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>treecmd 可视化测试台</title>
+<style>
+:root{
+  --bg:#f6f7f9; --panel:#fff; --panel2:#fbfbfc; --line:#e3e6ea; --line2:#eef0f3;
+  --fg:#1d2126; --fg2:#5a636e; --fg3:#8b939d; --accent:#2f6fd0; --accent-fg:#fff;
+  --ok:#1f8a4c; --ok-bg:#e8f6ec; --warn:#9a6b00; --warn-bg:#fdf3dc; --bad:#c0392b; --bad-bg:#fdecea;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#16191d; --panel:#1e2227; --panel2:#23272d; --line:#2f353c; --line2:#282d33;
+    --fg:#e6e8ea; --fg2:#a8b0b9; --fg3:#767e87; --accent:#5b9bf0; --accent-fg:#0e1216;
+    --ok:#5cc98a; --ok-bg:#17301f; --warn:#e0b355; --warn-bg:#332a12; --bad:#f08a80; --bad-bg:#33191a;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:13px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",system-ui,sans-serif}
+code,kbd,pre,.mono{font-family:var(--mono);font-size:12px}
+a{color:var(--accent)}
+
+header{position:sticky;top:0;z-index:10;background:var(--panel);border-bottom:1px solid var(--line);
+  padding:10px 16px;display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+h1{margin:0;font-size:14px;font-weight:600;letter-spacing:.2px}
+h1 small{font-weight:400;color:var(--fg3);margin-left:6px}
+.spacer{flex:1}
+.field{display:flex;align-items:center;gap:6px}
+label{color:var(--fg2)}
+input,select,textarea,button{font:inherit;color:var(--fg);background:var(--panel2);
+  border:1px solid var(--line);border-radius:8px;padding:5px 9px;outline:none}
+input:focus,select:focus,textarea:focus{border-color:var(--accent)}
+textarea{font-family:var(--mono);font-size:12px;resize:vertical}
+button{cursor:pointer;background:var(--panel2)}
+button:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);color:var(--accent-fg);border-color:var(--accent);font-weight:600}
+button.primary:hover{filter:brightness(1.06)}
+button:disabled{opacity:.5;cursor:not-allowed}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--fg3);display:inline-block}
+.dot.ok{background:var(--ok)} .dot.bad{background:var(--bad)} .dot.warn{background:var(--warn)}
+
+nav{display:flex;gap:2px;padding:0 16px;background:var(--panel);border-bottom:1px solid var(--line);
+  position:sticky;top:53px;z-index:9;overflow-x:auto}
+nav button{border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent;
+  padding:9px 12px;color:var(--fg2);white-space:nowrap}
+nav button[aria-selected=true]{color:var(--fg);border-bottom-color:var(--accent);font-weight:600}
+
+main{padding:16px;max-width:1180px;margin:0 auto}
+section[hidden]{display:none}
+.grid{display:grid;gap:12px}
+.g2{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+.g3{grid-template-columns:repeat(auto-fit,minmax(210px,1fr))}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.card h2{margin:0 0 8px;font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px}
+.card h2 .hint{font-weight:400;color:var(--fg3);font-size:12px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;align-items:baseline}
+.kv dt{color:var(--fg2)}
+.kv dd{margin:0;word-break:break-all}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--line2);vertical-align:top}
+th{color:var(--fg2);font-weight:500}
+td.num,th.num{text-align:right;font-family:var(--mono)}
+.badge{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px;font-weight:600;
+  background:var(--line2);color:var(--fg2)}
+.badge.ok{background:var(--ok-bg);color:var(--ok)}
+.badge.warn{background:var(--warn-bg);color:var(--warn)}
+.badge.bad{background:var(--bad-bg);color:var(--bad)}
+.badge.info{background:rgba(47,111,208,.12);color:var(--accent)}
+.node-row{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line2)}
+.node-row:last-child{border-bottom:0}
+.node-row .nm{font-weight:600}
+.node-row .sub{color:var(--fg3);font-size:12px}
+pre{margin:6px 0 0;padding:9px 10px;background:var(--panel2);border:1px solid var(--line2);
+  border-radius:8px;overflow:auto;max-height:340px;white-space:pre-wrap;word-break:break-all}
+details{margin:4px 0}
+details>summary{cursor:pointer;color:var(--fg2)}
+details>summary:hover{color:var(--accent)}
+.muted{color:var(--fg3)}
+.warnbox{background:var(--warn-bg);color:var(--warn);border-radius:8px;padding:8px 10px;margin:8px 0}
+.errbox{background:var(--bad-bg);color:var(--bad);border-radius:8px;padding:8px 10px;margin:8px 0;
+  white-space:pre-wrap;word-break:break-all}
+.presets{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+.timeline{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:12px;color:var(--fg2)}
+.timeline .t{background:var(--panel2);border:1px solid var(--line2);border-radius:999px;padding:1px 8px}
+.bar{height:6px;background:var(--line2);border-radius:999px;overflow:hidden;margin-top:6px}
+.bar>i{display:block;height:100%;background:var(--accent)}
+.bar>i.ok{background:var(--ok)} .bar>i.bad{background:var(--bad)}
+footer{color:var(--fg3);padding:18px 16px 32px;max-width:1180px;margin:0 auto;font-size:12px}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>treecmd 可视化测试台<small id="rootName"></small></h1>
+  <div class="field">
+    <label for="target">目标</label>
+    <input id="target" size="22" placeholder="127.0.0.1:18443" spellcheck="false">
+    <button id="btnConnect" class="primary">连接</button>
+  </div>
+  <div class="field"><span class="dot" id="statusDot"></span><span id="statusText" class="muted">未连接</span></div>
+  <div class="spacer"></div>
+  <div class="field">
+    <label for="autoRefresh"><input type="checkbox" id="autoRefresh"> 自动刷新</label>
+    <button id="btnRefresh">刷新</button>
+  </div>
+</header>
+
+<nav id="tabs">
+  <button data-tab="overview" aria-selected="true">总览</button>
+  <button data-tab="tree" aria-selected="false">拓扑</button>
+  <button data-tab="health" aria-selected="false">健康</button>
+  <button data-tab="cmd" aria-selected="false">指令</button>
+  <button data-tab="metrics" aria-selected="false">指标</button>
+</nav>
+
+<main>
+  <!-- ================= 总览 ================= -->
+  <section id="tab-overview">
+    <div id="connErr"></div>
+    <div class="grid g3" id="ovCards"></div>
+    <div class="grid g2" style="margin-top:12px">
+      <div class="card">
+        <h2>根节点 <span class="hint">来自 /v1/tree</span></h2>
+        <div id="ovRoot" class="muted">点上面的「连接」开始。</div>
+      </div>
+      <div class="card">
+        <h2>直接子节点 <span class="hint" id="ovChildHint"></span></h2>
+        <div id="ovChildren" class="muted">—</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 拓扑 ================= -->
+  <section id="tab-tree" hidden>
+    <div class="card">
+      <h2>本节点视角的拓扑 <span class="hint">GET /v1/tree</span></h2>
+      <div class="warnbox">这一份是**本节点视角**：只有自己和**直接子节点**。
+        更深层要逐节点查（子节点的 API 地址不在这个响应里），所以下面的「健康」标签页也是同样的深度。</div>
+      <div id="treeBox">—</div>
+    </div>
+  </section>
+
+  <!-- ================= 健康 ================= -->
+  <section id="tab-health" hidden>
+    <div class="card">
+      <h2>健康扫描 <span class="hint">GET /v1/health?depth=-1&amp;detail=true</span></h2>
+      <div class="field" style="margin-bottom:8px">
+        <label for="healthTimeout">timeout</label>
+        <input id="healthTimeout" size="6" value="20s">
+        <button id="btnHealth">扫描</button>
+        <span class="muted">全树逐跳签名 + 四步校验；节点多时给足预算</span>
+      </div>
+      <div id="healthBox" class="muted">—</div>
+    </div>
+  </section>
+
+  <!-- ================= 指令 ================= -->
+  <section id="tab-cmd" hidden>
+    <div class="grid g2">
+      <div class="card">
+        <h2>提交指令 <span class="hint">POST /v1/commands</span></h2>
+        <div class="presets" id="presets"></div>
+        <table style="margin-bottom:8px">
+          <tr><th style="width:88px">type</th><td>
+            <select id="fType">
+              <option value="echo">echo — 回显载荷</option>
+              <option value="noop">noop — 什么都不做</option>
+              <option value="sleep">sleep — 睡 N 毫秒</option>
+              <option value="fail">fail — 故意失败（测失败传播）</option>
+            </select></td></tr>
+          <tr><th>payload</th><td><input id="fPayload" style="width:100%" placeholder="echo 填文本；sleep 填毫秒数；fail 空=fail 全树，k=v=只让标签匹配的节点失败" spellcheck="false"></td></tr>
+          <tr><th>aggregate</th><td>
+            <select id="fAgg"><option>TREE</option><option>MERGE</option><option>SUM</option><option>COUNT</option></select></td></tr>
+          <tr><th>on_failure</th><td>
+            <input id="fOnFail" style="width:100%" value="ALL_MUST_SUCCEED"
+              placeholder="ALL_MUST_SUCCEED | TOLERATE_N:2 | TOLERATE_PCT:0.1 | BEST_EFFORT" spellcheck="false"></td></tr>
+          <tr><th>target</th><td>
+            <select id="fTarget"><option value="SUBTREE">SUBTREE（全子树，当前唯一支持）</option>
+              <option value="NODE">NODE（已下线，会被 400 拒绝）</option>
+              <option value="SELECTOR">SELECTOR（已下线，会被 400 拒绝）</option></select></td></tr>
+          <tr><th>可选</th><td>
+            <label><input type="checkbox" id="fRaw"> raw_children</label>
+            <label style="margin-left:12px"><input type="checkbox" id="fIdem"> idempotent</label>
+            <label style="margin-left:12px">attest_depth <input id="fAttest" size="3" placeholder="—"></label>
+          </td></tr>
+        </table>
+        <div class="field">
+          <button id="btnSubmit" class="primary">提交并跟踪结果</button>
+          <button id="btnClearLog">清空日志</button>
+          <span class="muted" id="payloadPreview"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>结果</h2>
+        <div id="cmdTimeline" class="timeline muted">还没有提交。</div>
+        <div id="cmdResult"></div>
+        <div id="cmdActions" class="field" style="margin-top:10px" hidden>
+          <button id="btnCancel">取消指令</button>
+          <div class="field"><label for="retryNode">retry node</label>
+            <select id="retryNode"></select><button id="btnRetry">重试该子节点</button></div>
+        </div>
+        <div id="cmdTrace"></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <h2>本次会话的指令日志 <span class="hint">存在浏览器本地，刷新不丢</span></h2>
+      <div id="logBox" class="muted">—</div>
+    </div>
+  </section>
+
+  <!-- ================= 指标 ================= -->
+  <section id="tab-metrics" hidden>
+    <div class="grid g3" id="metricCards"></div>
+    <div class="card" style="margin-top:12px">
+      <h2>全部指标 <span class="hint" id="metricHint">GET /metrics（Prometheus 文本）</span></h2>
+      <div id="metricBox" class="muted">—</div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  控制台只读程序的 HTTP API，不改它的任何状态（取消/重试除外，那两个是你主动点的按钮）。<br>
+  跨源问题由本地代理 <code>serve.py</code> 解决：页面走同源 <code>/api/&lt;path&gt;</code> 转发到你填的目标地址。<br>
+  直接双击打开本文件也能用（此时默认代理 <code>http://127.0.0.1:8899</code>）。
+</footer>
+
+<script>
+'use strict';
+/* ------------------------------------------------------------------ *
+ * 基础
+ * ------------------------------------------------------------------ */
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+// file:// 直接打开时，得显式指向本地代理
+const API_BASE = location.protocol === 'file:' ? 'http://127.0.0.1:8899' : '';
+
+const state = {
+  target: localStorage.getItem('tc_target') || '127.0.0.1:18443',
+  connected: false,
+  tree: null,
+  health: null,
+  metrics: null,
+  lastCmd: null,
+  timer: null,
+};
+
+function apiUrl(path) {
+  const sep = path.includes('?') ? '&' : '?';
+  return `${API_BASE}/api${path}${sep}__target=${encodeURIComponent(state.target)}`;
+}
+
+async function api(path, opts) {
+  const res = await fetch(apiUrl(path), opts);
+  const text = await res.text();
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch { body = text; }
+  return { ok: res.ok, status: res.status, body };
+}
+
+function setStatus(kind, text) {
+  $('statusDot').className = 'dot ' + kind;
+  $('statusText').textContent = text;
+}
+
+function showErr(msg) { $('connErr').innerHTML = msg ? `<div class="errbox">${esc(msg)}</div>` : ''; }
+
+function b64(str) {                       // UTF-8 安全的 base64
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  bytes.forEach(b => bin += String.fromCharCode(b));
+  return btoa(bin);
+}
+
+function statusBadge(s) {
+  const t = String(s || '').replace('COMMAND_STATUS_', '');
+  const cls = {COMPLETED:'ok', FAILED:'bad', RUNNING:'info', CANCELED:'warn', PARTIAL:'warn'}[t] || '';
+  return `<span class="badge ${cls}">${esc(t)}</span>`;
+}
+
+function healthBadge(s) {
+  const map = {HEALTHY:'ok', DEGRADED:'warn', UNHEALTHY:'bad', UNREACHABLE:'bad'};
+  return `<span class="badge ${map[s] || ''}">${esc(s || '?')}</span>`;
+}
+
+/* 递归渲染任意 JSON（结果体里的 TREE 聚合就是嵌套结构） */
+function jsonTree(v, depth = 0) {
+  if (v === null || typeof v !== 'object') {
+    const cls = typeof v === 'number' ? 'num' : '';
+    return `<span class="mono ${cls}">${esc(JSON.stringify(v))}</span>`;
+  }
+  const isArr = Array.isArray(v);
+  const keys = Object.keys(v);
+  if (!keys.length) return `<span class="mono">${isArr ? '[]' : '{}'}</span>`;
+  const open = depth < 2 ? ' open' : '';
+  return `<details${open}><summary><span class="mono">${isArr ? `[${keys.length}]` : `{${keys.length}}`}</span></summary>`
+    + `<div style="padding-left:14px">` + keys.map(k =>
+        `<div><span class="mono muted">${esc(k)}</span>: ${jsonTree(v[k], depth + 1)}</div>`).join('') 
+    + `</div></details>`;
+}
+
+/* ------------------------------------------------------------------ *
+ * 标签页
+ * ------------------------------------------------------------------ */
+$('tabs').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-tab]');
+  if (!b) return;
+  [...$('tabs').children].forEach(x => x.setAttribute('aria-selected', String(x === b)));
+  ['overview','tree','health','cmd','metrics'].forEach(t => { $('tab-' + t).hidden = (t !== b.dataset.tab); });
+  if (b.dataset.tab === 'health' && state.connected && !state.health) loadHealth();
+  if (b.dataset.tab === 'metrics' && state.connected && !state.metrics) loadMetrics();
+});
+
+/* ------------------------------------------------------------------ *
+ * 连接 / 刷新
+ * ------------------------------------------------------------------ */
+async function connect() {
+  state.target = $('target').value.trim() || state.target;
+  localStorage.setItem('tc_target', state.target);
+  showErr('');
+  setStatus('warn', '连接中…');
+  try {
+    const z = await api('/v1/healthz');
+    if (!z.ok) throw new Error(`/v1/healthz → HTTP ${z.status} ${typeof z.body === 'string' ? z.body : JSON.stringify(z.body)}`);
+    state.connected = true;
+    await loadTree();
+    setStatus('ok', '已连接');
+  } catch (e) {
+    state.connected = false;
+    setStatus('bad', '连接失败');
+    showErr(`连不上 ${state.target}：${e.message}\n`
+      + `排查：① 根节点起来了吗（scripts/start_node.sh <node.yaml> status）\n`
+      + `        ② 目标的 api.http_addr 与端口填对了吗\n`
+      + `        ③ 代理默认只允许转发到本机，指向远程节点要加 --allow-any-host`);
+  }
+}
+
+async function refreshAll() {
+  if (!state.connected) return connect();
+  await Promise.all([loadTree(), loadMetricsIfVisible(), loadHealthIfVisible()]);
+}
+
+/* ------------------------------------------------------------------ *
+ * 拓扑
+ * ------------------------------------------------------------------ */
+const ROLE_CN = {root:'根', relay:'中继', leaf:'叶子'};
+
+async function loadTree() {
+  const r = await api('/v1/tree');
+  if (!r.ok) { showErr(`/v1/tree → HTTP ${r.status}`); return; }
+  state.tree = r.body;
+  const d = r.body;
+  $('rootName').textContent = d.node_name ? `· ${d.node_name}` : '';
+
+  $('ovCards').innerHTML = [
+    card('角色', `${ROLE_CN[d.role] || d.role || '—'}`, d.listen || ''),
+    card('直接子节点', `${d.conn_children ?? 0} 在线 / ${(d.children || []).length} 已知`, 'conn_children'),
+    card('结果索引', String(d.index_entries ?? 0), 'index_entries'),
+  ].join('');
+
+  $('ovRoot').innerHTML = `<dl class="kv">
+    <dt>node_id</dt><dd class="mono">${esc(d.node_id)}</dd>
+    <dt>name</dt><dd>${esc(d.node_name || '—')}</dd>
+    <dt>remark</dt><dd>${esc(d.node_remark || '—')}</dd>
+    <dt>path</dt><dd class="mono">${esc(d.path)}</dd>
+    <dt>listen</dt><dd class="mono">${esc(d.listen || '—（根没配 listen 就不对外收注册）')}</dd>
+    <dt>labels</dt><dd class="mono">${esc(JSON.stringify(d.labels))}</dd>
+    <dt>caps</dt><dd class="mono">${esc(JSON.stringify(d.caps))}</dd>
+    <dt>对象存储</dt><dd class="mono">${esc(d.object_store || '—')}</dd>
+  </dl>`;
+
+  $('ovChildHint').textContent = '只看得到直接子';
+  $('ovChildren').innerHTML = (d.children || []).length
+    ? d.children.map(c => `<div class="node-row">
+        <span class="dot ${c.online ? 'ok' : 'bad'}"></span>
+        <span class="nm">${esc(c.node_name || '(未命名)')}</span>
+        <span class="sub">${esc(c.node_remark || '')}</span>
+        <span class="spacer"></span>
+        <span class="mono sub">${esc((c.node_id || '').slice(0, 8))}</span>
+      </div>`).join('')
+    : '<span class="muted">当前没有子节点连上来</span>';
+
+  $('treeBox').innerHTML = `
+    <div class="node-row" style="border-bottom:1px solid var(--line)">
+      <span class="dot ok"></span><span class="nm">${esc(d.node_name || '(未命名)')}</span>
+      <span class="badge info">${esc(ROLE_CN[d.role] || d.role)}</span>
+      <span class="sub">${esc(d.node_remark || '')}</span>
+      <span class="spacer"></span><span class="mono sub">${esc(d.path)}</span>
+    </div>
+    <div style="padding-left:22px">
+      ${(d.children || []).map(c => `<div class="node-row">
+        <span class="dot ${c.online ? 'ok' : 'bad'}"></span>
+        <span class="nm">${esc(c.node_name || '(未命名)')}</span>
+        <span class="sub">${esc(c.node_remark || '')}</span>
+        <span class="spacer"></span>
+        <span class="sub mono">${esc(c.node_id)}</span>
+        <span class="sub">caps=${esc((c.caps || []).join(','))}</span>
+      </div>`).join('') || '<div class="muted" style="padding:6px 0">（无直接子节点）</div>'}
+    </div>`;
+
+  // 重试下拉：用直接子节点填
+  $('retryNode').innerHTML = (d.children || []).map(c =>
+    `<option value="${esc(c.node_id)}">${esc(c.node_name || c.node_id.slice(0, 8))}</option>`).join('');
+}
+
+function card(title, big, sub) {
+  return `<div class="card"><h2>${esc(title)}</h2>
+    <div style="font-size:22px;font-weight:600;line-height:1.25">${esc(big)}</div>
+    <div class="muted">${esc(sub || '')}</div></div>`;
+}
+
+/* ------------------------------------------------------------------ *
+ * 健康
+ * ------------------------------------------------------------------ */
+async function loadHealth() {
+  const to = $('healthTimeout').value.trim() || '20s';
+  $('healthBox').innerHTML = '<span class="muted">扫描中…（全树逐跳签名，节点多会慢）</span>';
+  const r = await api(`/v1/health?depth=-1&detail=true&timeout=${encodeURIComponent(to)}`);
+  if (!r.ok) { $('healthBox').innerHTML = `<div class="errbox">HTTP ${r.status}：${esc(typeof r.body === 'string' ? r.body : JSON.stringify(r.body))}</div>`; return; }
+  const d = r.body; state.health = d;
+  const h = d.health || {};
+  const sm = h.summary || {};
+  const m = h.metrics || {};
+  const kids = h.children || [];
+
+  $('healthBox').innerHTML = `
+    <div class="grid g3" style="margin-bottom:10px">
+      ${card('整体', (h.status || '—'), `根：${d.node_name || d.node_id.slice(0, 8)}`)}
+      ${card('子树节点数', `${sm.total ?? '—'}`, `healthy ${sm.healthy ?? '—'} · <b>不含本节点自己</b>（COUNT 聚合会多 1）${sm.truncated ? ' · 被预算截断' : ''}`)}
+      ${card('内存 / 运行', `${m.mem_mb != null ? Number(m.mem_mb).toFixed(1) + ' MB' : '—'}`, `uptime ${m.uptime_seconds ?? '—'}s · inflight ${m.inflight ?? '—'}`)}
+    </div>
+    <h2 style="font-size:13px;margin:10px 0 4px">本节点自检 <span class="hint">checks</span></h2>
+    <table>${(h.checks || []).map(c =>
+      `<tr><td style="width:170px">${esc(c.name)}</td><td>${healthBadge(c.status)}</td><td class="muted">${esc(c.detail || '')}</td></tr>`).join('')}</table>
+    <h2 style="font-size:13px;margin:14px 0 4px">直接子节点
+      <span class="hint">JSON 只展开这一层；更深层用 children_online 表示"它下面还连着几个"。汇总 total 是逐层累加的，但语义是<b>不含本节点自己</b></span></h2>
+    <table><tr><th>节点</th><th>状态</th><th>备注</th><th class="num">它下面的在线子节点</th><th>err</th></tr>
+      ${kids.map(c => `<tr>
+        <td>${esc(c.node_name || '(未命名)')}<div class="mono muted">${esc((c.node_id || '').slice(0, 8))}</div></td>
+        <td>${healthBadge(c.status)}</td><td class="muted">${esc(c.node_remark || '')}</td>
+        <td class="num">${c.children_online ?? 0}</td>
+        <td class="muted">${esc(c.err || '')}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">无直接子节点</td></tr>'}
+    </table>
+    <details style="margin-top:10px"><summary>完整 JSON</summary><pre>${esc(JSON.stringify(d, null, 2))}</pre></details>`;
+}
+
+function loadHealthIfVisible() { return $('tab-health').hidden ? null : loadHealth(); }
+
+/* ------------------------------------------------------------------ *
+ * 指标
+ * ------------------------------------------------------------------ */
+function parsePrometheus(text) {
+  const items = [];
+  for (const line of text.split('\n')) {
+    const s = line.trim();
+    if (!s || s.startsWith('# HELP') || s.startsWith('# TYPE')) continue;
+    const mm = s.match(/^([a-zA-Z_:][\w:]*)(\{[^}]*\})?\s+(.+)$/);
+    if (!mm) continue;
+    items.push({ name: mm[1], labels: (mm[2] || '').replace(/^\{|\}$/g, ''), value: mm[3] });
+  }
+  return items;
+}
+
+async function loadMetrics() {
+  const r = await api('/metrics');
+  if (!r.ok) { $('metricBox').innerHTML = `<div class="errbox">HTTP ${r.status}</div>`; return; }
+  const text = typeof r.body === 'string' ? r.body : JSON.stringify(r.body);
+  const items = parsePrometheus(text);
+  state.metrics = items;
+  const get = (n) => { const it = items.filter(x => x.name === n); return it.length ? Number(it[0].value) : null; };
+
+  const cards = [
+    ['直接子节点', get('children_count'), 'children_count'],
+    ['已知子节点', get('children_known'), 'children_known'],
+    ['证书剩余天数', get('cert_not_after_days'), 'cert_not_after_days — 负数=已过期'],
+    ['在途指令', get('command_inflight'), 'command_inflight'],
+    ['补报积压', get('pending_result_backlog'), 'pending_result_backlog'],
+    ['保留水位', get('retention_floor'), 'retention_floor'],
+    ['近 1h 失败率', get('fail_rate_1h'), 'fail_rate_1h'],
+    ['时钟偏移', get('clock_offset_ms'), 'clock_offset_ms（毫秒 EWMA）'],
+  ];
+  $('metricCards').innerHTML = cards.map(([t, v, s]) => card(t, v == null ? '—' : String(v), s)).join('');
+  $('metricHint').textContent = `GET /metrics · 共 ${items.length} 条`;
+  $('metricBox').innerHTML = `<table><tr><th>指标</th><th>labels</th><th class="num">值</th></tr>
+    ${items.map(x => `<tr><td class="mono">${esc(x.name)}</td><td class="mono muted">${esc(x.labels)}</td>
+      <td class="num">${esc(x.value)}</td></tr>`).join('')}</table>`;
+}
+
+function loadMetricsIfVisible() { return $('tab-metrics').hidden ? null : loadMetrics(); }
+
+/* ------------------------------------------------------------------ *
+ * 预设场景（对应平时手工测的那几种）
+ * ------------------------------------------------------------------ */
+const PRESETS = [
+  { n: '全树 echo（TREE）',    type:'echo',  payload:'hello', agg:'TREE',  onfail:'ALL_MUST_SUCCEED' },
+  { n: '全树计数（COUNT）',    type:'noop',  payload:'',      agg:'COUNT', onfail:'ALL_MUST_SUCCEED' },
+  { n: '慢指令 sleep 2s',      type:'sleep', payload:'2000',  agg:'TREE',  onfail:'ALL_MUST_SUCCEED' },
+  { n: '全树失败（fail）',     type:'fail',  payload:'',      agg:'TREE',  onfail:'ALL_MUST_SUCCEED' },
+  { n: '全树失败 + BEST_EFFORT', type:'fail', payload:'',     agg:'TREE',  onfail:'BEST_EFFORT' },
+  { n: '失败 + TOLERATE_N:2',  type:'fail',  payload:'',      agg:'TREE',  onfail:'TOLERATE_N:2' },
+  { n: '标签筛选失败 k=v',      type:'fail',  payload:'zone=east', agg:'TREE', onfail:'ALL_MUST_SUCCEED' },
+  { n: '大载荷 64KB（看分片）',  type:'echo',  payload:'x'.repeat(65536), agg:'TREE', onfail:'ALL_MUST_SUCCEED' },
+];
+
+$('presets').innerHTML = PRESETS.map((p, i) => `<button data-preset="${i}">${esc(p.n)}</button>`).join('');
+$('presets').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-preset]');
+  if (!b) return;
+  const p = PRESETS[+b.dataset.preset];
+  $('fType').value = p.type; $('fPayload').value = p.payload;
+  $('fAgg').value = p.agg; $('fOnFail').value = p.onfail;
+  updatePreview();
+});
+
+function updatePreview() {
+  const t = $('fType').value, p = $('fPayload').value;
+  const bytes = new TextEncoder().encode(p).length;
+  $('payloadPreview').textContent = p ? `payload ${bytes} 字节 → base64 ${b64(p).slice(0, 24)}${b64(p).length > 24 ? '…' : ''}` : '';
+}
+['fType','fPayload'].forEach(id => $(id).addEventListener('input', updatePreview));
+
+/* ------------------------------------------------------------------ *
+ * 提交与轮询
+ * ------------------------------------------------------------------ */
+function bodyFromForm() {
+  const body = {
+    type: $('fType').value,
+    payload: b64($('fPayload').value),
+    target: { mode: $('fTarget').value },
+    aggregate: $('fAgg').value,
+    on_failure: $('fOnFail').value.trim() || 'ALL_MUST_SUCCEED',
+  };
+  if ($('fRaw').checked) body.raw_children = true;
+  if ($('fIdem').checked) body.idempotent = true;
+  const ad = $('fAttest').value.trim();
+  if (ad !== '') body.attest_depth = Number(ad);
+  return body;
+}
+
+async function submitCmd() {
+  if (!state.connected) { await connect(); if (!state.connected) return; }
+  const body = bodyFromForm();
+  const t0 = performance.now();
+  $('cmdResult').innerHTML = '';
+  $('cmdActions').hidden = true;
+  $('cmdTrace').innerHTML = '';
+  $('cmdTimeline').innerHTML = '<span class="t">提交中…</span>';
+  const r = await api('/v1/commands', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const msg = r.body && r.body.error ? `${r.body.error}：${r.body.detail || ''}` : JSON.stringify(r.body);
+    $('cmdTimeline').innerHTML = `<span class="t">已拒绝</span>`;
+    $('cmdResult').innerHTML = `<div class="errbox">HTTP ${r.status}\n${esc(msg)}</div>`;
+    logCmd({ ...body, status: `HTTP ${r.status}`, error: msg });
+    return;
+  }
+  const { command_id } = r.body;
+  state.lastCmd = command_id;
+  $('cmdTimeline').innerHTML = `<span class="t">202 Accepted</span><span class="t mono">${esc(command_id)}</span>`
+    + `<span class="t">owner_path ${esc(r.body.owner_path)}</span><span class="t">local_seq ${r.body.local_seq}</span>`;
+  $('cmdActions').hidden = false;
+  pollCmd(command_id, t0);
+}
+
+const TERMINAL = ['COMMAND_STATUS_COMPLETED', 'COMMAND_STATUS_FAILED', 'COMMAND_STATUS_CANCELED'];
+
+async function pollCmd(id, t0, round = 1) {
+  const r = await api(`/v1/commands/${encodeURIComponent(id)}`);
+  const ms = Math.round(performance.now() - t0);
+  if (r.status === 404) {
+    $('cmdResult').innerHTML = `<div class="warnbox">结果还不在本节点，且索引未命中（可能还在跑）—— 继续轮询…</div>`;
+    if (round < 120) return setTimeout(() => pollCmd(id, t0, round + 1), 500);
+    return;
+  }
+  if (!r.ok) {
+    $('cmdResult').innerHTML = `<div class="errbox">HTTP ${r.status}：${esc(typeof r.body === 'string' ? r.body : JSON.stringify(r.body))}</div>`;
+    return;
+  }
+  const d = r.body;
+  const done = TERMINAL.includes(d.status);
+  $('cmdTimeline').insertAdjacentHTML('beforeend',
+    `<span class="t">${done ? '终态' : '第 ' + round + ' 次'} ${esc(String(d.status).replace('COMMAND_STATUS_',''))} ${ms}ms</span>`);
+
+  let result = d.result;
+  let parsed = null;
+  if (typeof result === 'string' && result) { try { parsed = JSON.parse(result); } catch { /* 不是 JSON 就原样展示 */ } }
+  $('cmdResult').innerHTML = `
+    <div class="field" style="margin:6px 0">${statusBadge(d.status)}
+      <span class="muted mono">${ms} ms</span>
+      <span class="muted">trace_summary: ${esc(d.trace_summary || '—')}</span>
+      ${d.result_bytes != null ? `<span class="muted">${d.result_bytes} 字节</span>` : ''}
+      ${done ? '' : '<span class="muted">（还在跑，500ms 后再查）</span>'}
+    </div>
+    ${d.result_ref ? `<div class="muted mono">result_ref: ${esc(JSON.stringify(d.result_ref))}</div>` : ''}
+    ${d.result_sha256 ? `<div class="muted mono">sha256: ${esc(d.result_sha256.slice(0, 24))}…</div>` : ''}
+    ${parsed !== null ? `<details open><summary>聚合结果（已解析为 JSON）</summary>${jsonTree(parsed)}</details>` : ''}
+    ${result ? `<details${parsed === null ? ' open' : ''}><summary>原始 result</summary><pre>${esc(result)}</pre></details>` : ''}`;
+
+  if (!done && round < 200) setTimeout(() => pollCmd(id, t0, round + 1), 500);
+  else if (done) logCmd({ command_id: id, status: d.status, ms, ...bodyFromForm() });
+}
+
+async function cancelCmd() {
+  if (!state.lastCmd) return;
+  const r = await api(`/v1/commands/${encodeURIComponent(state.lastCmd)}/cancel`, { method: 'POST' });
+  alert(r.ok ? '已发送取消：' + JSON.stringify(r.body) : `取消失败 HTTP ${r.status}：${JSON.stringify(r.body)}`);
+  if (r.ok) pollCmd(state.lastCmd, performance.now());
+}
+
+async function retryCmd() {
+  if (!state.lastCmd || !$('retryNode').value) return;
+  const r = await api(`/v1/commands/${encodeURIComponent(state.lastCmd)}/retry?node=${encodeURIComponent($('retryNode').value)}`, { method: 'POST' });
+  alert(r.ok ? '已触发重试：' + JSON.stringify(r.body) : `重试失败 HTTP ${r.status}：${JSON.stringify(r.body)}`);
+}
+
+async function traceCmd() {
+  if (!state.lastCmd) return;
+  $('cmdTrace').innerHTML = '<span class="muted">查轨迹中…</span>';
+  const r = await api(`/v1/health?command_id=${encodeURIComponent(state.lastCmd)}&depth=2&detail=true&timeout=15s`);
+  $('cmdTrace').innerHTML = `<h2 style="font-size:13px;margin-top:12px">指令轨迹 <span class="hint">GET /v1/health?command_id=…</span></h2>`
+    + (r.ok ? `<pre>${esc(JSON.stringify(r.body, null, 2))}</pre>` : `<div class="errbox">HTTP ${r.status}</div>`);
+}
+
+/* ------------------------------------------------------------------ *
+ * 本地指令日志
+ * ------------------------------------------------------------------ */
+function logCmd(entry) {
+  const all = JSON.parse(localStorage.getItem('tc_log') || '[]');
+  all.unshift({ at: new Date().toLocaleTimeString(), ...entry });
+  localStorage.setItem('tc_log', JSON.stringify(all.slice(0, 60)));
+  renderLog();
+}
+function renderLog() {
+  const all = JSON.parse(localStorage.getItem('tc_log') || '[]');
+  if (!all.length) { $('logBox').innerHTML = '<span class="muted">还没有记录。</span>'; return; }
+  $('logBox').innerHTML = `<table><tr><th>时间</th><th>type</th><th>aggregate</th><th>on_failure</th>
+      <th>状态</th><th class="num">耗时</th><th>command_id</th><th></th></tr>
+    ${all.map((x, i) => `<tr>
+      <td class="muted">${esc(x.at)}</td><td>${esc(x.type || '')}</td><td>${esc(x.aggregate || '')}</td>
+      <td class="mono">${esc(x.on_failure || '')}</td><td>${esc(String(x.status || x.error || '').replace('COMMAND_STATUS_',''))}</td>
+      <td class="num">${x.ms != null ? x.ms + 'ms' : '—'}</td>
+      <td class="mono muted">${esc((x.command_id || '').slice(0, 10))}</td>
+      <td>${x.command_id ? `<button data-query="${esc(x.command_id)}">查</button>` : ''}</td></tr>`).join('')}</table>`;
+}
+$('logBox').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-query]');
+  if (!b) return;
+  $('tab-' + 'cmd').hidden = false;
+  [...$('tabs').children].forEach(x => x.setAttribute('aria-selected', String(x.dataset.tab === 'cmd')));
+  state.lastCmd = b.dataset.query; $('cmdActions').hidden = false;
+  $('cmdTimeline').innerHTML = `<span class="t mono">${esc(state.lastCmd)}</span>`;
+  $('cmdResult').innerHTML = ''; pollCmd(state.lastCmd, performance.now());
+});
+
+/* ------------------------------------------------------------------ *
+ * 绑定与启动
+ * ------------------------------------------------------------------ */
+$('target').value = state.target;
+$('btnConnect').onclick = connect;
+$('btnRefresh').onclick = refreshAll;
+$('btnSubmit').onclick = submitCmd;
+$('btnCancel').onclick = cancelCmd;
+$('btnRetry').onclick = retryCmd;
+$('btnClearLog').onclick = () => { localStorage.removeItem('tc_log'); renderLog(); };
+$('btnHealth').onclick = loadHealth;
+$('target').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
+
+$('autoRefresh').onchange = () => {
+  if (state.timer) { clearInterval(state.timer); state.timer = null; }
+  if ($('autoRefresh').checked) state.timer = setInterval(refreshAll, 5000);
+};
+
+renderLog();
+updatePreview();
+connect();
+</script>
+</body>
+</html>
