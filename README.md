@@ -1,0 +1,322 @@
+# treecmd —— 分布式树形指令执行系统（Go 实现）
+
+按《架构方案 v3.21》（`../docs/架构方案.md`）落地的可运行实现：**一个进程同时是客户端与服务端**，
+节点自下而上注册成树，指令自上而下分发，结果自下而上聚合到发起节点。
+
+**部署形态**：单服务器、**一个节点一个进程**、手工放 `node.yaml` 后启动；**证书由你自己的脚本管理**，
+程序只负责"发现证书变更就重新加载"。手工部署细节见 `docs/手动部署指南.md`。
+
+## 快速开始
+
+```bash
+# 构建（全项目只有一个可执行文件：单节点入口）
+go build -o bin/treecmd-node ./cmd/node
+```
+
+一个节点 = 一份 `node.yaml`（**手写、程序只读、绝不回写**）+ 一组身份材料 + 一个进程。
+单服务器部署时按角色各拷一份配置与材料即可，细节见 `docs/手动部署指南.md`。
+
+### 节点身份与元信息：`node.id` / `node.name` / `node.remark`
+
+| 字段 | 说明 |
+|------|------|
+| `node.id` | 节点身份（UUIDv7），**必须与证书身份一致**。**可以留空** —— 程序会按下面的顺序自动定下来，**从不回写本文件**（ADR-050） |
+| `node.name` | 节点名：人类可读地标记"我是谁"（如 `edge-sz-01`）。可省略 |
+| `node.remark` | 备注：自由文本（如 `"1 号柜 3 号机位"`）。可省略 |
+
+**`node.id` 留空时怎么定**（前一个命中即停止，全程只读）：
+
+| 顺序 | 来源 | 说明 |
+|---|---|---|
+| 1 | `node.yaml` 里的 `node.id` | 显式指定，最高优先 |
+| 2 | **已签发证书的身份**（CN 优先、SAN URI 兜底） | 证书就是身份 —— 所以**根节点不必在配置里写 id**：它自带证书，ID 自然从证书取 |
+| 3 | **`state.dat` 的 `self.id`** | "还没拿到证书"那段窗口里的身份锚点，跨重启稳定 |
+| 4 | 都没有 → 生成 UUIDv7 | 生成值**在上线前**就写进 `state.dat`（不是 `node.yaml`），此后固定 |
+
+> **为什么放 `state.dat` 而不是写回配置**：`node.yaml` 是"人写的、要能进版本管理"的东西，
+> 程序碰它就把"配置"变成了"状态"（ADR-005）。NodeID 属于**运行期状态**，`state.dat` 正是它的归宿
+> —— 只由程序写、可丢弃重建、且已被 `.gitignore` 覆盖，**不需要给 ADR-005 开任何口子**。
+>
+> 两条边界：
+> ① `state.dat` 与证书身份不一致 → **以证书为准**并告警（否则必然过不了启动强校验）；
+> ② 父端若用 `enrollment.allow_ids` 白名单，白名单里要填"这个节点实际拿到的 ID" —— 首启后看启动日志
+> （`node.id 未写定 → 本次生成 … node_id=<ID>`）或读 `state.dat` 的 `self.id` 即可拿到。
+> `-check` 是只读自检：会说"启动时生成 `<ID>` 并写入 `<state.dat>`"，但不落盘、也不碰配置。
+
+`node.name` / `node.remark` **只作展示用途**，不参与任何权限判定与摘要计算，也**不进 `config_hash`**：
+改个显示名不会被当成拓扑变更。它们随每次注册上行（父端在 `/v1/tree` 里就能看到名字），
+也随健康响应逐跳回传（根在 `/v1/health` 里能看到每个子节点的名字）。
+
+```bash
+# 改名后让它立刻同步给父：SIGHUP 即可（检测到元信息变化会主动重注册一次）
+./scripts/start_node.sh conf node.yaml     # = kill -HUP
+
+curl -s localhost:18443/v1/tree        # 本节点 + 直接子的 node_name / node_remark
+curl -s 'localhost:18443/v1/health?depth=-1&detail=true&timeout=20s'   # 逐层都能看到名字
+```
+
+> 补充：**根节点仍然必须自带证书**（没有父可以签发它）。"根 + 无证书"会拒绝启动，
+> 与 id 写没写无关 —— id 可以从证书取，证书本身没有就只能自带。
+
+### 手工部署（三种便捷入口）
+
+```bash
+# 生成带注释的样例配置：root（完整）/ child（最小：只需要"我是谁 + 父地址"）/ relay / leaf
+./bin/treecmd-node -print-sample-config child > node.yaml
+
+# 一次性生成本节点密钥对（程序**启动路径绝不生成密钥**，这是显式的部署工具）
+./bin/treecmd-node -genkey -keydir keys            # 还有下级就加 -with-ca
+
+# 部署前自检：只读配置与证书，不监听、不连接、不落盘；并把"按约定补全了什么"逐条列出来
+./bin/treecmd-node -check -config node.yaml
+
+# 起停 / 自检 / 换证后重载 / 配置热更
+./scripts/start_node.sh <node.yaml>            # 启动（先自检再后台起）
+./scripts/start_node.sh reload <node.yaml>     # = kill -USR1：证书脚本换证后立即重载
+./scripts/start_node.sh conf   <node.yaml>     # = kill -HUP：配置热更
+./scripts/start_node.sh stop   <node.yaml>
+```
+
+**子节点的配置可以只有两项**（其余按约定补全：`keys/id_ed25519`、`certs/node.crt`、`trust/`、`enroll.token`…）：
+
+```yaml
+node:
+  id: <我是谁>
+parents:
+  - id: <父的真实 NodeID>
+    addr: 127.0.0.1:19443
+```
+
+### 证书生命周期：外部脚本管理 + 自动重载
+
+| 能力 | 说明 |
+|------|------|
+| **运行期入网签发** | 子节点没有证书也能上线：`EnrollChallenge`（一次性 nonce）→ 子用**自己私钥**签 PoP → 提交身份公钥(+CA 公钥)与入网许可 → **父用自己的 CA 私钥签这两个公钥** → 子校验后原子写盘 + 热切换。**私钥全程不出本机**，程序既不生成也不接收私钥 |
+| **证书热重载** | 轮询（默认 30s，只做 `stat`，变了才读内容）+ **`SIGUSR1` 立即生效**；监视身份私钥/公钥/证书 + 本节点 CA 证书/私钥 + 全部信任锚 |
+| **fail-safe** | 新证书**任何一项校验不过**（格式/身份/链/有效期）就**继续用当前证书**并打 ERROR —— 绝不会因为脚本投放了半个文件把在跑的节点弄挂。指标 `cert_reload_total{result=ok\|failed\|missing\|nochange}` |
+| **生效范围** | 信任锚与对端证书只影响新连接；只有**本节点身份证书/私钥**变了才主动重连一次（`cert_reload.on_change: reconnect`；设 `lazy` 则完全不打断现有会话） |
+| **信任锚给目录** | `ca_cert_paths: [trust]` —— 目录下 `*.crt`/`*.pem` 全部加载；**换 CA 只换文件、不改配置** |
+| **证书撤下可自愈** | 证书文件被删 → 子节点自动重新入网把文件补回；根节点则继续用内存里的旧证书服务（并记 `result=missing`） |
+| **首启顺序无关** | 子先起、父后起也能收敛：没证书/连不上都不会让进程退出，按退避（1s→2s→4s…30s）持续重试 |
+
+### 身份硬约束：私钥 + 公钥必须预置
+
+每个节点启动时都要带**自己的私钥与公钥**（`security.identity_key_path` / `security.identity_pubkey_path`）：
+
+- **程序绝不生成密钥**。启动时读不到私钥或公钥，直接 `REFUSE TO START` 并非零退出；
+- 三者必须完全一致：**私钥 ↔ 公钥 ↔ 证书公钥**，且证书身份 == NodeID、证书链能验到信任锚、证书未过期；
+- 有子节点的节点（根 / 中继）还必须预置 CA 私钥与 CA 证书，否则也拒绝启动。
+
+启动时的强校验是**默认生效、无需开关**的：上面每一条不满足都会 `REFUSE TO START` 并以非零码退出。
+部署前想先看结果，用 `./bin/treecmd-node -check -config node.yaml`（只读自检，不监听、不连接、不落盘）。
+
+### HTTP API（有对外端点的节点）
+
+```
+POST /v1/commands                     提交指令（本节点即 OriginID 与聚合终点）
+GET  /v1/commands/{id}                结果查询（跨节点沿路径前缀路由到持有者）
+POST /v1/commands/{id}/cancel         取消
+POST /v1/commands/{id}/retry?node=X   子节点重跑（RetryNode）
+GET  /v1/health[?command_id=&depth=&detail=&timeout=]   健康度 / 指令轨迹 双模式
+GET  /v1/tree                         本节点视角的拓扑
+GET  /v1/healthz
+```
+
+```bash
+curl -s -XPOST localhost:18443/v1/commands -d '{"type":"echo","payload":"aGVsbG8=","aggregate":"TREE"}'
+curl -s "localhost:18443/v1/health?depth=-1&timeout=20s"
+curl -s "localhost:18443/v1/health?command_id=<ID>&depth=2&detail=true"
+```
+
+## 目录结构
+
+```
+api/proto/node.proto        协议定义：**手写的唯一契约**（64 message / 11 enum / 1 service / 6 rpc）
+internal/pb/                protoc 生成的 Go 绑定（7,467 行）；**勿手改**，重新生成方式见本节末尾
+internal/identity/          UUIDv7、Ed25519、与系统树同构的 PKI、证书签发与链校验、启动强校验、mTLS
+  lifecycle.go              信任锚目录扫描 + PathStamp/PathDigest（变更判定）+ 按公钥签发 + 入网握手 TLS
+internal/config/            node.yaml 加载 / 校验（含 renew_at×3 ≤ lease_ttl 硬约束）/ config_hash 白名单
+  nodeid.go                 node.id 解析：配置 → 证书身份 → state.dat → 生成（**只读，不写任何文件**，ADR-050）
+internal/canon/             canonical 编码（确定性序列化）+ NodeID 16 字节大端升序排序
+internal/persist/           state.dat：临时文件 + fsync + rename 原子写
+internal/store/             bbolt：meta / commands / cmdlog / assignments / assign_child / child_reports /
+                            local_state / pending_result / results / child_watermark / crl /
+                            pending_index / evicted_children + 本地文件系统对象存储（objects/）
+internal/registry/          直接子节点表、路径前缀路由、祖先链与环检测（不做 Target 筛选）
+internal/aggregate/         TREE / MERGE / SUM / COUNT / CUSTOM + OnFailure 精确判定公式
+internal/exec/              Executor 接口（含 OnRestart）+ noop / echo / sleep / fail + 安全空执行器
+internal/node/              组装：handle / waitChildren / terminal / 租约 / 取消 / 健康 / 查询 / HTTP API
+  enroll.go                 运行期入网签发：服务端（许可+白名单+PoP 校验→用 CA 私钥签公钥）+ 客户端（换取并落盘）
+  reload.go                 证书热重载：stat 优先的两级变更判定 + SIGUSR1 + fail-safe + 生效策略
+  inspect.go                部署前只读自检（Check）与运维辅助（EnsureCertificate / WatchInfo）
+  auth.go                   ReqAuth 跨跳委托凭证：入口签一次、逐跳原样透传、每跳离线验链 + 按自己白名单校验
+  crl.go                    吊销列表：版本单调递增、身份密钥签名、逐跳转发、重连 CRLReq 全量对齐
+  lifecycle.go              证书续签 / 配置热更 / Reconcile 对账 / 驱逐归档 / 索引待重发队列
+internal/observability/     Prometheus 文本指标（零依赖）+ /metrics
+cmd/node/                   单节点入口（一个节点一个进程）
+examples/                   手工部署样例（阅读版）
+  README.md                 部署阅读指南：角色对照 / 目录约定 / 字段生效时机 / 报错对照 / 检查清单
+  root.yaml                 根节点：全字段详解（每个字段标了必填/可选/默认值）
+  relay.yaml                中继节点：唯一同时要"上行 + 下行"两侧材料的角色
+  child.yaml                叶子节点：最小形态（只需"我是谁 + 父地址"）+ 约定与默认值全表
+scripts/start_node.sh       单节点起停 / 自检 / 换证重载（SIGUSR1）/ 配置热更（SIGHUP）
+docs/                       手动部署指南、差异处理方案、项目功能完整介绍、代码注释规范
+```
+
+### 代码注释约定
+
+**每个函数/方法都要有一段 doc comment**，说明「它是干嘛的」和「参数是什么东西」——
+写法（首行函数名开头、参数/返回用 tab 缩进的块）见 **`docs/代码注释规范.md`**。
+通读某个包时可以直接用 `go doc -all ./internal/config` 把注释按格式打出来。
+
+### 生成代码（`internal/pb/`）：从哪来、怎么重新生成
+
+`internal/pb/node.pb.go`（7,146 行）与 `internal/pb/node_grpc.pb.go`（321 行）**都是 protoc 自动生成的，不要手改**
+—— 头部写着 `DO NOT EDIT`，下次生成会被覆盖；而全仓库有 **20 个文件**引用这个包，改错是全局性的。
+
+| 文件 | 负责什么 |
+|------|---------|
+| `api/proto/node.proto` | **唯一的协议契约**（手写）：64 message / 11 enum / 1 service / 6 rpc |
+| `internal/pb/node.pb.go` | **数据面**：每个 message → 一个 Go struct（字段编号写在 `protobuf:"bytes,N,..."` tag 里）、11 个枚举及其 `String()`、375 个 nil 安全的 `GetXxx()`、25 个 `oneof` 包装类型、协议自描述符 |
+| `internal/pb/node_grpc.pb.go` | **调用面**：`NodeServiceClient` / `NodeServiceServer` 接口与 6 个 RPC 的桩 |
+
+编解码本身在 `google.golang.org/protobuf` 运行时库里；这两个文件提供的是**内存布局 + 字段编号 + 反射信息**。
+所以业务代码从不手写字节：`canon.Digest` 用的 `proto.MarshalOptions{Deterministic: true}` 就作用在这些类型上 ——
+**wire 格式、摘要、签名三者一致性的根基，就是 `.proto` → `pb.go` 这条链。**
+
+一次性准备（本机若没有）。**注意本机（以及多数 mac/开发机）默认没有 `protoc`**，
+本项目用的是 `grpcio-tools` 自带的 protoc，所以不需要装 `protobuf-compiler`：
+
+```bash
+# ① protoc 本体：放在仓库外的固定位置，避免污染项目目录
+python3 -m venv ~/.cache/treecmd-protoc
+~/.cache/treecmd-protoc/bin/pip install -q grpcio-tools
+
+# ② 两个生成插件（Go 侧）
+go install google.golang.org/protobuf/cmd/protoc-gen-go@latest          # 生成 node.pb.go
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest         # 生成 node_grpc.pb.go
+```
+
+改了 `api/proto/node.proto` 之后，重新生成：
+
+```bash
+~/.cache/treecmd-protoc/bin/python -m grpc_tools.protoc -I api/proto \
+  --plugin=protoc-gen-go=$HOME/go/bin/protoc-gen-go \
+  --plugin=protoc-gen-go-grpc=$HOME/go/bin/protoc-gen-go-grpc \
+  --go_out=.      --go_opt=module=treecmd \
+  --go-grpc_out=. --go-grpc_opt=module=treecmd \
+  api/proto/node.proto
+go build ./...        # 生成后一定要编译一遍
+```
+
+> 用哪个解释器很重要：真正的 `python -m grpc_tools.protoc` 需要**装了 grpcio-tools 的那个**解释器。
+> 系统自带的 `python3` 通常没有这个包，直接跑会报 `No module named grpc_tools`。
+>
+> 当前生成产物对应的工具链版本（写在 `node.pb.go` 头部，换版本可能产生无关 diff）：
+> `protoc-gen-go v1.36.12`、`protoc v7.35.1`。用上面这套重跑，输出与仓库里的现有文件**逐字节一致**（已验证幂等）。
+
+三条硬规矩（proto 文件头部也写了）：
+
+1. **字段编号一旦用过就不能改** —— 它是 wire 兼容的唯一依据；要改只能新增编号。
+   （proto 里那些标着"已下线"的枚举值，就是为保留编号而留的。）
+2. **`optional` 要显式用** —— proto3 标量分不清"没传"和"传了 0"，本项目一律靠 `*T` 指针 + `!= nil` 区分。
+   例：`AttestDepth *int32` —— 不传 = 默认 1，显式传 `0` = 无上限（全树背书）。
+3. **枚举第一个值必须是 `*_UNSPECIFIED = 0`**；所有摘要/签名一律对 canonical（确定性）编码取，
+   repeated 字段在取摘要前按 NodeID 的 16 字节大端升序排序。
+
+## 已实现的核心机制（对应方案章节）
+
+- **双角色单进程**：`DownstreamHub`（服务端）+ `UpstreamLink`（客户端）+ `TaskEngine`（1.1，ADR-001/027）
+- **拉模式工作队列**：`FetchCommands` 返回"seq 增量的新指令 ∪ 名下 Assignment 重投"，投递由 Assignment + 租约驱动，
+  与内容水位解耦（3.1/3.2/ADR-022/036）；父端不信任客户端 `since_seq`（取 `max(客户端, 父侧权威水位)`）；
+  响应构造与水位落盘同一事务，**绝不回退**；`fetch_response_max_bytes`(3.5MB) 父端兜底截断
+- **租约**：`LeaseTTL` 只做活性检测、租约过期即回收（只看父时钟）、回收不推进 `attempt`、`LocalBusy` 短退避（3.4）
+- **本地三态**：`NOT_STARTED/SELF_RUNNING/SELF_DONE/SELF_FAILED/SELF_CANCELLED/COMPLETED`；
+  `SELF_RUNNING` 先落盘再执行（`OnRestart` 的唯一触发条件）；`SELF_DONE` 与两个本地终态绝不重跑（3.5，ADR-016/039）
+- **终态单事务**：`terminal()` 一个 bbolt 事务里写 `local_state` + `CommandRecord.Status` + 结果归宿
+  （`sink==SELF → results`，`sink==UPSTREAM → pending_result`，含唯一一处 `SelfResult` 裁剪）（1.1，ADR-037/046/049）
+- **`waitChildren` 状态机**：进入顺序"重建上下文 → 审退出原因标记 → 命中对账 → 判空 → 写 RUNNING"；
+  独立 `Deadline` timer + 带 jitter 的 tick；`applyEvent` 后立即判 `OnFailure` 上限；
+  退出前落定未上报子的 Assignment 并落"退出原因标记"；`Cancelled/Deadline` 三态互斥（3.16，ADR-042/047/049）
+- **`child_reports` 持久化闭环**：接受子报告 = 单事务（写权威副本 + 置 Assignment 终态 + 记生效 attempt），
+  `ok=true` 语义 = "已持久化接受"；`waitChildren` 进入时由它重建已完成的支（ADR-048/049）
+- **补报**：`pending_result` 先落盘 → 上报 → 收到 `ok` 才清理；三级路径（内联 / 分片 / 引用）由 `reportUpstream`
+  按字节数自动选择；周期重发 + 每次 Fetch 成功顺手重发（单飞 + 批量上限 + 指数退避）（3.11）
+- **取消**：`cancelCommand` 只置进程内原子标志 + `cancel()`；终态与 `children` 由持有 `childrenBuf` 的协程写；
+  必经路径 = 续租响应回带终态（3.9，ADR-048/049）
+- **下发即执行**：父节点下发的任务，子节点收到就执行本地部分，**框架不做任何按路径 / 标签的筛选**
+  （`Target` 只保留 `SUBTREE` 一种语义；`NODE` / `SELECTOR` 提交时返回 `ERR_TARGET_NOT_SUPPORTED`）；
+  `waitChildren` 仍保留"应发未发"对账兜底，覆盖对账窗口内新注册进来的子节点（3.16）
+- **逐跳重签名与背书链**：下行 `HopChain` per-child 派生（对"即将发出的内容"取 Digest，先签后追加）；
+  上行 `ChildAttest` 含 `Descendants`（`AttestDepth==0` 为无上限）；子节点四项校验（ChildID/ForwarderID/Digest/Sig）；
+  origin 签名只覆盖创建后不可变字段、用内联 `OriginCert` 离线验（7.5/7.6，ADR-024/032/034）
+- **身份与 PKI**：UUIDv7 + Ed25519（CSPRNG，绝不从 GUID 派生）、证书由父签发、PKI 与系统树同构、
+  全链到根、启动强校验（文件/私钥/证书/链/一致性任一失败 fatal）、epoch 双主仲裁、环检测（7.1~7.9）
+- **健康检查 / 指令轨迹**：双模式、`depth` 逐跳递减、`timeout_ms` 逐跳只减不增（留执行余量）、
+  `detail` 控制完整对象、每节点身份签名 + 父端四步校验、`SubtreeSummary` 逐层累加、
+  按查询重量三把锁单飞（在途即拒 429）（第 4 章，ADR-021）
+- **结果落库与查询**：发起节点 `results` upsert 幂等；`ResultIndex` 内存缓存 + 结果索引上行到根（`ownerSig`/`hopSig`）+ 周期重推；
+  查询沿父链上行找索引 → 从"确定为持有者祖先"的一跳沿 `owner_path` 下行 → 沿 `reqID → 上游跳` 转发表反向原路回（3.14，ADR-035/038/048）
+- **持久化**：配置 / 状态分离、`config_hash` 白名单、`state.dat` 原子写、`next_cmd_seq` 权威值在 bbolt `meta`（只增不减）、
+  保留水位 = `min(min{FetchedCmdSeq}, min{未终态 Assignment 的 LocalSeq})`（第 6 章）
+- **后台任务**：租约回收（LeaseTTL/3）、驱逐扫描、指令日志清理、`pending_result` 重发、`state.dat` 落盘、
+  results 清理、索引重推、驱逐归档回收、结果索引待重发、证书续签调度（13.6）
+
+### 本轮新增（批次 A–E）
+
+| 能力 | 实现要点 |
+|------|---------|
+| **CA 材料强校验** | `ValidateStartup` 对 CA 证书做与身份证书同强度的校验：`IsCA`、`keyUsage certSign`、有效期、**链到信任锚**、CN 含 nodeID；新增显式 `security.ca_cert_path`（不再靠 `<cert>.ca` 魔法路径） |
+| **`AttestDepth` 语义修正** | proto 改 `optional int32`：不传 = 默认 1，**显式 0 = 无上限（全树背书）**；修掉"`RawChildren=true, AttestDepth=0` 被误拒"的缺陷 |
+| **`Unreported` 显式建模** | 新增 `WaitResult.ParentJudged`；父侧判定的失败/超时**计入 `NotDone`**，同时 `Outcomes` 与背书链恢复严格 1:1（不再往 `Outcomes` 里塞无 Attest 的条目） |
+| **CRL 吊销** | 版本单调递增（只应用更高版本）、发送方身份密钥签名、逐跳转发、重连 `CRLReq` 取全量对齐、服务端拦截器 + `serveConn` 双重拦截；`GET /v1/crl`、`POST /v1/revoke?node=` |
+| **证书续签** | 父在子 Connect/RESUME 时检查剩余有效期，**进入 2/3 生命期窗口即换发** `CertRenewOffer`；子原子替换证书文件 + `TLSContainer` 热切换 + 重连握手；子侧每小时主动调度；TLS 层给"过期 ≤7 天"续签宽限，应用层只放行注册/续签帧 |
+| **配置热更** | `SIGHUP` 重读 `node.yaml`：只改运行参数 → 原地热更；进 `config_hash` 的字段变了 → 触发全量重注册。父经 `ConfigPush{overrides}` 下发运行参数，子端**白名单校验**（只接受 `command./health./query./persist.`，绝不接受 identity/parents/listen） |
+| **Reconcile 对账** | 子重连后上报本地未终态指令（完整 wire `Command`）；父内联 `OriginCert` 离线验 origin 签名 + 校验末条 `HopAttest` 指向自己 → 与我持有的派生结果逐字节比对：一致则重置 Assignment 重投，**不一致即拒绝并记审计**；父已无记录则按子上报内容重建 |
+| **驱逐归档** | 驱逐前把该子名下未终态 Assignment 的**指令体归档**到 `evicted_children`；`ChildWatermark.evicted` 让它**退出保留水位计算**；子回来对账成功后清归档；归档保留期到期连同水位条目一并回收 |
+| **对象存储引用** | 本地文件系统 `objects/<sha256[:2]>/<sha256>`，原子写 + 摘要寻址；>64MB 的结果走引用、父端按引用取回并校验摘要 |
+| **`QueryData` 分片回传** | >256KB 的查询结果：先回元数据 `QueryResp{has_data}`，再沿同一回程发 `QueryData` 分片（逐片 gzip + crc32 + 持有者身份签名、**首片带证书链供入口离线验链**）；入口收齐拼装；超 `query_response_max_bytes` 降级为引用；校验失败回"校验失败"而不是 `NOT_FOUND` |
+| **`ReqAuth` 跨跳委托** | 入口签一份短时委托（ViewerID / EntryCert / EntrySig / NotAfter / Kind / **ParamsHash 只绑定跨跳不变的 command_id+detail+Kind**）；每跳用预置根证书**离线**验链验签，再按**自己的** `health_viewers`（默认"直接父 + root"）/`query_viewers`（默认放行）决定是否服务/转发；拒绝落审计日志 |
+| **CUSTOM 聚合器注册** | `aggregate.RegisterCustom/LookupCustom`；`aggregate=CUSTOM` 必须给 `aggregate_name`（随指令逐跳透传），未注册 → `ERR_UNKNOWN_CUSTOM_AGGREGATOR`；声明 `NeedsSelfResult()` 而未开 `raw_children` → 提交期即拒；内置 `subtree_count` / `audit_raw` 两个示例 |
+| **`/metrics`** | 手写 Prometheus 文本（零依赖）：`node_up`、`children_count/known`、`command_inflight/pending_total`、`partial_total`、`pending_result_backlog`、`retention_floor`、`result_index_entries`、`clock_offset_ms`、`command_terminal_total{status}`、`fail_rate_1h`、`result_stored_total`、`lease_reclaim_total`、`untrusted_origin_rejected_total` … |
+| **祖先 NodeID 链** | `RegisterAck.ancestor_ids`：环检测与 `health_viewers` 默认白名单（"直接父 + **root**"）都要按 ID 判定 —— 根的路径是 `"/"`，从路径里取不出它的 NodeID |
+| **健康扫描可取消** | 健康/轨迹递归跟随 HTTP 请求的 `ctx`：调用方放弃即停止扇出与等待，避免"被丢弃的扫描"在后台堆积 |
+
+## 协议与数据面
+
+- **传输**：gRPC over HTTP/2 + TLS 1.3，mTLS 双向认证；`Connect` 双向流承载所有父 → 子控制帧
+  （`CommandNotify` / `CommandCanceled` / `TerminalNotice` / `HealthReq` / `QueryReq` / 回程 `QueryResp`/`QueryData`）
+- **序列化**：protobuf（`.proto` 是唯一协议约定；枚举 0 值一律 `*_UNSPECIFIED`，需显式设置的字段用 `optional`）
+- **canonical 编码**：`proto.MarshalOptions{Deterministic:true}`；`repeated` 在取摘要前显式按
+  **NodeID 的 16 字节大端升序**排序（不是字符串字典序）；时间字段一律 `google.protobuf.Timestamp`
+
+## 实现说明（与方案的差异 / 有意取舍）
+
+1. **PKI 中 CA 证书独立一张**：方案 7.7 的"CA 密钥按需生成 → 向父重签自身证书为 `CA:TRUE`"在本实现中改为
+   "为有子节点的节点额外签发一张独立 CA 证书（`CA:TRUE`，含 CA 公钥）"。理由：方案写法会让"身份密钥"与"CA 密钥"
+   落在同一张证书上，而子节点证书由 CA 密钥签发、其公钥却不在父的身份证书里，**标准 x509 链无法校验**。
+   改动后"双密钥互相隔离"与"PKI 与树同构"都不变，且链校验成立。
+2. **仍未实现（明确标注，均不在主链路正确性路径上）**：
+   - **根 CA 轮换的双签过渡期**：`ca_cert_paths[]` 多锚已支持，但缺"同时信任新旧根 + 全树滚动重启"的运维编排；
+   - **`evicted_children` 的跨节点取回**：归档在本节点，未做跨节点共享存储；
+   - **对象存储的跨节点取回**：引用只保证"同一节点可取回"（本地文件系统）。跨节点共享需换成 S3/共享盘；
+   - **`AttestDepth ≥ 2` 的递归背书校验**：`Descendants` 已回传，但父端默认只验直接子层，未实现审计态的递归验签；
+   - **健康请求的应用层限流**：`health.rate_limit_per_sec` 已在配置里，未接入限流器（单飞互斥已实现）；
+   - **`ConfigPush` 的下行策略**：仅支持父手写 `overrides` 下发，未做"根推到全树"的中心化分发；
+   - **入网许可的时效性**：`enrollment.token` 是长期共享串（父端无状态），没有"一次性许可 / 许可过期"机制；
+     要更强的话可换成"每节点一枚一次性许可（用后即废）"，目前靠 `allow_ids` 白名单 + 保留期由人工撤销；
+   - **证书热重载不跟随符号链接目标**（按 `stat` 的 size+mtime 判定）；若你的脚本用 `ln -sf` 变更新链接目标，
+     `lstat` 层面的 mtime 也会变，实测可触发；但若只替换目标文件内容而不动链接，则依赖目标文件的 mtime 变化。
+3. **`AttestDepth` 已改为 `optional int32`**（不再有 0 值歧义）：不传 = 默认 1，显式 `0` = 无上限（全树背书）。
+   唯一的行为变化是"不传 `attest_depth` 的指令默认只回传到直接子层"，与方案 7.5 一致。
+4. **`Target` 只保留 `SUBTREE`**：环境是"父节点下发、子节点直接执行"，不做按路径 / 标签的筛选，
+   因此 `SELECTOR`（标签选择器）与 `NODE`（点对点寻址）已下线，提交时返回 `ERR_TARGET_NOT_SUPPORTED`。
+   proto 里保留了字段与枚举值，需要恢复点对点下发时改动面很小（提交校验 + `EnsureCreated` 的建 Assignment 范围）。
+5. **`Unreported` 已显式建模**：父侧判定的终态子放在 `WaitResult.ParentJudged`（`Unreported` 的子集），
+   计入 `NotDone`（否则"有子失败、整条指令却判成功"）；`Outcomes` 严格 = "收到过 Report 的子"，与 `Children` 背书链 1:1。
+6. **健康响应的 `SubtreeSummary` / `TraceSummary`**：已**回写进方案 4.3**（`ChildHealth.Summary` / `ChildTrace.Summary`）——
+   `detail=false` 时也必须回传，且明确"`detail` 只控制是否回完整对象、不控制汇总"。
+7. **`Hub.handleHeartbeat` 除续租响应外**还会回一个 `HeartbeatAck` 帧承载 `t2`/`t3`（用于 EWMA 时钟偏移）与 `terminal[]`
+   （"续租响应必须回带终态"那一半同一必经路径）。已**补进方案 5.6 的帧表**。
+8. **`Startup` 强校验对 CA 证书同样严格**：新增显式 `security.ca_cert_path`（不再靠 `<cert>.ca` 魔法路径），
+   并对 CA 证书校验 `IsCA` / `keyUsage certSign` / 有效期 / 链到信任锚 / CN 含 nodeID。

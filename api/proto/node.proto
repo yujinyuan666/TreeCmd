@@ -1,0 +1,771 @@
+// 分布式树形指令执行系统 —— 协议定义（对应《架构方案 v3.21》3.2 / 3.3 / 3.13 / 4.3 / 5.6）
+//
+// 约定（必须遵守，跨实现一致性的根基）：
+//   * 所有枚举的第一个值一律是 *_UNSPECIFIED = 0，且"未设置"与"显式传 0"必须靠 proto3 optional + has_* 区分；
+//   * 凡"必须显式设置"的字段（Target.Mode 等）用 optional，has_* == false 即拒绝；
+//   * 时间字段一律 google.protobuf.Timestamp（UTC 秒 + 纳秒），绝不用本地时间字符串；
+//   * 摘要 / 签名一律对"canonical 编码"（deterministic serialization，字段按序号）取，
+//     repeated 字段在取摘要前显式按 NodeID 的 16 字节大端升序排序。
+
+syntax = "proto3";
+
+package treecmd.v1;
+
+option go_package = "treecmd/internal/pb;pb";
+
+import "google/protobuf/timestamp.proto";
+
+// ============================================================================
+// 枚举
+// ============================================================================
+
+// 本地三态（客户端视角，见 3.5 / 12.1）
+enum LocalExecState {
+  LOCAL_STATE_UNSPECIFIED = 0;
+  LOCAL_STATE_NOT_STARTED = 1;
+  LOCAL_STATE_SELF_RUNNING = 2;
+  LOCAL_STATE_SELF_DONE = 3;
+  LOCAL_STATE_SELF_FAILED = 4;    // 终态
+  LOCAL_STATE_SELF_CANCELLED = 5; // 终态
+  LOCAL_STATE_COMPLETED = 6;      // 终态（含子树聚合）
+}
+
+// 指令级状态（服务端视角，见 12.2）
+enum CommandStatus {
+  COMMAND_STATUS_UNSPECIFIED = 0;
+  COMMAND_STATUS_PENDING = 1;
+  COMMAND_STATUS_RUNNING = 2;
+  COMMAND_STATUS_PARTIAL = 3; // 过渡态，不向上报
+  COMMAND_STATUS_COMPLETED = 4;
+  COMMAND_STATUS_FAILED = 5;
+  COMMAND_STATUS_TIMEOUT = 6;
+  COMMAND_STATUS_CANCELLED = 7;
+}
+
+// 单个子节点的交付状态（每个子一条，不含 PARTIAL，见 3.3 / 12.2）
+enum AssignStatus {
+  ASSIGN_STATUS_UNSPECIFIED = 0;
+  ASSIGN_STATUS_PENDING = 1;
+  ASSIGN_STATUS_LEASED = 2;
+  ASSIGN_STATUS_DONE = 3;
+  ASSIGN_STATUS_FAILED = 4;
+  ASSIGN_STATUS_TIMEOUT = 5;
+  ASSIGN_STATUS_CANCELLED = 6;
+}
+
+// 指令作用域（见 2.3）
+enum TargetMode {
+  TARGET_MODE_UNSPECIFIED = 0;
+  TARGET_SUBTREE = 1; // 唯一支持的语义：发起节点整棵子树，人人执行
+  TARGET_NODE = 2;     // 已下线：提交时拒绝（ERR_TARGET_NOT_SUPPORTED）
+  TARGET_SELECTOR = 3; // 已下线：提交时拒绝（ERR_TARGET_NOT_SUPPORTED）
+}
+
+// 聚合策略枚举（见 3.3）
+enum AggregateStrategy {
+  AGGREGATE_UNSPECIFIED = 0; // 非法值，提交时拒绝
+  AGGREGATE_TREE = 1;
+  AGGREGATE_MERGE = 2;
+  AGGREGATE_SUM = 3;
+  AGGREGATE_COUNT = 4;
+  AGGREGATE_CUSTOM = 5;
+}
+
+// 失败策略（见 3.3 / ADR-010）
+enum FailurePolicy {
+  FAILURE_POLICY_UNSPECIFIED = 0;
+  POLICY_ALL_MUST_SUCCEED = 1;
+  POLICY_TOLERATE_N = 2;
+  POLICY_TOLERATE_PCT = 3;
+  POLICY_BEST_EFFORT = 4;
+}
+
+enum HealthStatus {
+  HEALTH_STATUS_UNSPECIFIED = 0;
+  HEALTHY = 1;
+  DEGRADED = 2;
+  UNHEALTHY = 3;
+  UNREACHABLE = 4;
+}
+
+enum HealthMode {
+  HEALTH_MODE_UNSPECIFIED = 0;
+  HEALTH_MODE_HEALTH = 1;
+  HEALTH_MODE_COMMAND_TRACE = 2;
+}
+
+enum TraceRole {
+  TRACE_ROLE_UNSPECIFIED = 0;
+  TRACE_SUBJECT = 1;    // 作为客户端收到并执行
+  TRACE_DISPATCHER = 2; // 作为服务端下发
+  TRACE_BOTH = 3;
+}
+
+enum ResultSink {
+  RESULT_SINK_UNSPECIFIED = 0;
+  RESULT_SINK_SELF = 1;
+  RESULT_SINK_UPSTREAM = 2;
+}
+
+enum ResultRefKind {
+  RESULT_REF_KIND_UNSPECIFIED = 0;
+  RESULT_REF_INLINE = 1;
+  RESULT_REF_CHUNKED = 2;
+  RESULT_REF_OBJECT_STORE = 3;
+}
+
+// ============================================================================
+// 指令本体（纯 wire 对象，绝不承载逐节点运行时状态，见 3.3 / ADR-030）
+// ============================================================================
+
+// Target 只保留"整棵子树、人人执行"一种语义（见 README「实现说明」）：
+// 父节点下发的任务，子节点收到即执行，框架不做任何按路径 / 标签的筛选。
+// 字段保留是为了 wire 兼容与将来扩展；当前只接受 TARGET_SUBTREE。
+message Target {
+  optional TargetMode mode = 1;
+}
+
+message HopAttest {
+  string forwarder_id = 1;
+  string child_id = 2;
+  bytes digest = 3;
+  bytes sig = 4;
+}
+
+message Command {
+  string id = 1;
+  int64 seq = 2; // 发送方(本跳服务端)的 LocalSeq，逐跳重分配，不入 origin 签名
+  string type = 3;
+  bytes payload = 4;
+  Target target = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp deadline = 7;       // 逐跳可变（只缩不增），不入 origin 签名
+  google.protobuf.Timestamp origin_deadline = 8; // 创建时的原始 Deadline，入签名
+  optional FailurePolicy on_failure = 9;
+  optional AggregateStrategy aggregate = 10; // 未设置 → 默认 TREE；显式 0 → 拒绝
+  bool raw_children = 11;
+  // 背书链回传深度。**optional**：未设置 → 默认 1（只到直接子层）；显式 0 → 无上限（全树背书，审计用）
+  optional int32 attest_depth = 12;
+  bool idempotent = 13;
+  string origin_id = 14;
+  bytes origin_sig = 15;
+  bytes origin_cert = 16;
+  repeated HopAttest hop_chain = 17;
+  // on_failure 的参数：POLICY_TOLERATE_N 的 k / POLICY_TOLERATE_PCT 的 p
+  optional double tolerate_value = 18;
+
+  // ---- 以下为"节点本地运行参数"的随行副本，仅供执行器/调试，不入 origin 签名 ----
+  string trace_label = 19;
+  // CUSTOM 聚合器名字（aggregate=CUSTOM 时必填）：逐跳透传，创建后不变，入 origin 签名
+  string aggregate_name = 20;
+}
+
+// ============================================================================
+// 服务端视角 / 客户端视角的落盘记录（非 wire，见 6.7）
+// ============================================================================
+
+message CommandRecord {
+  string command_id = 1;
+  int64 local_seq = 2;
+  bytes command = 3; // 基础 Command（Seq = LocalSeq、HopChain 到本节点为止）
+  CommandStatus status = 4;
+  google.protobuf.Timestamp updated_at = 5;
+}
+
+message Lease {
+  string owner = 1;
+  google.protobuf.Timestamp expire_at = 2; // 父时钟
+  uint64 attempt = 3;
+}
+
+message AssignmentRecord {
+  string command_id = 1;
+  string child_id = 2;
+  AssignStatus status = 3;
+  Lease lease = 4;
+  int32 reclaim_count = 5;
+  int32 retry_count = 6;
+  google.protobuf.Timestamp last_reclaim_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+  int64 local_seq = 9;        // 冗余 CommandRecord.LocalSeq，供 retention_floor 计算
+  uint64 effective_attempt = 10;
+  google.protobuf.Timestamp backoff_until = 11; // LocalBusy 短退避
+  // ---- per-child 派生基线（ADR-037：Deadline 只在"创建 / attempt 推进"时算一次，
+  //      同一 attempt 内重复拉取不再继续缩；派生结果逐字节一致，子节点可用其做幂等判断）----
+  google.protobuf.Timestamp child_deadline = 12;
+  uint64 derived_attempt = 13;
+  bytes derived_command = 14;
+  bool inflight_hint_seen = 15;
+  // ---- attempt 推进语义（3.4 / ADR-026）----
+  // next_attempt   = 下次真正投递时使用的 attempt（初始 1；租约回收后 = delivered_attempt+1；
+  //                  LocalBusy 退回 / InflightHint 不推进，保持 = delivered_attempt）
+  // delivered_attempt = 最近一次实际投递使用的 attempt
+  uint64 next_attempt = 16;
+  uint64 delivered_attempt = 17;
+}
+
+message LocalCommandRecord {
+  string command_id = 1;
+  LocalExecState local_state = 2;
+  bytes command = 3; // 未终态时保留的完整 wire Command
+  uint64 attempt = 4;
+  bytes self_result = 5; // 本轮 MarkSelfRunning 时清空
+  bytes final = 6;
+  string error = 7;
+  int64 last_upstream_seq = 8;
+  google.protobuf.Timestamp updated_at = 9;
+}
+
+message ChildAttest {
+  string node_id = 1;
+  bytes digest = 2;
+  bytes child_sig = 3;
+  repeated ChildAttest descendants = 4; // 按 NodeID 升序
+}
+
+message ResultRef {
+  ResultRefKind kind = 1;
+  string ref = 2;
+  bytes hash = 3;
+  int64 size = 4; // len(final)，原始未压缩字节数
+}
+
+message Report {
+  string command_id = 1;
+  string node_id = 2;
+  uint64 attempt = 3;
+  LocalExecState local_state = 4; // 必填
+  string error = 5;
+  bytes self_result = 6;      // 仅 RawChildren=true 时填充
+  bytes aggregated = 7;       // 永不为 nil（无数据为 0 字节）
+  ResultRef result_ref = 8;   // 与 aggregated 互斥
+  repeated ChildAttest children = 9;
+  bytes sig = 10;
+}
+
+message ChildReportRecord {
+  string command_id = 1;
+  string child_id = 2;
+  uint64 attempt = 3;
+  LocalExecState local_state = 4;
+  string error = 5;
+  bytes self_result = 6;
+  bytes aggregated = 7;
+  ResultRef result_ref = 8;
+  repeated ChildAttest children = 9;
+  bytes digest = 10;
+  bytes child_sig = 11;
+  google.protobuf.Timestamp received_at = 12;
+}
+
+message PendingResultRecord {
+  string command_id = 1;
+  string node_id = 2;
+  uint64 attempt = 3;
+  LocalExecState local_state = 4;
+  string error = 5;
+  bytes self_result = 6; // 已按 RawChildren 裁剪（全系统唯一裁剪点）
+  bytes aggregated = 7;
+  repeated ChildAttest children = 8;
+  ResultSink sink = 9;
+  ResultRef result_ref = 10;
+  google.protobuf.Timestamp received_at = 11;
+  int32 fail_count = 12;
+  google.protobuf.Timestamp next_retry_at = 13;
+}
+
+message ChildWatermark {
+  string child_id = 1;
+  int64 fetched_cmd_seq = 2;
+  google.protobuf.Timestamp last_seen_at = 3;
+  uint64 last_epoch = 4;
+  // 驱逐标记（3.7）：超 eviction_timeout 未出现的子节点置 true，**从保留水位计算中剔除**；
+  // 该子重连并完成对账后重置为 false。条目本身保留到归档保留期到期才回收（否则表会无界增长）。
+  bool evicted = 5;
+  google.protobuf.Timestamp evicted_at = 6;
+}
+
+message ResultRecord {
+  string command_id = 1;
+  CommandStatus status = 2;
+  LocalExecState local_state = 3;
+  bytes final = 4;
+  ResultRef result_ref = 5;
+  repeated ChildAttest children = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp expire_at = 8;
+  string trace_summary = 9;
+}
+
+// ============================================================================
+// 工作队列（拉模式，见 3.2）
+// ============================================================================
+
+message Delivery {
+  Command command = 1;
+  uint64 attempt = 2;
+  int64 lease_expire_unix_ms = 3;
+}
+
+message FetchRequest {
+  string node_id = 1; // 冗余校验，空视为未带
+  int64 since_seq = 2;
+  int32 max_fetch = 3;
+  int32 max_bytes = 4;
+}
+
+message FetchResponse {
+  repeated Delivery deliveries = 1;
+  int64 new_seq = 2;
+}
+
+message ReportResponse {
+  bool ok = 1;
+  string reason = 2;
+}
+
+// 大结果分片（3.13，双向流）
+message StreamBegin {
+  string command_id = 1;
+  string node_id = 2;
+  uint64 attempt = 3;
+  int32 total = 4;
+  // 子树背书链与失败原因随首帧带上：分片路径下 Report 不单独发送（与 ReportResult 二选一）
+  repeated ChildAttest children = 5;
+  string error = 6;
+}
+
+message ResultChunk {
+  string command_id = 1;
+  string node_id = 2;
+  uint64 attempt = 3;
+  int32 index = 4;
+  int32 total = 5;
+  bytes payload = 6; // 压缩后，<=256KB
+  uint32 crc32 = 7;  // 对压缩后 payload
+  bytes sig = 8;
+  optional LocalExecState final_state = 9; // 仅末片允许设置
+  string error = 10;
+}
+
+message StreamFrame {
+  oneof frame {
+    StreamBegin begin = 1;
+    ResultChunk chunk = 2;
+  }
+}
+
+message UploadAck {
+  bool ok = 1;
+  repeated int32 missing = 2;
+  bool final = 3;
+  string reason = 4;
+}
+
+// ============================================================================
+// Connect 双向流帧（5.6）
+// ============================================================================
+
+message RegisterRequest {
+  string node_id = 1;
+  bytes pubkey = 2;
+  bytes sig = 3; // 对 (guid, pubkey, nonce, epoch) 签名
+  bytes nonce = 4;
+  uint64 epoch = 5;
+  repeated string labels = 6;
+  repeated string capabilities = 7;
+  string listen_addr = 8;
+  // 节点元信息（ADR-051）：人类可读的"我是谁"，用于父端/根端展示与运维定位。
+  // 仅展示用途，不参与任何权限判定与摘要计算。
+  string node_name = 9;
+  string proto_version = 10;
+  string node_remark = 11;
+}
+
+message RegisterAck {
+  bool ok = 1;
+  string reason = 2;
+  string path = 3;                // 父下发的路径，不写进配置文件
+  repeated string ancestors = 4;  // 父的完整祖先链（路径形式，含父自身）
+  // 父的完整祖先链（**NodeID 形式**，含父自身）：环检测与 health_viewers 默认白名单
+  //（"直接父 + root"）都要按 ID 判定 —— 根的路径是 "/"，从路径里取不出它的 NodeID。
+  repeated string ancestor_ids = 9;
+  int64 start_cmd_seq = 5;        // 注册水位 = 父"最后已分配的 seq"
+  string server_proto_version = 6;
+  bytes node_binding = 7;         // 根仲裁结果（本实现为父代签发；见 README 差异说明）
+  uint64 epoch = 8;
+}
+
+message ResumeRequest {
+  string node_id = 1;
+  string session_id = 2;
+  uint64 epoch = 3;
+  int64 msg_seq = 4;
+  string proto_version = 5;
+}
+
+message Heartbeat {
+  int64 send_ts_local = 1; // t1
+  int32 inflight = 2;
+  repeated LeaseRenew renew = 3;
+  LoadMetrics load = 4;
+}
+
+message LeaseRenew {
+  string command_id = 1;
+  uint64 attempt = 2;
+}
+
+message LoadMetrics {
+  double cpu_pct = 1;
+  double mem_mb = 2;
+  int32 queue_depth = 3;
+}
+
+message HeartbeatAck {
+  int64 echo_send_ts_local = 1;
+  int64 recv_ts = 2; // t2
+  int64 send_ts = 3; // t3
+  // 续租响应必须回带终态（3.9 的必经路径）
+  repeated TerminalNotice terminal = 4;
+}
+
+message TerminalNotice {
+  string command_id = 1;
+  CommandStatus status = 2;
+}
+
+message CommandNotify {
+  int64 seq = 1;
+}
+
+message CommandCanceled {
+  string command_id = 1;
+}
+
+message LocalBusy {
+  string command_id = 1;
+}
+
+message InflightHint {
+  string command_id = 1;
+  uint64 attempt = 2;
+}
+
+message ResultIndexUp {
+  string command_id = 1;
+  string owner_path = 2;
+  google.protobuf.Timestamp expire_at = 3;
+  bytes owner_sig = 4;
+  bytes hop_sig = 5;
+  string origin_id = 6;
+}
+
+// 健康检查 / 指令轨迹（4.x）
+message HealthReq {
+  string req_id = 1;
+  string command_id = 2; // 空 = 健康度；非空 = 指令轨迹
+  int32 depth = 3;
+  bool detail = 4;
+  int64 timeout_ms = 5;
+  // 原始调用者身份的委托凭证：逐跳**原样透传**、每跳离线验签并按自己的 health_viewers 校验
+  ReqAuth req_auth = 6;
+}
+
+message ReqAuth {
+  string viewer_id = 1;
+  bytes viewer_cert_fp = 2;
+  string entry_id = 3;
+  bytes entry_cert = 4;
+  google.protobuf.Timestamp issued_at = 5;
+  google.protobuf.Timestamp not_after = 6;
+  uint32 kind = 7;
+  bytes params_hash = 8;
+  bytes entry_sig = 9;
+}
+
+message CheckResult {
+  string name = 1;
+  HealthStatus status = 2;
+  string detail = 3;
+}
+
+message SignerInfo {
+  string node_id = 1;
+  bytes cert_fingerprint = 2;
+  google.protobuf.Timestamp cert_not_after = 3;
+}
+
+message HealthMetrics {
+  int64 uptime_seconds = 1;
+  int32 inflight = 2;
+  int64 pending_commands = 3;
+  double cpu_pct = 4;
+  double mem_mb = 5;
+  int64 children_online = 6;
+  double fail_rate_1h = 7;
+  int64 pending_result_backlog = 8;
+}
+
+message SubtreeSummary {
+  int32 total = 1;
+  int32 healthy = 2;
+  int32 degraded = 3;
+  int32 unhealthy = 4;
+  int32 unreachable = 5;
+  repeated string anomalies = 6;
+}
+
+message ChildHealth {
+  string node_id = 1;
+  HealthStatus status = 2;
+  HealthReport report = 3; // detail=true 时完整返回
+  bytes digest = 4;
+  bytes sig = 5;
+  string err = 6;
+  // detail=false 时仍回传子树汇总：父端据此累加出整棵子树的计数（不必背完整对象）
+  SubtreeSummary summary = 7;
+  // 子节点元信息（ADR-051）：由父端从子节点的 HealthResponse 原样带回（detail=false 也有），
+  // 作用是把"名字/备注"沿树逐跳带到根，使任何一层的 /v1/health 都能直接看懂拓扑。
+  // 注意：这两个字段**不参与** ChildHealth.Digest/Sig 的签名范围（它们由父端填充），
+  // 但父端整份 HealthResponse 会被父自己签名，所以仍然可验证。
+  string node_name = 8;
+  string node_remark = 9;
+}
+
+message HealthReport {
+  HealthStatus status = 1;
+  repeated CheckResult checks = 2;
+  HealthMetrics metrics = 3;
+  repeated ChildHealth children = 4;
+  SubtreeSummary summary = 5;
+  bool truncated = 6;
+  int32 omitted = 7;
+}
+
+message ChildTrace {
+  string node_id = 1;
+  TraceRole role = 2;
+  LocalExecState local_state = 3;
+  AssignStatus status = 4;
+  string error = 5;
+  bytes digest = 6;
+  bytes sig = 7;
+  string err = 8;
+  TraceSummary summary = 9; // detail=false 时仍回传子树轨迹汇总
+}
+
+message TraceSummary {
+  int32 total = 1;
+  int32 done = 2;
+  int32 failed = 3;
+  int32 timeout = 4;
+  int32 cancelled = 5;
+  int32 pending = 6;
+  int32 leased = 7;
+  int32 not_found = 8;
+  repeated string anomalies = 9;
+}
+
+message CommandTrace {
+  string command_id = 1;
+  TraceRole role = 2;
+  LocalExecState local_state = 3;
+  Lease lease = 4;
+  google.protobuf.Timestamp deadline = 5;
+  CommandStatus status = 6;
+  ResultRef self_result = 7;
+  string error = 8;
+  repeated ChildTrace children = 9;
+  TraceSummary summary = 10;
+  string status_source = 11; // "" | "LOCAL_STATE_ONLY" | "TASK_ENGINE"
+}
+
+message HealthResponse {
+  string node_id = 1;
+  string path = 2;
+  HealthMode mode = 3;
+  SignerInfo signer = 4;
+  bytes sig = 5;
+  HealthReport health = 6;
+  CommandTrace command = 7;
+  // 本节点自己的元信息（ADR-051）：放在**自己的**响应里，就随本节点签名一起上行，
+  // 父端据此填充 ChildHealth，无需依赖父端缓存的注册信息。
+  string node_name = 8;
+  string node_remark = 9;
+}
+
+// 结果查询（3.14）
+message QueryReq {
+  string req_id = 1;
+  string command_id = 2;
+  ReqAuth req_auth = 3;
+}
+
+message QueryResp {
+  string req_id = 1;
+  string status = 2; // OK / NOT_FOUND / VERIFY_FAILED
+  bytes result_inline = 3;
+  ResultRef result_ref = 4;
+  string trace_summary = 5;
+  string owner_path = 6;
+  bool has_data = 7;
+  CommandStatus command_status = 8;
+}
+
+message QueryData {
+  string req_id = 1;
+  int32 index = 2;
+  int32 total = 3;
+  bytes payload = 4; // 压缩后
+  uint32 crc32 = 5;
+  bytes payload_sig = 6;
+  bool final = 7;
+  bytes signer_cert = 8; // 仅首片
+}
+
+message UpFrame {
+  string proto_version = 1;
+  uint64 msg_seq = 2;
+  string node_id = 3;
+  oneof frame {
+    RegisterRequest register = 4;
+    ResumeRequest resume = 5;
+    Heartbeat heartbeat = 6;
+    CRLReq crl_req = 14;
+    CertRenewReq cert_renew_req = 15;
+    Reconcile reconcile = 16;
+    HealthResp health_resp = 7;
+    LocalBusy local_busy = 8;
+    InflightHint inflight_hint = 9;
+    ResultIndexUp result_index = 10;
+    QueryReq query_req = 11;   // 上行段
+    QueryResp query_resp = 12; // 回程段
+    QueryData query_data = 13; // 回程段
+  }
+}
+
+message HealthResp {
+  string req_id = 1;
+  HealthResponse response = 2;
+}
+
+message DownFrame {
+  string proto_version = 1;
+  uint64 msg_seq = 2;
+  oneof frame {
+    RegisterAck register_ack = 3;
+    CommandNotify command_notify = 4;
+    CommandCanceled command_canceled = 5;
+    HealthReq health_req = 6;
+    QueryReq query_req = 7;   // 下行段
+    QueryResp query_resp = 8; // 回程段
+    QueryData query_data = 9; // 回程段
+    TerminalNotice terminal = 10;
+    ConfigPush config_push = 11;
+    HeartbeatAck heartbeat_ack = 12;
+    RevocationList revocation_list = 13;
+    CertRenewOffer cert_renew_offer = 14;
+  }
+}
+
+message ConfigPush {
+  string reason = 1;
+  // 只承载**运行参数**（command./health./query./persist. 段）的覆盖项，形如 "command.lease_ttl=120s"。
+  // 绝不承载进 config_hash 的字段（identity / parents / node.listen / labels / capabilities）。
+  repeated string overrides = 2;
+}
+
+// 吊销列表（7.7）：版本号由**该子节点的直接父**维护、单调递增；发送方用自己的身份密钥签名。
+message RevocationList {
+  uint64 version = 1;
+  repeated string guids = 2;
+  string signer_id = 3;
+  bytes sig = 4;
+  google.protobuf.Timestamp issued_at = 5;
+}
+
+message CRLReq {} // 语义 = "给我最新全量"（不依赖增量补齐）
+
+// 证书续签：父 → 子即时换发（父无法对子发起 RPC，见 5.6）
+message CertRenewOffer {
+  bytes cert_chain = 1;   // 新的身份证书链（PEM 串接）；身份密钥与 NodeID 不变
+  string reason = 2;
+}
+
+message CertRenewReq {  // 子 → 父：请求续签（生命期 2/3 处主动发起）
+  string reason = 1;
+}
+
+// 重连对账（3.7）：子上报本地仍未终态的指令，父离线验 origin 签名后重建
+message Reconcile {
+  string command_id = 1;
+  bytes command = 2;    // **完整 wire Command**（含 OriginCert / OriginID / OriginSig / HopChain）
+  bytes origin_sig = 3;
+}
+
+// 被驱逐子节点的指令体归档（3.7 evicted_children 子库）
+message EvictedEntry {
+  string child_id = 1;
+  string command_id = 2;
+  bytes command = 3;                       // 完整 wire Command（含 OriginCert），供重建
+  google.protobuf.Timestamp archived_at = 4;
+  google.protobuf.Timestamp expire_at = 5;
+}
+
+// ============================================================================
+// 运行期入网签发（7.10）：子节点**没有自带证书**时的上线路径
+// ============================================================================
+// 这两条 RPC 是唯一"允许客户端不提供证书"的入口（服务端按 ALPN `treecmd-enroll/1` 分流放行），
+// 所以鉴权必须自己扛住：一次性 nonce（防重放）+ 私钥持有证明 PoP（防拿别人的公钥申请）
+// + 入网许可 token / allow_ids 白名单。签发只做一件事：**用父自己的 CA 私钥签子提交的公钥** ——
+// 任何私钥都由子机本地持有，程序绝不代生成、也不回传。
+message EnrollChallengeReq {
+  string node_id = 1; // 申请方自报 NodeID（只用于把 nonce 绑定到这次申请，本身不构成信任）
+}
+
+message EnrollChallengeResp {
+  bytes nonce = 1;             // 一次性随机挑战
+  string parent_node_id = 2;   // 由哪个父下发（防跨父重放）
+  int64 expires_at_unix = 3;   // 挑战有效期
+}
+
+message EnrollRequest {
+  string node_id = 1;
+  bytes identity_pubkey = 2;  // 身份公钥（对应私钥只在子机本地）
+  bytes ca_pubkey = 3;        // 可选：CA 公钥（还有下级的中继才需要；叶子留空）
+  bytes nonce = 4;            // 取自 EnrollChallenge
+  bytes poof_sig = 5;         // 身份私钥对 (nonce || parent_node_id || node_id) 的签名
+  bytes ca_poof_sig = 6;      // 可选：CA 私钥对同一内容的签名
+  string permit = 7;          // 入网许可：与父端 security.enrollment.token 常量时间比对
+  string listen_addr = 8;
+  string note = 9;            // 人类可读备注，落审计日志
+}
+
+message EnrollResponse {
+  bool ok = 1;
+  string reason = 2;          // 拒绝原因：ERR_ENROLL_*
+  bytes cert_chain = 3;       // 身份证书链（PEM 串接，到根）
+  bytes ca_cert_chain = 4;    // CA 证书链（仅当请求带了 ca_pubkey 才返回，PEM 串接）
+  int64 not_after_unix = 5;
+  string issued_by = 6;       // 签发者（父）NodeID
+}
+
+// ============================================================================
+// 服务定义（3.2）
+// ============================================================================
+
+service NodeService {
+  // 控制面双向流：注册、心跳、租约续期、健康检查、查询（子主动建立）
+  rpc Connect(stream UpFrame) returns (stream DownFrame);
+  // 拉取工作队列（seq 增量 + 名下待执行/重投 Assignment）：幂等，可无限重试
+  rpc FetchCommands(FetchRequest) returns (FetchResponse);
+  // 上报结果：幂等，可重试（小结果内联）
+  rpc ReportResult(Report) returns (ReportResponse);
+  // 大结果分片上行：双向流（见 3.13）
+  rpc StreamResult(stream StreamFrame) returns (stream UploadAck);
+  // 运行期入网：取一次性挑战（**不要求客户端证书**，鉴权靠 PoP + 许可）
+  rpc EnrollChallenge(EnrollChallengeReq) returns (EnrollChallengeResp);
+  // 运行期入网：提交公钥 + PoP + 许可 → 父用自身 CA 私钥签发身份证书与（可选的）CA 证书
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+}
