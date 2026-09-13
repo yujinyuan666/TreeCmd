@@ -61,6 +61,10 @@ curl -s 'localhost:18443/v1/health?depth=-1&detail=true&timeout=20s'   # 逐层�
 ### 手工部署（三种便捷入口）
 
 ```bash
+# 生成证书材料（根：自签 CA + 身份证书；子：密钥 + 信任锚 + 许可）
+./scripts/gen_certs.sh root  <节点目录> <node-id>
+./scripts/gen_certs.sh child <节点目录> <父的CA证书>
+
 # 生成带注释的样例配置：root（完整）/ child（最小：只需要"我是谁 + 父地址"）/ relay / leaf
 ./bin/treecmd-node -print-sample-config child > node.yaml
 
@@ -159,6 +163,7 @@ examples/                   手工部署样例（阅读版）
   root.yaml                 根节点：全字段详解（每个字段标了必填/可选/默认值）
   relay.yaml                中继节点：唯一同时要"上行 + 下行"两侧材料的角色
   child.yaml                叶子节点：最小形态（只需"我是谁 + 父地址"）+ 约定与默认值全表
+scripts/gen_certs.sh       证书材料生成：根自签 CA + 身份证书 / 子节点密钥与信任锚 / 离线代签 / 续期
 scripts/start_node.sh       单节点起停 / 自检 / 换证重载（SIGUSR1）/ 配置热更（SIGHUP）
 docs/                       手动部署指南、差异处理方案、项目功能完整介绍、代码注释规范
 ```
