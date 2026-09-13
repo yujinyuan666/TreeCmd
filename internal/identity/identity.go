@@ -573,11 +573,22 @@ func issueCert(cn string, pub ed25519.PublicKey, parent *x509.Certificate, paren
 		return nil, err
 	}
 	sanURI, _ := url.Parse("spiffe://treecmd/node/" + cn)
+	// 有效期：身份证书短、CA 证书长。
+	//
+	// 身份证书走"运行期续签"（父给子重签 / 根自签重签），30 天 + 生命期 2/3 处换发，
+	// 换证只影响自己，代价小。
+	// CA 证书则是**全树信任锚链的一环**：换 CA 意味着所有下级节点都要重新分发 trust/，
+	// 所以给它长有效期（10 年），让它稳定；否则有下级的节点（中继）会陷入
+	// "CA 证书 30 天到期、而续签只换身份证书链"的死角（启动强校验会因 CA 过期拒绝启动）。
+	notAfter := now.AddDate(0, 0, 30)
+	if isCA {
+		notAfter = now.AddDate(10, 0, 0)
+	}
 	tmpl := &x509.Certificate{
 		SerialNumber:          sn,
 		Subject:               pkix.Name{CommonName: cn, Organization: []string{"treecmd"}},
 		NotBefore:             now,
-		NotAfter:              now.AddDate(0, 0, 30), // 有效期 30 天（见 7.7）
+		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,

@@ -30,6 +30,17 @@ type CheckReport struct {
 	CertSerialOK    bool      // 证书链/身份/有效期是否通过
 
 	CanIssueChildCerts bool // 是否持有 CA 材料（有子节点才需要）
+	// CertInRenewWindow 证书是否已进入续签窗口（剩余 < 生命期 1/3，含已过期）。
+	// 根会**启动时自签续期**；有父的节点会向父申请换发。`-check` 只报告、不执行。
+	CertInRenewWindow bool
+	// CanSelfRenew 本节点能否自签续期（没有父 + 持有 CA 材料，即根）
+	CanSelfRenew bool
+	// SelfRenewNeeded 证书是否已进续签窗口、启动时会走自签续期（`-check` 里只做只读演练）
+	SelfRenewNeeded bool
+	// CertAfterSelfRenew 自签续期之后证书会变成的到期时间（仅在 SelfRenewNeeded 时有意义）
+	CertAfterSelfRenew time.Time
+	// SelfRenewErr 演练/续期过程中的错误（非空表示续不上，启动会因证书问题被拒）
+	SelfRenewErr error
 
 	TrustAnchorPaths []string
 	TrustAnchors     int
@@ -90,18 +101,29 @@ func Check(cfg *config.Config) (*CheckReport, error) {
 		}
 	}
 
-	b, err := loadIdentity(cfg)
+	// selfRenew=false：`-check` 是只读自检，绝不落盘（要不要自续只报告，不执行）
+	b, err := loadIdentity(cfg, false)
 	if err != nil {
 		return rep, err
 	}
 	rep.PendingEnroll = b.pending
 	rep.IdentityReady = !b.pending
 	rep.CertSerialOK = !b.pending && b.id != nil && b.id.Cert != nil
+	// 自签续期是"只读演练"：b.id.Cert 此时已是**续期后**的证书，所以报告里给的是磁盘上那张的到期时间
+	rep.SelfRenewNeeded = b.selfRenewNeeded
+	rep.SelfRenewErr = b.selfRenewErr
 	if b.id != nil {
 		rep.CanIssueChildCerts = b.id.CAKey != nil && b.id.CACert != nil
 		if b.id.Cert != nil {
 			rep.CertNotAfter = b.id.Cert.NotAfter
+			if b.selfRenewNeeded {
+				rep.CertNotAfter = b.certBeforeNotAfter // 报告磁盘上那张（更诚实）
+			}
+			rep.CertAfterSelfRenew = b.certAfterSelfRenew
 			rep.CertFingerprint = fmt.Sprintf("%x", identity.Fingerprint(b.id.Cert))[:16]
+			rep.CertInRenewWindow = needRenew(b.id.Cert)
+			// 根：没有父，只能自己签自己；有父的节点由父签发，所以不能自签
+			rep.CanSelfRenew = cfg.Role() == config.RoleRoot && rep.CanIssueChildCerts
 		}
 	}
 
@@ -123,6 +145,19 @@ func Check(cfg *config.Config) (*CheckReport, error) {
 	}
 	if cfg.Role() == config.RoleRoot && b.pending {
 		rep.Warnings = append(rep.Warnings, "根节点没有父可签发，证书必须自带")
+	}
+	if rep.SelfRenewNeeded {
+		if rep.SelfRenewErr != nil {
+			rep.Warnings = append(rep.Warnings,
+				"证书已进入续签窗口，但自签续期演练失败："+rep.SelfRenewErr.Error())
+		} else {
+			rep.Warnings = append(rep.Warnings, fmt.Sprintf(
+				"证书已进入续签窗口（磁盘上那张有效至 %s）：启动时会自动自签续期到 %s；本次自检只演练、不落盘",
+				rep.CertNotAfter.Format("2006-01-02"), rep.CertAfterSelfRenew.Format("2006-01-02")))
+		}
+	} else if rep.CertInRenewWindow && !rep.CanSelfRenew {
+		rep.Warnings = append(rep.Warnings,
+			"证书已进入续签窗口（剩余不足生命期 1/3）：启动后会向父申请换发")
 	}
 	if !rep.CertReloadEnabled {
 		rep.Warnings = append(rep.Warnings, "证书热重载已关闭：外部脚本换证书后需要重启进程")

@@ -289,6 +289,16 @@ func (n *Node) reloadCertsInner(trigger string) certReloadResult {
 			go n.up.forceReconnect("cert-reloaded")
 		}
 	}
+
+	// 换进来的证书若已进入续签窗口、而本节点又能自签（根），顺手续一张 —— 否则它会静静地在
+	// 几天后过期。有父的节点不用管：父会在它 Connect / RESUME 时主动换发。
+	if n.canSelfRenew() && needRenew(n.Id().Cert) {
+		go func() {
+			if err := n.renewSelfCert("reloaded certificate in renewal window"); err != nil {
+				n.Log.Warn("cert self-renew after reload failed", "err", err)
+			}
+		}()
+	}
 	return reloadOK
 }
 
@@ -351,7 +361,8 @@ func identityChanged(old, cur *identity.Identity) bool {
 //	*identityBundle — 校验通过的身份材料
 //	error           — 缺可用证书或校验失败时返回（调用方应继续用旧材料）
 func loadIdentityForReload(cfg *config.Config) (*identityBundle, error) {
-	b, err := loadIdentity(cfg)
+	// selfRenew=false：热重载只负责"把外部投放的材料吃进来"，绝不自己写证书文件
+	b, err := loadIdentity(cfg, false)
 	if err != nil {
 		return nil, err
 	}

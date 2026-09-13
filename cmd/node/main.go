@@ -198,7 +198,22 @@ func runCheck(cfg *config.Config) int {
 	if rep.PendingEnroll {
 		line("证书", "尚未签发 → 将向父入网换取")
 	} else if rep.CertSerialOK {
-		line("证书", fmt.Sprintf("有效至 %s（指纹 %s）", rep.CertNotAfter.Format(time.RFC3339), rep.CertFingerprint))
+		remaining := time.Until(rep.CertNotAfter)
+		days := int(remaining.Hours() / 24)
+		note := ""
+		switch {
+		case days < 0:
+			note = "  ← 已过期"
+		case rep.CertInRenewWindow:
+			note = "  ← 已进入续签窗口"
+		}
+		line("证书", fmt.Sprintf("有效至 %s（剩余 %d 天，指纹 %s）%s",
+			rep.CertNotAfter.Format("2006-01-02"), days, rep.CertFingerprint, note))
+		if rep.CanSelfRenew {
+			line("证书续期", "自签续期（根持有 CA 材料，启动时若进窗口会自动重签一张）")
+		} else {
+			line("证书续期", "向父申请换发（生命期 2/3 处）")
+		}
 	}
 	if cfg.NodeIDSource == config.IDFromGenerated {
 		line("node.id", fmt.Sprintf("未写定 → 启动时生成 %s 并写入 %s（本次只读自检，未落盘）",

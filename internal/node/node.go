@@ -57,6 +57,8 @@ type Node struct {
 	certSignal chan string
 	// 入网互斥：同一时刻只允许一次入网流程
 	enrolling atomic.Bool
+	// 自签续期互斥：根的自续可能被"本地调度"与"证书热重载后补续"同时触发
+	selfRenewMu sync.Mutex
 
 	// 运行期入网：一次性挑战表（nodeID → challenge）
 	enrollMu   sync.Mutex
@@ -170,10 +172,17 @@ func NewWithPath(cfg *config.Config, cfgPath string, logger *slog.Logger) (*Node
 	n.semLocal = make(chan struct{}, cfg.Command.MaxInflight)
 	n.inflight = newInflightTable()
 
-	// 身份材料
-	st, err := loadIdentity(cfg)
+	// 身份材料（selfRenew=true：这是真正的启动装配，允许根在启动时顺带自签续期并落盘）
+	st, err := loadIdentity(cfg, true)
 	if err != nil {
 		return nil, err
+	}
+	if st.selfRenewErr != nil {
+		n.Log.Warn("证书自签续期未成功，沿用现有证书", "err", st.selfRenewErr)
+	}
+	if st.selfRenewed {
+		n.Log.Info("证书已自签续期（根没有父，用自己的 CA 重签了一张）",
+			"cert_not_after", canonTime(st.id.Cert), "path", cfg.Security.IdentityCertPath)
 	}
 	n.idPtr.Store(st.id)
 	n.roots.Store(st.roots)
@@ -222,6 +231,14 @@ type identityBundle struct {
 	cs    []*x509.Certificate // 信任锚原始证书（校验时复用）
 	// pending = "密钥齐备但还没有证书"，等待运行期入网签发
 	pending bool
+	// 根的自签续期结论（根没有父，只能用自己的 CA 重签自己）。
+	// selfRenewNeeded 在"证书已进续签窗口"时为 true，无论最终有没有真的重签；
+	// certBeforeNotAfter 是**动刀之前**那张证书的到期时间，供 `-check` 如实报告。
+	selfRenewNeeded    bool
+	selfRenewed        bool
+	selfRenewErr       error
+	certBeforeNotAfter time.Time
+	certAfterSelfRenew time.Time
 }
 
 // loadIdentity 加载本节点身份材料并做启动强校验。
@@ -237,13 +254,17 @@ type identityBundle struct {
 //
 // 参数：
 //
-//	cfg — 本节点配置；读 security.* 下的密钥 / 证书 / 信任锚路径
+//	cfg       — 本节点配置；读 security.* 下的密钥 / 证书 / 信任锚路径
+//	selfRenew — true 表示允许"顺带自签续期"：**根**没有父、没有任何人给它续签，
+//	            而它自己就持有 CA 材料，所以若证书已进续签窗口（含已过期）就先自签换一张
+//	            再校验、并写回证书文件。**只有真正的启动装配传 true**：
+//	            `-check`（只读自检）与证书热重载都必须保持"不落盘"的语义。
 //
 // 返回：
 //
 //	*identityBundle — 身份材料（私钥、证书链、信任锚池）；证书暂缺时为 pending = true
 //	error           — 任一硬校验失败；错误文案以 "REFUSE TO START:" 开头
-func loadIdentity(cfg *config.Config) (*identityBundle, error) {
+func loadIdentity(cfg *config.Config, selfRenew bool) (*identityBundle, error) {
 	// 信任锚：每一项都可以是文件或目录（目录扫 *.crt/*.pem）
 	var cs []*x509.Certificate
 	if len(cfg.Security.CACertPaths) > 0 {
@@ -275,10 +296,59 @@ func loadIdentity(cfg *config.Config) (*identityBundle, error) {
 		if len(anchors) == 0 {
 			anchors = []*x509.Certificate{id.CACert}
 		}
-		if err := identity.ValidateStartup(id, anchors, pub); err != nil {
+		b := &identityBundle{id: id, roots: identity.NewPool(anchors...), cs: anchors}
+
+		// 根的自签续期：根没有父，谁都签不了它，但它自己就持有 CA 材料 ——
+		// 所以进入续签窗口（含已过期）时由它自己重签一张，这才叫"第一次启动之后全自动"。
+		//
+		// 两种模式共用同一套逻辑，只有"要不要落盘"不同：
+		//   · selfRenew=true（真正的启动装配）→ 校验通过就写回证书文件；
+		//   · selfRenew=false（`-check` 只读自检）→ **只把内存换成新证书**，让后面的强校验
+		//     如实反映"启动时会发生什么"，但绝不落盘。
+		//
+		// 注意：演练模式**不碰 id**（尤其不改 bundle 里的 id.Cert）。热重载路径会复用这个 bundle，
+		// 一旦在演练里把内存换成新证书，调用方就会以为"证书已经不在窗口了"从而漏掉续期。
+		var renewChain []*x509.Certificate
+		if needRenew(id.Cert) && id.CAKey != nil && id.CACert != nil {
+			b.selfRenewNeeded = true
+			b.certBeforeNotAfter = id.Cert.NotAfter
+			chain, err := reissueChainForSelf(id)
+			var candErr error
+			if err == nil {
+				// 先用"启动同一强度"校验新证书：新证书自己都不过关就绝不能落盘，
+				// 否则等于把一张还能用的证书换成坏的
+				candErr = identity.ValidateStartup(withChain(id, chain), anchors, pub)
+			}
+			switch {
+			case err != nil:
+				b.selfRenewErr = err
+			case candErr != nil:
+				b.selfRenewErr = fmt.Errorf("自签重签后的证书未通过强校验，未落盘: %w", candErr)
+			default:
+				renewChain = chain
+				b.certAfterSelfRenew = chain[0].NotAfter
+				if selfRenew {
+					if werr := applySelfRenew(cfg, id, chain); werr != nil {
+						b.selfRenewErr, renewChain = werr, nil
+					} else {
+						b.selfRenewed = true
+					}
+				}
+			}
+		}
+
+		// 强校验按"实际会用的那张证书"判定：
+		//   · selfRenew=true 且已落盘 → id 里就是续期后的证书；
+		//   · 只读演练（-check）→ id 还是磁盘上那张（可能已过期），改用 renewChain 判，
+		//     这样 -check 的结论才与真实启动一致（"能启动，因为启动时会自续"）。
+		effective := id
+		if renewChain != nil && !b.selfRenewed {
+			effective = withChain(id, renewChain)
+		}
+		if err := identity.ValidateStartup(effective, anchors, pub); err != nil {
 			return nil, fmt.Errorf("REFUSE TO START: startup identity validation failed: %w", err)
 		}
-		return &identityBundle{id: id, roots: identity.NewPool(anchors...), cs: anchors}, nil
+		return b, nil
 	}
 
 	if !fileExists(cfg.Security.IdentityCertPath) {
@@ -303,7 +373,13 @@ func loadIdentity(cfg *config.Config) (*identityBundle, error) {
 		return nil, err
 	}
 	if err := identity.ValidateStartup(id, cs, pub); err != nil {
-		return nil, fmt.Errorf("REFUSE TO START: startup identity validation failed: %w", err)
+		// 证书过期多半是"停机超过了剩余有效期"：子节点的证书只能由**父**签发，
+		// 它自己签不了，所以这里给出唯一的自救路径。
+		hint := ""
+		if id.Cert != nil && time.Now().After(id.Cert.NotAfter) {
+			hint = "；证书已过期，而子节点的证书只能由父签发 —— 挪走证书文件后启动会走运行期入网重新换取，或让父端换发"
+		}
+		return nil, fmt.Errorf("REFUSE TO START: startup identity validation failed: %w%s", err, hint)
 	}
 	return &identityBundle{id: id, roots: identity.NewPool(cs...), cs: cs}, nil
 }
@@ -754,6 +830,8 @@ func (n *Node) startBackgroundLoops() {
 	}
 	// 证书续签：子节点本地调度（生命期 2/3 处主动发起；父若有 CA 材料才会真的签发）
 	n.startCertRenewLoop()
+	// 根的自签续期：没有父、但持有 CA 材料的节点（根）自己重签自己（与上面那条互斥）
+	n.startSelfRenewLoop()
 	// 证书热重载：轮询兜底 + SIGUSR1 立即生效（外部脚本换证后无需重启）
 	n.startCertReloadLoop()
 	// state.dat 周期落盘

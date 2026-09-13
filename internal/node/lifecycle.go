@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -137,6 +138,162 @@ func (n *Node) startCertRenewLoop() {
 		if needRenew(n.Id().Cert) {
 			n.Log.Info("cert renew: requesting from parent", "not_after", n.Id().Cert.NotAfter.Format(time.RFC3339))
 			n.up.sendCertRenewReq("local schedule (2/3 of lifetime)")
+		}
+	})
+}
+
+// ---------- 根的自签续期（根没有父，只能自己签自己） ----------
+
+// applySelfRenew 把自签续期得到的新证书链落盘，并同步更新内存里的身份包。
+//
+// 调用方**必须先用 `identity.ValidateStartup` 校验过新证书**再调它（见 loadIdentity / renewSelfCert）：
+// 本函数只负责"写下去 + 换内存"，不做任何校验，以免把一张坏证书覆盖到好证书上。
+//
+// 参数：
+//
+//	cfg   — 本节点配置；写回目标是 security.identity_cert_path
+//	id    — 本节点身份包（会被就地更新 Cert / Chain）
+//	chain — 校验通过的新证书链，chain[0] 是新身份证书
+//
+// 返回：
+//
+//	error — 写盘失败时返回；此时内存与磁盘都保持原样
+func applySelfRenew(cfg *config.Config, id *identity.Identity, chain []*x509.Certificate) error {
+	if err := identity.WriteCertChainFile(cfg.Security.IdentityCertPath, chain); err != nil {
+		return err
+	}
+	id.Cert, id.Chain = chain[0], chain
+	return nil
+}
+
+// withChain 用一条新的证书链复制一份身份包（**不改原对象**）。
+//
+// 用途：先拿"换证后长什么样"去跑一遍启动强校验，通过了再决定要不要真的落盘。
+//
+// 参数：
+//
+//	id    — 原身份包（提供 NodeID / 私钥 / CA 材料）
+//	chain — 待校验的新证书链
+//
+// 返回：
+//
+//	*identity.Identity — 只把 Cert / Chain 换掉的副本，其余字段原样引用
+func withChain(id *identity.Identity, chain []*x509.Certificate) *identity.Identity {
+	return &identity.Identity{
+		NodeID: id.NodeID, Key: id.Key, Cert: chain[0], Chain: chain,
+		CAKey: id.CAKey, CACert: id.CACert, CAChain: id.CAChain,
+	}
+}
+
+// reissueChainForSelf 用本节点 CA 重签自己的身份证书并解析成证书链（**不落盘**）。
+//
+// 参数：
+//
+//	id — 本节点身份包；id.Cert 提供身份名与公钥，CAKey/CACert/CAChain 提供签发材料
+//
+// 返回：
+//
+//	[]*x509.Certificate — 新证书链（[新身份证书, 本节点 CA 证书…]）
+//	error               — 无 CA 材料 / 旧证书不是 Ed25519 / 新证书身份与旧的不一致时返回
+func reissueChainForSelf(id *identity.Identity) ([]*x509.Certificate, error) {
+	if id == nil || id.Cert == nil {
+		return nil, errors.New("identity certificate missing")
+	}
+	if id.CAKey == nil || id.CACert == nil {
+		return nil, errors.New("no CA material to sign with（本节点不持 CA 私钥与 CA 证书）")
+	}
+	pemBytes, err := identity.ReissueFor(id.Cert, id)
+	if err != nil {
+		return nil, err
+	}
+	chain, err := identity.ParseChainPEM(pemBytes)
+	if err != nil || len(chain) == 0 {
+		return nil, fmt.Errorf("自签续期结果无法解析: %v", err)
+	}
+	// 续签是"同一身份换一张证"，身份变了说明中间出了错，宁可失败
+	if got := identity.NodeIDFromCert(chain[0]); got != id.NodeID {
+		return nil, fmt.Errorf("自签续期后的证书身份不符: %s != %s", got, id.NodeID)
+	}
+	return chain, nil
+}
+
+// renewSelfCert 运行期的自签续期：重签 → 与启动同一强度校验 → 原子落盘 → 热切换 TLS 材料。
+//
+// 接收者 n 是本节点实例；带互斥，同一时刻只会有一个自续在跑。
+//
+// 参数：
+//
+//	reason — 触发原因（仅用于日志）
+//
+// 返回：
+//
+//	error — 无 CA 材料 / 新证书校验不过 / 落盘失败时返回；失败时**继续用旧证书**（fail-safe）
+func (n *Node) renewSelfCert(reason string) error {
+	n.selfRenewMu.Lock()
+	defer n.selfRenewMu.Unlock()
+
+	if !n.canSelfRenew() {
+		return errors.New("本节点不能自签续期（有父的节点由父签发；没有 CA 材料则无从自签）")
+	}
+	cur := n.Id()
+	chain, err := reissueChainForSelf(cur)
+	if err != nil {
+		return err
+	}
+	// 先按"启动同一强度"校验**新证书**再落盘：宁可续不上，也不能把一张坏证书写进去
+	pub, err := identity.LoadPublicKeyFile(n.C().Security.IdentityPubKeyPath)
+	if err != nil {
+		return fmt.Errorf("load public key: %w", err)
+	}
+	if err := identity.ValidateStartup(withChain(cur, chain), identity.PoolCerts(n.rootsPool()), pub); err != nil {
+		return fmt.Errorf("自签续期未通过启动强度校验: %w", err)
+	}
+	if err := applySelfRenew(n.C(), cur, chain); err != nil {
+		return err
+	}
+	n.certBox.Set(identity.TLSCertFrom(cur))
+	// 这份文件是我们自己写的 → 重算监视基线，免得被当成"外部变更"再触发一轮重载
+	n.refreshReloadBaseline()
+	n.Log.Info("cert self-renew: applied", "reason", reason,
+		"not_after", canonTime(chain[0]), "fingerprint", certSha256(chain[0]))
+	return nil
+}
+
+// canSelfRenew 本节点能否"自签续期"：**没有父**（即根），且自己持有 CA 材料。
+//
+// 有父的节点一律不自签：它的身份证书必须由父签发，自己签自己会破坏"父签发子"的授权模型。
+//
+// 接收者 n 是本节点实例（要求已完成装配、n.up 已确定）。
+//
+// 返回：
+//
+//	bool — true 表示可以自己重签自己的身份证书
+func (n *Node) canSelfRenew() bool {
+	if n.up != nil {
+		return false
+	}
+	id := n.Id()
+	return id != nil && id.Cert != nil && id.CAKey != nil && id.CACert != nil
+}
+
+// startSelfRenewLoop 启动"根自签续期"调度：没有父、但持有 CA 材料的节点（即根）每小时检查一次，
+// 进入续签窗口就自己重签一张。
+//
+// 与 startCertRenewLoop 互斥且互补：有父的节点由**父**给它签（子自己没 CA 材料）；
+// 没有父的就是根，只能自签。
+//
+// 接收者 n 是本节点实例。
+func (n *Node) startSelfRenewLoop() {
+	if !n.canSelfRenew() {
+		return // 有父（走"父给子签"）或没有 CA 材料（无从自签）
+	}
+	n.loop(time.Hour, 2*time.Minute, "cert-self-renew", func(context.Context) {
+		if !needRenew(n.Id().Cert) {
+			return
+		}
+		n.Log.Info("cert self-renew: certificate in renewal window", "not_after", canonTime(n.Id().Cert))
+		if err := n.renewSelfCert("local schedule (2/3 of lifetime)"); err != nil {
+			n.Log.Warn("cert self-renew failed", "err", err)
 		}
 	})
 }
