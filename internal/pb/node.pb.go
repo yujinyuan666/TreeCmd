@@ -2688,15 +2688,13 @@ func (x *UploadAck) GetReason() string {
 }
 
 type RegisterRequest struct {
-	state        protoimpl.MessageState `protogen:"open.v1"`
-	NodeId       string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
-	Pubkey       []byte                 `protobuf:"bytes,2,opt,name=pubkey,proto3" json:"pubkey,omitempty"`
-	Sig          []byte                 `protobuf:"bytes,3,opt,name=sig,proto3" json:"sig,omitempty"` // 对 (guid, pubkey, nonce, epoch) 签名
-	Nonce        []byte                 `protobuf:"bytes,4,opt,name=nonce,proto3" json:"nonce,omitempty"`
-	Epoch        uint64                 `protobuf:"varint,5,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	Labels       []string               `protobuf:"bytes,6,rep,name=labels,proto3" json:"labels,omitempty"`
-	Capabilities []string               `protobuf:"bytes,7,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
-	ListenAddr   string                 `protobuf:"bytes,8,opt,name=listen_addr,json=listenAddr,proto3" json:"listen_addr,omitempty"`
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	NodeId     string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	Pubkey     []byte                 `protobuf:"bytes,2,opt,name=pubkey,proto3" json:"pubkey,omitempty"`
+	Sig        []byte                 `protobuf:"bytes,3,opt,name=sig,proto3" json:"sig,omitempty"` // 对 (guid, pubkey, nonce, epoch) 签名
+	Nonce      []byte                 `protobuf:"bytes,4,opt,name=nonce,proto3" json:"nonce,omitempty"`
+	Epoch      uint64                 `protobuf:"varint,5,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	ListenAddr string                 `protobuf:"bytes,8,opt,name=listen_addr,json=listenAddr,proto3" json:"listen_addr,omitempty"`
 	// 节点元信息（ADR-051）：人类可读的"我是谁"，用于父端/根端展示与运维定位。
 	// 仅展示用途，不参与任何权限判定与摘要计算。
 	NodeName     string `protobuf:"bytes,9,opt,name=node_name,json=nodeName,proto3" json:"node_name,omitempty"`
@@ -2774,20 +2772,6 @@ func (x *RegisterRequest) GetEpoch() uint64 {
 		return x.Epoch
 	}
 	return 0
-}
-
-func (x *RegisterRequest) GetLabels() []string {
-	if x != nil {
-		return x.Labels
-	}
-	return nil
-}
-
-func (x *RegisterRequest) GetCapabilities() []string {
-	if x != nil {
-		return x.Capabilities
-	}
-	return nil
 }
 
 func (x *RegisterRequest) GetListenAddr() string {
@@ -5660,7 +5644,7 @@ type ConfigPush struct {
 	state  protoimpl.MessageState `protogen:"open.v1"`
 	Reason string                 `protobuf:"bytes,1,opt,name=reason,proto3" json:"reason,omitempty"`
 	// 只承载**运行参数**（command./health./query./persist. 段）的覆盖项，形如 "command.lease_ttl=120s"。
-	// 绝不承载进 config_hash 的字段（identity / parents / node.listen / labels / capabilities）。
+	// 绝不承载进 config_hash 的字段（identity / parents / node.listen）。
 	Overrides     []string `protobuf:"bytes,2,rep,name=overrides,proto3" json:"overrides,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -6774,15 +6758,13 @@ const file_node_proto_rawDesc = "" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x18\n" +
 	"\amissing\x18\x02 \x03(\x05R\amissing\x12\x14\n" +
 	"\x05final\x18\x03 \x01(\bR\x05final\x12\x16\n" +
-	"\x06reason\x18\x04 \x01(\tR\x06reason\"\x82\x03\n" +
+	"\x06reason\x18\x04 \x01(\tR\x06reason\"\xe8\x02\n" +
 	"\x0fRegisterRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x16\n" +
 	"\x06pubkey\x18\x02 \x01(\fR\x06pubkey\x12\x10\n" +
 	"\x03sig\x18\x03 \x01(\fR\x03sig\x12\x14\n" +
 	"\x05nonce\x18\x04 \x01(\fR\x05nonce\x12\x14\n" +
-	"\x05epoch\x18\x05 \x01(\x04R\x05epoch\x12\x16\n" +
-	"\x06labels\x18\x06 \x03(\tR\x06labels\x12\"\n" +
-	"\fcapabilities\x18\a \x03(\tR\fcapabilities\x12\x1f\n" +
+	"\x05epoch\x18\x05 \x01(\x04R\x05epoch\x12\x1f\n" +
 	"\vlisten_addr\x18\b \x01(\tR\n" +
 	"listenAddr\x12\x1b\n" +
 	"\tnode_name\x18\t \x01(\tR\bnodeName\x12#\n" +
@@ -6793,7 +6775,7 @@ const file_node_proto_rawDesc = "" +
 	"\vbinary_hash\x18\f \x01(\tR\n" +
 	"binaryHash\x12\x1f\n" +
 	"\vbinary_size\x18\r \x01(\x03R\n" +
-	"binarySize\"\xa1\x03\n" +
+	"binarySizeJ\x04\b\x06\x10\aJ\x04\b\a\x10\bR\x06labelsR\fcapabilities\"\xa1\x03\n" +
 	"\vRegisterAck\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x16\n" +
 	"\x06reason\x18\x02 \x01(\tR\x06reason\x12\x12\n" +

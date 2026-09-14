@@ -652,7 +652,7 @@ func (h *Hub) serveConn(stream pb.NodeService_ConnectServer, peerID string, pub 
 
 	// 注册表：标签摘要（子树摘要）由子上报；name/remark 是 ADR-051 的展示用元信息
 	child := &registry.Child{
-		NodeID: peerID, Path: path, Labels: labelsFrom(reg), Caps: reg.Capabilities,
+		NodeID: peerID, Path: path,
 		Name: reg.NodeName, Remark: reg.NodeRemark,
 		ListenAddr: reg.ListenAddr, Confirmed: true, RegisteredAt: time.Now(), LastEpoch: reg.Epoch,
 		// 子上报的是"它自己那份镜像"：父端拿它和 h.n.Build().Hash 一比就知道谁没跟上
@@ -1174,28 +1174,6 @@ func majorOf(v string) string {
 		}
 	}
 	return v
-}
-
-// labelsFrom 把注册请求里的 "k=v" 标签列表解析成 map。
-//
-// 参数：
-//
-//	r — 注册请求，其 Labels 形如 {"zone=az1", "gpu=1"}
-//
-// 返回：
-//
-//	map[string]string — 键值对；没有 '=' 的项被忽略
-func labelsFrom(r *pb.RegisterRequest) map[string]string {
-	out := map[string]string{}
-	for _, l := range r.Labels {
-		for i := 0; i < len(l); i++ {
-			if l[i] == '=' {
-				out[l[:i]] = l[i+1:]
-				break
-			}
-		}
-	}
-	return out
 }
 
 // existingOr 优先返回注册表里已知的子节点 path，没有则用 fallback。

@@ -357,7 +357,7 @@ func readFrames(ctx context.Context, stream pb.NodeService_ConnectClient, ch cha
 	}
 }
 
-// buildRegister 组装注册请求：能力 / 标签 / nonce / 公钥，并对载荷签名。
+// buildRegister 组装注册请求：nonce / 公钥 / 监听地址 / 元信息，并对载荷签名。
 //
 // 接收者 u 是上行侧（客户端角色）的连接管理器。
 //
@@ -365,14 +365,6 @@ func readFrames(ctx context.Context, stream pb.NodeService_ConnectClient, ch cha
 //
 //	*pb.RegisterRequest — 首帧要发送的注册请求
 func (u *Upstream) buildRegister() *pb.RegisterRequest {
-	caps := u.n.C().Node.Capabilities
-	if len(caps) == 0 {
-		caps = u.n.Exec.Types()
-	}
-	labels := make([]string, 0, len(u.n.C().Node.Labels))
-	for _, k := range sortedKeys(u.n.C().Node.Labels) {
-		labels = append(labels, k+"="+u.n.C().Node.Labels[k])
-	}
 	nonce := make([]byte, 16)
 	for i := range nonce {
 		nonce[i] = byte(randInt63n(256))
@@ -381,7 +373,7 @@ func (u *Upstream) buildRegister() *pb.RegisterRequest {
 	return &pb.RegisterRequest{
 		NodeId: u.n.C().Node.ID, Pubkey: u.n.Id().Key.Public().(ed25519.PublicKey),
 		Nonce: nonce, Epoch: u.epoch, Sig: identity.Sign(u.n.Id().Key, payload),
-		Labels: labels, Capabilities: caps, ListenAddr: u.n.C().Node.Listen,
+		ListenAddr: u.n.C().Node.Listen,
 		// 元信息（ADR-051）：随每次注册/重注册上行，父端据此展示"我是谁"
 		NodeName: u.n.C().Node.Name, NodeRemark: u.n.C().Node.Remark,
 		ProtoVersion: protoVersion,

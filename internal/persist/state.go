@@ -10,17 +10,14 @@ import (
 	"time"
 )
 
-// KnownChild 只留静态信息（id / path / name / remark / caps / labels），
+// KnownChild 只留静态信息（id / path / name / remark），
 // 供启动预热注册表并标记为未确认（6.2）。凡"会变的事实"一律以 bbolt 为准：
 // LastSeenAt / last_epoch / status 都不在这里。
 type KnownChild struct {
-	ID         string            `json:"id"`
-	Path       string            `json:"path"`
-	Name       string            `json:"name,omitempty"`   // 节点名（ADR-051；旧快照无此字段 → 空值，向后兼容）
-	Remark     string            `json:"remark,omitempty"` // 节点备注（ADR-051）
-	Caps       []string          `json:"caps,omitempty"`
-	Labels     map[string]string `json:"labels,omitempty"`
-	TagSummary []string          `json:"tag_summary,omitempty"`
+	ID     string `json:"id"`
+	Path   string `json:"path"`
+	Name   string `json:"name,omitempty"`   // 节点名（ADR-051；旧快照无此字段 → 空值，向后兼容）
+	Remark string `json:"remark,omitempty"` // 节点备注（ADR-051）
 }
 
 // Self 本节点静态身份快照。

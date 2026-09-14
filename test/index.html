@@ -172,7 +172,7 @@ footer{color:var(--fg3);padding:18px 16px 32px;max-width:1180px;margin:0 auto;fo
               <option value="sleep">sleep — 睡 N 毫秒</option>
               <option value="fail">fail — 故意失败（测失败传播）</option>
             </select></td></tr>
-          <tr><th>payload</th><td><input id="fPayload" style="width:100%" placeholder="echo 填文本；sleep 填毫秒数；fail 空=fail 全树，k=v=只让标签匹配的节点失败" spellcheck="false"></td></tr>
+          <tr><th>payload</th><td><input id="fPayload" style="width:100%" placeholder="echo 填文本；sleep 填毫秒数；fail 空=fail 全树，填文本=用该文本当失败原因" spellcheck="false"></td></tr>
           <tr><th>aggregate</th><td>
             <select id="fAgg"><option>TREE</option><option>MERGE</option><option>SUM</option><option>COUNT</option></select></td></tr>
           <tr><th>on_failure</th><td>
@@ -370,8 +370,6 @@ async function loadTree() {
     <dt>remark</dt><dd>${esc(d.node_remark || '—')}</dd>
     <dt>path</dt><dd class="mono">${esc(d.path)}</dd>
     <dt>listen</dt><dd class="mono">${esc(d.listen || '—（根没配 listen 就不对外收注册）')}</dd>
-    <dt>labels</dt><dd class="mono">${esc(JSON.stringify(d.labels))}</dd>
-    <dt>caps</dt><dd class="mono">${esc(JSON.stringify(d.caps))}</dd>
     <dt>对象存储</dt><dd class="mono">${esc(d.object_store || '—')}</dd>
   </dl>`;
 
@@ -504,7 +502,7 @@ const PRESETS = [
   { n: '全树失败（fail）',     type:'fail',  payload:'',      agg:'TREE',  onfail:'ALL_MUST_SUCCEED' },
   { n: '全树失败 + BEST_EFFORT', type:'fail', payload:'',     agg:'TREE',  onfail:'BEST_EFFORT' },
   { n: '失败 + TOLERATE_N:2',  type:'fail',  payload:'',      agg:'TREE',  onfail:'TOLERATE_N:2' },
-  { n: '标签筛选失败 k=v',      type:'fail',  payload:'zone=east', agg:'TREE', onfail:'ALL_MUST_SUCCEED' },
+  { n: '失败 + 自定义原因',      type:'fail',  payload:'boom: upstream timeout', agg:'TREE', onfail:'ALL_MUST_SUCCEED' },
   { n: '大载荷 64KB（看分片）',  type:'echo',  payload:'x'.repeat(65536), agg:'TREE', onfail:'ALL_MUST_SUCCEED' },
 ];
 

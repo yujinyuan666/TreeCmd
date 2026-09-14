@@ -218,7 +218,7 @@ func (n *Node) runLocal(ctx context.Context, c *pb.Command) ([]byte, error) {
 	ex := n.Exec.For(c.Type)
 	spec := exec.Spec{
 		CommandID: c.Id, NodeID: n.C().Node.ID, Path: n.SelfPath(),
-		Type: c.Type, Payload: c.Payload, Labels: n.C().Node.Labels,
+		Type: c.Type, Payload: c.Payload,
 	}
 	if err := ex.Validate(spec); err != nil {
 		return nil, err

@@ -94,12 +94,9 @@ func (n *Node) SubmitCommand(req SubmitRequest, originID string) (*SubmitResult,
 	if req.Type == "" {
 		return nil, fmt.Errorf("ERR_TYPE_REQUIRED")
 	}
-	// 能力校验：X 自己也在"命中集合"里（默认 SUBTREE 含自身）
+	// 能力校验：类型必须在本节点登记的执行器里（X 自己也在"命中集合"里，默认 SUBTREE 含自身）
 	if !n.Exec.Has(req.Type) {
 		return nil, fmt.Errorf("ERR_CAPABILITY_UNSUPPORTED: type %q not registered", req.Type)
-	}
-	if len(n.C().Node.Capabilities) > 0 && !contains(n.C().Node.Capabilities, req.Type) {
-		return nil, fmt.Errorf("ERR_CAPABILITY_UNSUPPORTED: type %q not in capabilities", req.Type)
 	}
 	payload := req.Payload
 	if payload == nil && req.PayloadB64 != "" {
@@ -423,14 +420,4 @@ func parsePEMChain(b []byte) ([]*x509.Certificate, error) {
 		out = append(out, c)
 	}
 	return out, nil
-}
-
-// contains 判断字符串列表里是否含有指定字符串。
-func contains(list []string, s string) bool {
-	for _, x := range list {
-		if x == s {
-			return true
-		}
-	}
-	return false
 }

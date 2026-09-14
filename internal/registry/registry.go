@@ -20,8 +20,6 @@ type Child struct {
 	Path         string
 	Name         string // 节点名（人类可读，注册时上报；仅展示用途）
 	Remark       string // 节点备注（注册时上报；仅展示用途）
-	Labels       map[string]string
-	Caps         []string
 	ListenAddr   string
 	Confirmed    bool // 是否真的连上过（warm 预热不算）
 	RegisteredAt time.Time
@@ -36,8 +34,6 @@ type Table struct {
 	mu       sync.RWMutex
 	selfID   string
 	selfPath string
-	labels   map[string]string
-	caps     []string
 	children map[string]*Child
 }
 
@@ -47,16 +43,13 @@ type Table struct {
 //
 //	selfID   — 本节点 NodeID
 //	selfPath — 本节点路径；根节点通常是 "/"
-//	labels   — 本节点标签
-//	caps     — 本节点能力列表
 //
 // 返回：
 //
 //	*Table — 子节点为空的表，可直接使用
-func New(selfID, selfPath string, labels map[string]string, caps []string) *Table {
+func New(selfID, selfPath string) *Table {
 	return &Table{
 		selfID: selfID, selfPath: selfPath,
-		labels: labels, caps: caps,
 		children: map[string]*Child{},
 	}
 }
@@ -90,49 +83,10 @@ func (t *Table) SetSelfPath(p string) {
 	t.selfPath = p
 }
 
-// SetLabels 更新本节点标签。
-//
-// 接收者 t 是本节点的直接子节点表。
-//
-// 参数：
-//
-//	l — 新的标签表
-func (t *Table) SetLabels(l map[string]string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.labels = l
-}
-
-// Labels 返回本节点标签。
-//
-// 接收者 t 是本节点的直接子节点表。直接返回内部 map 引用，调用方不应修改它。
-//
-// 返回：
-//
-//	map[string]string — 本节点标签
-func (t *Table) Labels() map[string]string {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.labels
-}
-
-// Caps 返回本节点能力列表的一份拷贝。
-//
-// 接收者 t 是本节点的直接子节点表。
-//
-// 返回：
-//
-//	[]string — 能力列表副本；改它不会影响表内数据
-func (t *Table) Caps() []string {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return append([]string(nil), t.caps...)
-}
-
 // Upsert 插入或更新一个直接子节点（按 NodeID 去重）。
 //
 // 接收者 t 是本节点的直接子节点表。
-// 已存在时是"合并更新"：Path / Labels / Caps / Confirmed / RegisteredAt / LastEpoch 直接覆盖，
+// 已存在时是"合并更新"：Path / Confirmed / RegisteredAt / LastEpoch 直接覆盖，
 // 而 Name / Remark / ListenAddr / BuildHash 只在本次非空时才覆盖 —— 避免旧版本客户端或未配置
 // 名字的节点把表里已有的人类可读信息擦掉。
 //
@@ -144,8 +98,6 @@ func (t *Table) Upsert(c *Child) {
 	defer t.mu.Unlock()
 	if old, ok := t.children[c.NodeID]; ok {
 		old.Path = c.Path
-		old.Labels = c.Labels
-		old.Caps = c.Caps
 		// 元信息按"上报了才覆盖"处理：旧版本客户端 / 未配置 name 的节点不应该把已有名字擦掉
 		if c.Name != "" {
 			old.Name = c.Name
@@ -208,7 +160,7 @@ func (t *Table) Get(id string) (*Child, bool) {
 //
 // 返回：
 //
-//	[]*Child — 结构体逐个复制后的新切片；元素指针是新指针，但 Labels / Caps 仍与表内共享底层数据
+//	[]*Child — 结构体逐个复制后的新切片；元素指针是新指针，调用方改它不会影响表内数据
 func (t *Table) Snapshot() []*Child {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -245,7 +197,7 @@ func (t *Table) Warm(known []persist.KnownChild) {
 			continue
 		}
 		t.children[kc.ID] = &Child{
-			NodeID: kc.ID, Path: kc.Path, Caps: kc.Caps, Labels: kc.Labels,
+			NodeID: kc.ID, Path: kc.Path,
 			Name: kc.Name, Remark: kc.Remark,
 			Confirmed: false,
 		}

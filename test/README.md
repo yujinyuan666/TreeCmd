@@ -36,14 +36,14 @@ python3 serve.py --target 10.0.0.5:18443 --allow-any-host
 
 | 标签页 | 对应接口 | 说明 |
 |---|---|---|
-| 总览 | `/v1/tree` | 根的角色/名字/备注/labels/caps、在线子节点数、结果索引条数 |
+| 总览 | `/v1/tree` | 根的角色/名字/备注/listen、在线子节点数、结果索引条数 |
 | 拓扑 | `/v1/tree` | 本节点 + 直接子节点的树形视图（**只有一层**，见下） |
 | 健康 | `/v1/health?depth=-1&detail=true` | 全树扫描：本节点 checks、子树汇总、每个直接子的状态与"它下面还连着几个" |
 | 指令 | `/v1/commands` | 8 个预设场景 + 手填全部字段；提交后自动轮询到终态，TREE 聚合结果可递归展开；支持取消 / 按子节点重试 |
 | 指标 | `/metrics` | 关键指标卡 + 全部 Prometheus 条目 |
 
 预设场景：全树 echo(TREE)、全树计数(COUNT)、慢指令 sleep 2s、全树失败(fail)、
-失败+BEST_EFFORT、失败+TOLERATE_N:2、标签筛选失败(k=v)、64KB 大载荷。
+失败+BEST_EFFORT、失败+TOLERATE_N:2、失败+自定义原因、64KB 大载荷。
 
 ## 两个「只有一层」的诚实说明
 

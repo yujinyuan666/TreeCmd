@@ -860,7 +860,6 @@ func (n *Node) TreeSnapshot() map[string]any {
 			children = append(children, map[string]any{
 				"node_id": c.NodeID, "path": c.Path, "online": online,
 				"node_name": c.Name, "node_remark": c.Remark,
-				"caps": c.Caps, "labels": c.Labels,
 				// 这个子跑的是哪份镜像 + 是不是还没跟上（父端一眼看出收敛进度）
 				"build_hash":     shortHash(c.BuildHash),
 				"build_mismatch": c.BuildHash != "" && mine.Known() && c.BuildHash != mine.Hash,
@@ -873,8 +872,7 @@ func (n *Node) TreeSnapshot() map[string]any {
 	return map[string]any{
 		"node_id": n.C().Node.ID, "path": n.SelfPath(), "role": string(n.Role()),
 		"node_name": n.C().Node.Name, "node_remark": n.C().Node.Remark,
-		"listen": n.C().Node.Listen, "labels": n.C().Node.Labels,
-		"caps": n.C().Node.Capabilities, "children": children,
+		"listen": n.C().Node.Listen, "children": children,
 		"conn_children": n.childOnline(), "index_entries": n.index.len(),
 		"object_store": n.Obj.Dir(),
 		// 本节点自己那份镜像：与每个子上报的 build_hash 比一比，就知道谁还没收敛

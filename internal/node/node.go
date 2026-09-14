@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -157,7 +156,7 @@ func NewWithPath(cfg *config.Config, cfgPath string, logger *slog.Logger) (*Node
 	n := &Node{
 		cfgPath: cfgPath,
 		Log:     &Logger{logger.With("node", shortID(cfg.Node.ID))},
-		Reg:     registry.New(cfg.Node.ID, "/", cfg.Node.Labels, cfg.Node.Capabilities),
+		Reg:     registry.New(cfg.Node.ID, "/"),
 		Exec:    exec.NewRegistry(), events: map[string]chan struct{}{},
 		resending: map[string]bool{}, stopCh: make(chan struct{}), fetchNotify: make(chan struct{}, 1),
 		certSignal: make(chan string, 4), challenges: map[string]enrollChallenge{},
@@ -976,7 +975,7 @@ func (n *Node) saveState() {
 	kc := []persist.KnownChild{}
 	for _, c := range n.Reg.Snapshot() {
 		kc = append(kc, persist.KnownChild{ID: c.NodeID, Path: c.Path,
-			Name: c.Name, Remark: c.Remark, Caps: c.Caps, Labels: c.Labels})
+			Name: c.Name, Remark: c.Remark})
 	}
 	s.KnownChildren = kc
 	if err := persist.Save(n.C().Persist.StatePath, s); err != nil {
@@ -1290,21 +1289,3 @@ var ErrTerminal = errors.New("ERR_COMMAND_TERMINAL")
 
 // ErrRetryExhausted 重试次数用尽。
 var ErrRetryExhausted = errors.New("ERR_RETRY_EXHAUSTED")
-
-// sortedKeys 取 map 的全部键并升序排序（用于把 map 输出成稳定的顺序）。
-//
-// 参数：
-//
-//	m — 要取键的 map；nil 也安全
-//
-// 返回：
-//
-//	[]string — 升序排好的键；m 为空时返回长度 0 的切片
-func sortedKeys(m map[string]string) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}

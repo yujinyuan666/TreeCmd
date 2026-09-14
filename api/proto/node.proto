@@ -372,8 +372,10 @@ message RegisterRequest {
   bytes sig = 3; // 对 (guid, pubkey, nonce, epoch) 签名
   bytes nonce = 4;
   uint64 epoch = 5;
-  repeated string labels = 6;
-  repeated string capabilities = 7;
+  // 6 / 7 曾用于 labels 与 capabilities，已随这两个功能一起移除。
+  // 按"绝不改老编号"的约定**保留编号、绝不回收**：老版本节点发上来会被当未知字段忽略。
+  reserved 6, 7;
+  reserved "labels", "capabilities";
   string listen_addr = 8;
   // 节点元信息（ADR-051）：人类可读的"我是谁"，用于父端/根端展示与运维定位。
   // 仅展示用途，不参与任何权限判定与摘要计算。
@@ -688,7 +690,7 @@ message DownFrame {
 message ConfigPush {
   string reason = 1;
   // 只承载**运行参数**（command./health./query./persist. 段）的覆盖项，形如 "command.lease_ttl=120s"。
-  // 绝不承载进 config_hash 的字段（identity / parents / node.listen / labels / capabilities）。
+  // 绝不承载进 config_hash 的字段（identity / parents / node.listen）。
   repeated string overrides = 2;
 }
 

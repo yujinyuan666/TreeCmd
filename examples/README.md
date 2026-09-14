@@ -140,7 +140,7 @@ sleep 2 && curl -s "127.0.0.1:18443/v1/commands/$CID" | python3 -m json.tool
 | `security.cert_reload.*` | **SIGHUP 即刻生效**，不重注册 |
 | `security.enrollment.token` / `token_path` / `challenge_ttl` | **SIGHUP 即刻生效**，不重注册（换 token 不需要重注册） |
 | `selfupdate.*` | **SIGHUP 即刻生效**，不重注册。⚠️ 它**不在父可下发的白名单里**（`ConfigPush` 只接受 `command./health./query./persist.`），全树改这一项要逐节点改文件 + SIGHUP |
-| `node.id`、`parents[]`、`node.labels`、`node.capabilities`、`security.identity_*`、`security.ca_*`、`security.enrollment.enabled|allow_ids`、`registration.backfill` | **SIGHUP ⇒ 自动触发全量重注册**（这些进 `config_hash`，旧会话作废并重连） |
+| `node.id`、`node.listen`、`parents[]`、`security.identity_*`、`security.ca_*`、`security.enrollment.enabled|allow_ids`、`registration.backfill` | **SIGHUP ⇒ 自动触发全量重注册**（这些进 `config_hash`，旧会话作废并重连） |
 
 **证书相关（不由 `node.yaml` 控制；签发与续期在程序里，文件被替换时由外部触发重载）：**
 

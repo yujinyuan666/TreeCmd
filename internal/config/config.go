@@ -104,12 +104,10 @@ type Parent struct {
 // 依次取"已签发证书的身份 → state.dat 的 self.id → 新生成 UUIDv7"，
 // **绝不回写本文件**（`node.yaml` 对程序始终只读）。显式写上则以其为准。
 type NodeSection struct {
-	ID           string            `yaml:"id"`
-	Listen       string            `yaml:"listen"`
-	Name         string            `yaml:"name"`   // 节点名（人类可读，如 edge-sz-01）；用于标记这个 node 的身份
-	Remark       string            `yaml:"remark"` // 节点备注（自由文本）；与 name 一起随注册上行、经 API 可见
-	Labels       map[string]string `yaml:"labels"`
-	Capabilities []string          `yaml:"capabilities"`
+	ID     string `yaml:"id"`
+	Listen string `yaml:"listen"`
+	Name   string `yaml:"name"`   // 节点名（人类可读，如 edge-sz-01）；用于标记这个 node 的身份
+	Remark string `yaml:"remark"` // 节点备注（自由文本）；与 name 一起随注册上行、经 API 可见
 }
 
 // SecuritySection 身份材料 + 授权参数。
@@ -881,7 +879,7 @@ func (c *Config) Validate() error {
 // 明确不进 hash：security.viewers.*、query.query_viewers、command.*、health.*、persist.*、version。
 //
 // 接收者 c 是完整配置。做法是把白名单字段按固定顺序拼成一段文本再取 SHA-256；
-// labels / capabilities / allow_ids 会先排序，保证同一份配置每次算出的哈希一致。
+// allow_ids 会先排序，保证同一份配置每次算出的哈希一致。
 // 入网策略只把"开关 + allow_ids 列表"写进去，凭据 token 不进 —— 换 token 不该触发全量重注册。
 //
 // 返回：
@@ -891,17 +889,6 @@ func (c *Config) ConfigHash() string {
 	var sb strings.Builder
 	sb.WriteString("node.id=" + c.Node.ID + "\n")
 	sb.WriteString("node.listen=" + c.Node.Listen + "\n")
-	keys := make([]string, 0, len(c.Node.Labels))
-	for k := range c.Node.Labels {
-		keys = append(keys, k)
-	}
-	sortStrings(keys)
-	for _, k := range keys {
-		sb.WriteString("node.labels." + k + "=" + c.Node.Labels[k] + "\n")
-	}
-	caps := append([]string(nil), c.Node.Capabilities...)
-	sortStrings(caps)
-	sb.WriteString("node.capabilities=" + strings.Join(caps, ",") + "\n")
 	for _, p := range c.Parents {
 		sb.WriteString("parents=" + p.ID + "@" + p.Addr + "\n")
 	}
@@ -947,9 +934,8 @@ func (c *Config) DeadlineForType(t string) time.Duration {
 
 // sortStrings 就地按字典序升序排列字符串切片（插入排序）。
 //
-// 这里用它是为了让 labels / capabilities / allow_ids 的拼接顺序稳定：
-// map 的遍历顺序是随机的，不排序的话同一份配置每次算出的 ConfigHash 都会变。
-// 待排序的都是几十个元素的小切片，所以用最朴素的插入排序即可。
+// 这里用它是为了让 allow_ids 的拼接顺序稳定：`enrollment.allow_ids` 是个字符串列表，
+// 用户手写顺序不该影响 ConfigHash。待排序的都是几十个元素的小切片，所以用最朴素的插入排序即可。
 //
 // 参数：
 //

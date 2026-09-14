@@ -26,7 +26,6 @@ type Spec struct {
 	Path      string
 	Type      string
 	Payload   []byte
-	Labels    map[string]string
 }
 
 // ProgressEmitter 进度发射（可丢）。
@@ -141,22 +140,21 @@ func (Echo) Validate(s Spec) error {
 // 参数：
 //
 //	ctx  — 上下文；echo 不读它
-//	spec — 任务的输入；用到 NodeID、Path、Payload、Labels
+//	spec — 任务的输入；用到 NodeID、Path、Payload
 //	emit — 进度发射器；echo 不上报进度
 //
 // 返回：
 //
-//	any   — 一个 map，含 node / path / len / echo / labels 五个键
+//	any   — 一个 map，含 node / path / len / echo 四个键
 //	error — 恒为 nil
 //
 // 其中 echo 是 Payload 直接按字符串转出来的，不做编码转换，内容不保证是合法 UTF-8。
 func (Echo) Run(_ context.Context, s Spec, _ ProgressEmitter) (any, error) {
 	out := map[string]any{
-		"node":   s.NodeID,
-		"path":   s.Path,
-		"len":    len(s.Payload),
-		"echo":   string(s.Payload),
-		"labels": s.Labels,
+		"node": s.NodeID,
+		"path": s.Path,
+		"len":  len(s.Payload),
+		"echo": string(s.Payload),
 	}
 	return out, nil
 }
@@ -232,31 +230,24 @@ func (Fail) Type() string { return "fail" }
 //	error — 恒为 nil
 func (Fail) Validate(Spec) error { return nil }
 
-// Run 按载荷内容决定"失败"还是"成功并跳过"，用于测试失败传播与标签筛选。
+// Run 按载荷内容决定失败，用于测试失败传播。
 //
-// 载荷规则：空串或 "always" 一律失败；写成 "键=值" 时，只有本节点 Labels 里该键的值
-// 正好相等才失败，否则返回一个带 fail_skipped=true 的成功结果；其它内容当成错误信息原样返回。
+// 载荷规则：空串或 "always" 返回固定的 "intentional failure"；其它内容当成错误信息原样返回。
 //
 // 参数：
 //
 //	ctx  — 上下文；fail 不读它
-//	spec — 任务的输入；用到 Payload（失败规则）与 Labels（按标签筛选）
+//	spec — 任务的输入；只用到 Payload（失败信息）
 //	emit — 进度发射器；fail 不上报进度
 //
 // 返回：
 //
-//	any   — 标签不匹配时返回含 node / path / fail_skipped 的 map
-//	error — 需要失败时返回错误
+//	any   — 恒为 nil
+//	error — 恒为非空（这就是它的用途）
 func (Fail) Run(_ context.Context, s Spec, _ ProgressEmitter) (any, error) {
 	spec := strings.TrimSpace(string(s.Payload))
 	if spec == "" || spec == "always" {
 		return nil, errors.New("intentional failure")
-	}
-	if kv := strings.SplitN(spec, "=", 2); len(kv) == 2 {
-		if s.Labels[kv[0]] == kv[1] {
-			return nil, fmt.Errorf("intentional failure at %s (label %s=%s)", s.Path, kv[0], kv[1])
-		}
-		return map[string]any{"node": s.NodeID, "path": s.Path, "fail_skipped": true}, nil
 	}
 	return nil, errors.New(spec)
 }
