@@ -76,7 +76,7 @@ command -v openssl >/dev/null 2>&1 || die "找不到 openssl"
 
 # 找 treecmd-node：优先 $TREECMD_NODE，其次仓库里的 bin/，最后 PATH
 BIN="${TREECMD_NODE:-}"
-if [ -z "${BIN}" ]; then
+if [ -z "${BIN}" ]; then 
   if [ -x "${REPO_DIR}/bin/treecmd-node" ]; then BIN="${REPO_DIR}/bin/treecmd-node"
   elif command -v treecmd-node >/dev/null 2>&1; then BIN="$(command -v treecmd-node)"
   else die "找不到 treecmd-node：先 go build -o bin/treecmd-node ./cmd/node，或用 TREECMD_NODE=<路径> 指定"
