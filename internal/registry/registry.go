@@ -26,6 +26,9 @@ type Child struct {
 	Confirmed    bool // 是否真的连上过（warm 预热不算）
 	RegisteredAt time.Time
 	LastEpoch    uint64
+	// BuildHash 该子节点**可执行文件**的哈希（注册时上报；见 README「可执行文件一致性」）。
+	// 仅展示用途：父端拿它和 n.Build().Hash 一比，就能在 /v1/tree 里看出"谁跑的还是旧镜像"。
+	BuildHash string
 }
 
 // Table 直接子节点表。
@@ -130,8 +133,8 @@ func (t *Table) Caps() []string {
 //
 // 接收者 t 是本节点的直接子节点表。
 // 已存在时是"合并更新"：Path / Labels / Caps / Confirmed / RegisteredAt / LastEpoch 直接覆盖，
-// 而 Name / Remark / ListenAddr 只在本次非空时才覆盖 —— 避免旧版本客户端或未配置名字的节点
-// 把表里已有的人类可读信息擦掉。
+// 而 Name / Remark / ListenAddr / BuildHash 只在本次非空时才覆盖 —— 避免旧版本客户端或未配置
+// 名字的节点把表里已有的人类可读信息擦掉。
 //
 // 参数：
 //
@@ -152,6 +155,12 @@ func (t *Table) Upsert(c *Child) {
 		}
 		if c.ListenAddr != "" {
 			old.ListenAddr = c.ListenAddr
+		}
+		// 可执行文件哈希同理，但**必须覆盖**：子节点自同步换版后重新注册时，
+		// 正是靠这次覆盖把"我跑的还是旧镜像"改成"我跟上了"（否则 /v1/tree 会一直显示旧值、
+		// lagging_children 永远归不了零 —— 这是端到端测试抓出来的）。
+		if c.BuildHash != "" {
+			old.BuildHash = c.BuildHash
 		}
 		old.Confirmed = c.Confirmed
 		old.RegisteredAt = c.RegisteredAt

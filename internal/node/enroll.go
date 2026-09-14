@@ -464,3 +464,29 @@ func (n *Node) ensureStartedUpstream() {
 		n.up.start()
 	}
 }
+
+// ---------- 对外的小封装（命令行入口用） ----------
+
+// EnsureCertificate 只做"确保有可用证书"：已有就直接返回，否则走一次运行期入网。
+//
+// 接收者 n 是本节点实例；供 `-enroll` 子命令（"只入网、不常驻"）使用。
+// 带互斥，同一时刻只会有一个入网流程在跑。
+//
+// 参数：
+//
+//	ctx — 上下文
+//
+// 返回：
+//
+//	error — 拿到可用证书返回 nil，否则返回错误
+func (n *Node) EnsureCertificate(ctx context.Context) error { return n.ensureCertWithLock(ctx, true) }
+
+// HasUsableCert 报告本节点是否已持有可用证书（存在且未过期）。
+//
+// 接收者 n 是本节点实例；它是 hasUsableCert 的对外封装，供启动时打印
+// "正常上线 / 待入网"那行日志用。
+//
+// 返回：
+//
+//	bool — 持有未过期证书时为 true
+func (n *Node) HasUsableCert() bool { return n.hasUsableCert() }

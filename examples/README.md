@@ -1,7 +1,10 @@
 # treecmd 部署样例 · 阅读指南
 
-这个目录里的三份配置，加上这一份说明，应该足够你把程序部署起来。
-**建议阅读顺序：本页 → `child.yaml`（最小形态）→ `root.yaml`（全字段详解）→ `relay.yaml`（中间层）。**
+这个目录里只有一份配置：**`node.yaml`** —— 它是唯一的权威样例，头部有"按角色最简起步"，
+正文把全部字段逐条注释（每个字段标了【根/中继/叶】必填性与默认值）。
+本页是配套的**部署走查**：目录约定、字段生效时机、报错对照、检查清单。
+
+**建议阅读顺序：本页（三十秒速览）→ `node.yaml` 头部"按角色最简起步" → 需要时查 `node.yaml` 正文对应字段。**
 
 ---
 
@@ -10,13 +13,10 @@
 **部署形态**：单服务器 · 一个节点一个进程 · 手工放 `node.yaml` 后启动 · **证书由程序签发与续期**
 （父给子/其它客户端签发 + 运行期续签；**根节点的自签材料**部署时准备一次）。
 
-**角色不用手写，由配置推导出来：**
-
-| 角色 | 判据 | 证书从哪来 | 要 `listen` | 要 `parents[]` | 样例 |
-|---|---|---|---|---|---|
-| `root` 根 | 没有 `parents[]` | **必须自带**（没有父能签发给它） | ✅ 必须 | ❌ 不写 | `root.yaml` |
-| `relay` 中继 | 有 `parents[]` **且**有 `listen` | 自带或向父入网 | ✅ 必须 | ✅ 必须 | `relay.yaml` |
-| `leaf` 叶子 | 有 `parents[]`，**没有** `listen` | 自带或向父入网 | ❌ 不写 | ✅ 必须 | `child.yaml` |
+**角色不用手写，由配置推导**：没有 `parents[]` 是**根**；有 `parents[]` 且有 `listen` 是**中继**；
+有 `parents[]` 但没有 `listen` 是**叶**。三种角色的差别只有 4 个字段
+（`node.listen`、`parents[]`、`security.ca_cert_path`、`security.ca_key_path`）——
+每个字段归哪个角色，`node.yaml` 里都标着。
 
 **叶子最小可运行配置**（就这 5 行，其余按约定补全）：
 
@@ -41,13 +41,14 @@ parents:
 | `keys/id_ed25519` | 本节点**私钥** | `treecmd-node -genkey` | 必需 | 必需 | 必需 |
 | `keys/id_ed25519.pub` | 本节点**公钥** | 同上（成对） | 必需 | 必需 | 必需 |
 | `certs/node.crt` | 本节点**身份证书** | 根：自签；其余：**向父入网换取**¹（程序签发） | 必需¹ | 必需¹ | 必需 |
-| `certs/node.crt.ca` | 本节点**CA 证书**（给子签发） | 父在入网时一并签发（程序签发） | — | 必需 | 必需 |
-| `certs/ca.key` | 本节点**CA 私钥**（给子签发）² | `treecmd-node -genkey -with-ca` | — | 必需 | 必需 |
+| `certs/node.crt.ca` | 本节点**CA 证书**（给子签发） | 父在入网时一并签发；根由 `init_root.sh` 产出 | — | 必需 | 必需 |
+| `keys/ca` | 本节点**CA 私钥**（给子签发）² | `treecmd-node -genkey -with-ca` | — | 必需 | 必需 |
 | `trust/*.crt` | **信任锚**（校验父与对端） | 部署时投放（根自签的 CA 证书） | 必需 | 必需 | 可选³ |
 | `enroll.token` | **入网许可**（与父端一致，`chmod 600`） | 部署时投放（两边内容必须一致） | 需要入网时 | 需要入网时 | — |
 
 > ¹ 叶子 / 中继可以先**不放**身份证书：启动会以"待入网"状态起来，向父申请，由父用它自己的 CA 私钥签发后写入 `certs/node.crt`。**根没有父可签发，所以必须自带。**
-> ² CA 私钥**必须是你自己预置的** —— 父不可能把自己的私钥给你。这就是 `-genkey` 要加 `-with-ca` 的原因。
+> ² CA 私钥**必须是你自己预置的**（默认路径 `keys/ca`）—— 父不可能把自己的私钥给你。
+> 这就是 `-genkey` 要加 `-with-ca` 的原因。
 > ³ 根缺省会拿自己的 CA 证书当信任锚。
 
 生成密钥对的命令：
@@ -63,7 +64,7 @@ treecmd-node -genkey -keydir keys -with-ca       # 根 / 中继（有下级，�
 |---|---|
 | `certs/node.crt` | 入网换取到的身份证书 |
 | `state.db` | bbolt 账本（指令 / 分配 / 报告 / 结果 / 水位 …） |
-| `state.dat` | 运行态快照（原子写，默认每 10s） |
+| `state.dat` | 运行态快照（原子写，默认每 30s） |
 | `objects/` | >64MB 大结果的对象存储 |
 | `node.log` / `node.pid` | `scripts/start_node.sh` 产出的日志与 PID |
 
@@ -74,24 +75,23 @@ treecmd-node -genkey -keydir keys -with-ca       # 根 / 中继（有下级，�
 ### 单机三节点示例（根 + 中继 + 叶子）
 
 ```bash
-# ① 根：生成密钥对（含 CA）→ 放信任锚 → 自检 → 启动
+# ① 根：生成密钥对（含 CA）→ 放信任锚 → 启动
 cd /srv/treecmd/root
 treecmd-node -genkey -keydir keys -with-ca
 mkdir -p trust certs && cp <根节点自签产出的 CA 证书> trust/
-cp ../../examples/root.yaml node.yaml        # 改成你的 node.id / listen
-treecmd-node -check -config node.yaml        # 只读自检：不监听、不连接、不落盘
+cp ../../examples/node.yaml node.yaml        # 保留根形态：改 node.id / listen 即可
 treecmd-node -config node.yaml
 
 # ② 根：投放入网许可（子节点要用同一串）
 printf 'your-shared-token' > enroll.token && chmod 600 enroll.token
 mkdir -p ../../relay/trust && cp trust/root_ca.crt ../../relay/trust/
 
-# ③ 中继：生成密钥对（含 CA，因为有下级）→ 自检 → 启动
+# ③ 中继：生成密钥对（含 CA，因为有下级）→ 启动
 cd /srv/treecmd/relay
 treecmd-node -genkey -keydir keys -with-ca
 printf 'your-shared-token' > enroll.token && chmod 600 enroll.token
-cp ../../examples/relay.yaml node.yaml       # 填自己的 id、父的真实 id/addr、自己的 listen
-treecmd-node -check -config node.yaml
+cp ../../examples/node.yaml node.yaml        # 照 node.yaml 头部"中继"那段增删：
+                                             # 填自己的 id + listen，补 parents[]
 treecmd-node -config node.yaml               # 自动向父入网换证 → 自动注册
 
 # ④ 叶子：只要密钥对 + 信任锚 + 许可
@@ -99,17 +99,16 @@ cd /srv/treecmd/leaf
 treecmd-node -genkey -keydir keys            # 叶子不加 -with-ca
 mkdir -p trust && cp ../relay/trust/root_ca.crt trust/
 printf 'your-shared-token' > enroll.token && chmod 600 enroll.token
-cp ../../examples/child.yaml node.yaml       # 只需填：我是谁 + 父的真实 id/addr
-treecmd-node -check -config node.yaml
+cp ../../examples/node.yaml node.yaml        # 照 node.yaml 头部"叶"那段增删：
+                                             # 只留 node.id + parents[]（删掉 listen 与 ca_*）
 treecmd-node -config node.yaml
 ```
 
 ### 用附带脚本起停（推荐）
 
 ```bash
-scripts/start_node.sh <node.yaml>            # 启动（先自检，再后台起，写 node.log / node.pid）
+scripts/start_node.sh <node.yaml>            # 启动（后台起，写 node.log / node.pid）
 scripts/start_node.sh status <node.yaml>     # 查看状态
-scripts/start_node.sh check  <node.yaml>     # 只自检
 scripts/start_node.sh reload <node.yaml>     # = kill -USR1：证书脚本换证后立即重载
 scripts/start_node.sh conf   <node.yaml>     # = kill -HUP：配置热更
 scripts/start_node.sh stop   <node.yaml>
@@ -140,6 +139,7 @@ sleep 2 && curl -s "127.0.0.1:18443/v1/commands/$CID" | python3 -m json.tool
 | `security.trusted_origins`、`security.health_viewers`、`query.query_viewers` | **SIGHUP 即刻生效**，不重注册 |
 | `security.cert_reload.*` | **SIGHUP 即刻生效**，不重注册 |
 | `security.enrollment.token` / `token_path` / `challenge_ttl` | **SIGHUP 即刻生效**，不重注册（换 token 不需要重注册） |
+| `selfupdate.*` | **SIGHUP 即刻生效**，不重注册。⚠️ 它**不在父可下发的白名单里**（`ConfigPush` 只接受 `command./health./query./persist.`），全树改这一项要逐节点改文件 + SIGHUP |
 | `node.id`、`parents[]`、`node.labels`、`node.capabilities`、`security.identity_*`、`security.ca_*`、`security.enrollment.enabled|allow_ids`、`registration.backfill` | **SIGHUP ⇒ 自动触发全量重注册**（这些进 `config_hash`，旧会话作废并重连） |
 
 **证书相关（不由 `node.yaml` 控制；签发与续期在程序里，文件被替换时由外部触发重载）：**
@@ -195,27 +195,23 @@ sleep 2 && curl -s "127.0.0.1:18443/v1/commands/$CID" | python3 -m json.tool
 | 健康检查里某些节点 `UNREACHABLE` | 该节点进程没起 / 网络不通 / 刚断线正在退避重连 |
 | 入网被拒（`ERR_ENROLL_*`） | 许可串与父端不一致；或父端配了 `allow_ids` 而没有把本节点 ID 列进去；或父端 `enrollment.enabled=false` |
 
-> 排错第一步永远是：**`treecmd-node -check -config node.yaml`**。
-> 它只读、不监听、不连接、不落盘，会把节点身份、角色、信任锚数量、证书有效期与指纹、
-> 能/不能给子签发、入网与热重载状态，以及**"按约定替你补全了哪些配置"**全部列出来。
+> 排错第一步永远是：**启动日志**（`REFUSE TO START: ...` 那行 + 后面写清的原因），
+> 以及在任一开了 API 的节点上看 `/v1/tree`（谁在线、谁跑的是哪份镜像）与 `/metrics`。
+> 日志里同时会有节点身份、角色、信任锚数量、证书有效期与指纹、入网与热重载状态。
 
 ---
 
-## 7. 三份样例的差异（对照着看最快）
+## 7. 想在 `node.yaml` 里找什么，去哪一段
 
-| 配置项 | `root.yaml` | `relay.yaml` | `child.yaml` |
-|---|---|---|---|
-| `node.id` | 自定（UUIDv7） | 自定 | 自定 |
-| `node.listen` | ✅ 必须（子要连它） | ✅ 必须（子要连它） | ❌ 不写 |
-| `parents[]` | ❌ 不写 | ✅ 必须 | ✅ 必须 |
-| `security.identity_cert_path` | 必须**已存在** | 可不存在（入网） | 可不存在（入网） |
-| `security.ca_cert_path` / `ca_key_path` | ✅ 必须 | ✅ 必须 | ❌ 不需要 |
-| `security.ca_cert_paths` | 可选（缺省用自己的 CA） | ✅ 必须 | ✅ 必须 |
-| `enrollment` 段的角色 | **父**（发证方，要 `token`） | 两侧都用 | **子**（换证方，要 `token`） |
-| 建议 `api.http_addr` | ✅ 开（入口） | 可选 | 一般不开 |
+| 你想知道 | 去哪看 |
+|---|---|
+| 我这个角色最少要写哪几行 | `node.yaml` 头部 **【按角色最简起步】**（根 / 中继 / 叶 三段，直接抄） |
+| 某个字段归哪个角色、默认值是多少、进不进 `config_hash` | `node.yaml` 正文该字段的注释（每行都标着） |
+| 启动前目录里必须有哪几样东西 | `node.yaml` 第二部分「本节点目录里应有什么」 |
+| 命令怎么敲、怎么自检、怎么看状态 | `node.yaml` 第三部分「命令速查」 |
+| 部署走查 / 字段生效时机 / 报错对照 / 检查清单 | 本页第 2～6、8 节 |
 
-另外：`treecmd-node -print-sample-config root|child|relay|leaf` 也能直接打印这几份样例，
-内容更精简（不含本页的完整注释）；本目录的文件才是"阅读版"。
+> 本页**不再维护**"各角色字段对照表"——那份信息已经合并进 `node.yaml` 的行内标记，避免两处各说一套。
 
 ---
 
@@ -223,10 +219,10 @@ sleep 2 && curl -s "127.0.0.1:18443/v1/commands/$CID" | python3 -m json.tool
 
 - [ ] 每个节点一个独立目录、一份 `node.yaml`，`node.id` 全局唯一且与证书身份一致
 - [ ] 私钥 + 公钥已生成（`-genkey`）；根 / 中继加了 `-with-ca`
-- [ ] 根 / 中继有 `certs/node.crt.ca` 与 `certs/ca.key`
+- [ ] 根 / 中继有 `certs/node.crt.ca` 与 `keys/ca`
 - [ ] 所有非根节点的 `trust/` 里有**签发父证书的那个 CA**
 - [ ] 子节点的 `parents[].id` / `addr` 填的是父的**真实 NodeID / `listen` 地址**
 - [ ] 入网许可在父端与子端一致（`chmod 600`）
-- [ ] 每个节点 `-check` 通过，无 `REFUSE TO START`
+- [ ] 每个节点都能启动成功（日志里没有 `REFUSE TO START`）
 - [ ] 端口规划：`listen` 与 `api.http_addr` 不要落在同一段互相冲突
 - [ ] 已把证书脚本的换证动作接上 `kill -USR1 <pid>`（或接受 30s 内的轮询延迟）

@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"treecmd/internal/buildinfo"
 )
 
 // 节点元信息（node.name / node.remark）的长度上限。
@@ -289,6 +291,172 @@ type RegistrationSection struct {
 	Backfill string `yaml:"backfill"` // NONE / SINCE / FROM_SEQ
 }
 
+// SelfUpdateSection 可执行文件一致性：父把自己那份镜像下发给子（见 README「可执行文件一致性」）。
+//
+// 背景：树是"父下发、子执行"的，子如果跑的是另一份镜像，行为就可能与父不一致，
+// 而这类不一致的症状是"行为诡异"而不是"报错"，极难排查。所以每个节点启动时算一次自己
+// 可执行文件的 sha256：父在注册应答里给一份、子自己算一份，子连上后的第一件事就是比对。
+type SelfUpdateSection struct {
+	Enabled *bool `yaml:"enabled"` // 默认 true
+	// OnMismatch 子发现自己与父不一致时做什么：
+	//   sync（默认）—— 立刻向父拉取可执行文件，校验通过后原地重启
+	//   warn         —— 只记日志与指标、不动手（先观察一轮再打开同步时用）
+	OnMismatch string `yaml:"on_mismatch"`
+	// Serve 是否把本节点的可执行文件发给直接子（默认 true）。
+	// 只有"有下级的节点"才可能真的对外提供；叶子开着也没人问。
+	Serve *bool `yaml:"serve"`
+	// ChunkSize 分片大小（默认 256KB）。上限 4MB —— 要留足余量，因为同一个 Connect 流上
+	// 还跑着心跳与指令下发，消息体积不能贴到 gRPC 的 8MB 上限。
+	ChunkSize ByteSize `yaml:"chunk_size"`
+	// MaxBytes 单次同步的字节上限（默认 64MB）：请求方与提供方都按它截断。
+	MaxBytes ByteSize `yaml:"max_bytes"`
+	// SyncTimeout 一次同步的总时限（请求 → 收完最后一片），默认 60s。
+	SyncTimeout time.Duration `yaml:"sync_timeout"`
+	// MaxAttempts / AttemptWindow 同一个目标哈希在窗口内最多尝试几次（默认 3 次 / 1h）。
+	// 这是**防重启循环唯一的闸门**：替换失败、目录只读、"exec 完还是对不上"都会落到这里。
+	MaxAttempts   int           `yaml:"max_attempts"`
+	AttemptWindow time.Duration `yaml:"attempt_window"`
+	// Dir 暂存文件放哪（默认 = 可执行文件所在目录）。
+	// 必须与被替换的文件在**同一个文件系统**上，否则 rename 退化成"复制"，就不再是原子的了。
+	Dir string `yaml:"dir"`
+}
+
+// SelfUpdateEnabled 报告可执行文件一致性检查是否开启（没配就当开启）。
+//
+// 接收者 s 是 selfupdate 段的配置。
+//
+// 返回：
+//
+//	bool — enabled 字段为 nil（配置里没写）时返回 true，否则返回配置的值
+func (s *SelfUpdateSection) SelfUpdateEnabled() bool {
+	return s.Enabled == nil || *s.Enabled
+}
+
+// ServingChildren 报告本节点是否愿意把自己的可执行文件发给直接子（没配就当愿意）。
+//
+// 接收者 s 是 selfupdate 段的配置。真正的判定还在服务端：只有"持有 CA 材料、且对端确实是
+// 自己签发的直接子"才会真的发出去，这里只是一个总开关。
+//
+// 返回：
+//
+//	bool — serve 字段为 nil（配置里没写）时返回 true，否则返回配置的值
+func (s *SelfUpdateSection) ServingChildren() bool {
+	return s.Serve == nil || *s.Serve
+}
+
+// EnforceSync 报告"发现不一致时要不要真的动手同步并重启"。
+//
+// 接收者 s 是 selfupdate 段的配置。
+//
+// 返回：
+//
+//	bool — on_mismatch 不是 "warn" 时为 true；即只有显式写了 warn 才只告警
+func (s *SelfUpdateSection) EnforceSync() bool {
+	return s.OnMismatch != "warn"
+}
+
+// ChunkBytes 返回归一化后的分片大小（字节）。
+//
+// 接收者 s 是 selfupdate 段的配置。
+//
+// 返回：
+//
+//	int — 未配置或非正数时取 256KB；超过 4MB 时被压到 4MB（给心跳与指令帧留出消息体积余量）
+func (s *SelfUpdateSection) ChunkBytes() int {
+	n := int64(s.ChunkSize)
+	if n <= 0 {
+		n = 256 * 1024
+	}
+	const maxChunk = 4 << 20
+	if n > maxChunk {
+		n = maxChunk
+	}
+	return int(n)
+}
+
+// MaxTransferBytes 返回归一化后的单次同步字节上限。
+//
+// 接收者 s 是 selfupdate 段的配置。
+//
+// 返回：
+//
+//	int64 — 未配置或非正数时取 64MB
+func (s *SelfUpdateSection) MaxTransferBytes() int64 {
+	n := int64(s.MaxBytes)
+	if n <= 0 {
+		n = 64 << 20
+	}
+	return n
+}
+
+// Timeout 返回归一化后的一次同步总时限。
+//
+// 接收者 s 是 selfupdate 段的配置。
+//
+// 返回：
+//
+//	time.Duration — 未配置或非正数时取 60s；小于 5s 会被抬到 5s（太短必然失败，等于关掉功能）
+func (s *SelfUpdateSection) Timeout() time.Duration {
+	d := s.SyncTimeout
+	if d <= 0 {
+		d = 60 * time.Second
+	}
+	if d < 5*time.Second {
+		d = 5 * time.Second
+	}
+	return d
+}
+
+// AttemptLimit 返回归一化后的"同一目标哈希最多尝试几次"。
+//
+// 接收者 s 是 selfupdate 段的配置。
+//
+// 返回：
+//
+//	int — 未配置或非正数时取 3
+func (s *SelfUpdateSection) AttemptLimit() int {
+	if s.MaxAttempts <= 0 {
+		return 3
+	}
+	return s.MaxAttempts
+}
+
+// Window 返回归一化后的尝试计数窗口。
+//
+// 接收者 s 是 selfupdate 段的配置。窗口一过，计数清零（给"当时磁盘写满了、后来修好了"
+// 这种场景留一条自愈的路）。
+//
+// 返回：
+//
+//	time.Duration — 未配置或非正数时取 1h
+func (s *SelfUpdateSection) Window() time.Duration {
+	if s.AttemptWindow <= 0 {
+		return time.Hour
+	}
+	return s.AttemptWindow
+}
+
+// StagingDir 返回暂存新镜像用哪个目录。
+//
+// 接收者 s 是 selfupdate 段的配置。
+//
+// 参数：
+//
+//	exePath — 本节点可执行文件的路径（已解析符号链接）
+//
+// 返回：
+//
+//	string — 配了 dir 就用它；否则用可执行文件所在目录（同目录才能保证 rename 是原子的）
+func (s *SelfUpdateSection) StagingDir(exePath string) string {
+	if s.Dir != "" {
+		return s.Dir
+	}
+	if exePath == "" {
+		return "."
+	}
+	return filepath.Dir(exePath)
+}
+
 // PersistSection 状态落盘参数。
 type PersistSection struct {
 	StatePath string        `yaml:"state_path"`
@@ -310,20 +478,22 @@ type Config struct {
 	Health       HealthSection       `yaml:"health"`
 	Query        QuerySection        `yaml:"query"`
 	Registration RegistrationSection `yaml:"registration"`
+	SelfUpdate   SelfUpdateSection   `yaml:"selfupdate"`
 	Persist      PersistSection      `yaml:"persist"`
 	API          APISection          `yaml:"api"`
 	DataDir      string              `yaml:"data_dir"`
 
-	// Defaults 记录**程序补上的默认值**（不进 config_hash）。
-	// 手工部署时只写 node.id 与 parents[] 也能跑起来：其余路径按约定补全，
-	// 但"补了什么"必须能看见（`-check` 会逐条打印，避免隐式行为）。
-	Defaults []string `yaml:"-"`
-
 	// NodeIDSource / NodeIDWarning / NodeIDStatePath 是 node.id 的**解析结论**（ADR-050），
-	// 由 Load 填充，供启动日志与 `-check` 展示；不参与 config_hash、也不落盘。
+	// 由 Load 填充，供启动日志展示；不参与 config_hash、也不落盘。
 	NodeIDSource    NodeIDSource `yaml:"-"` // config | cert | state | generated
 	NodeIDWarning   string       `yaml:"-"`
 	NodeIDStatePath string       `yaml:"-"`
+
+	// Build 本节点**可执行文件**的身份快照（启动时算一次，见 README「可执行文件一致性」）。
+	// 它和上面三个字段是同一类东西：**程序填的运行时字段** —— 不来自 node.yaml、不进
+	// config_hash、也不落盘（yaml:"-"）。所以"把哈希放进运行时配置"并不违反"绝不回写
+	// node.yaml"，只是让"我是哪份镜像"在配置对象上顺手可取。
+	Build buildinfo.Info `yaml:"-"`
 }
 
 // Role 节点形态（根 / 中继 / 叶）。
@@ -424,8 +594,8 @@ func Load(path string) (*Config, error) {
 // applyDefaults 就地补全配置里的默认值，并把相对路径解析成绝对路径。
 //
 // 这是"手工部署只写 node.id 与 parents[] 也能跑起来"的实现处：凡是没有显式配置的
-// 运行参数、身份材料路径、持久化路径，都在这里按约定补齐。每补一项都会往
-// c.Defaults 追加一条说明，好让 `-check` 把它们逐条打印出来（避免隐式行为）。
+// 运行参数、身份材料路径、持久化路径，都在这里按约定补齐。补齐了哪些，看
+// examples/child.yaml 的"约定与默认值"一节 —— 那里是给人读的权威清单。
 //
 // 几处约定路径只在文件/目录确实存在时才补：信任锚目录 trust/、入网许可 enroll.token。
 // 路径解析的基准是 baseDir（即 node.yaml 所在目录）：data_dir 相对它解析，
@@ -533,10 +703,24 @@ func (c *Config) applyDefaults(baseDir string) {
 	if c.Registration.Backfill == "" {
 		c.Registration.Backfill = "NONE"
 	}
+	// ---- 可执行文件一致性（selfupdate）：默认"发现不一致就同步并原地重启" ----
+	su := &c.SelfUpdate
+	if su.OnMismatch == "" {
+		su.OnMismatch = "sync"
+	}
+	if su.ChunkSize == 0 {
+		su.ChunkSize = ByteSize(256 * 1024)
+	}
+	if su.MaxBytes == 0 {
+		su.MaxBytes = ByteSize(64 << 20)
+	}
+	def(&su.SyncTimeout, 60*time.Second)
+	def(&su.AttemptWindow, time.Hour)
+	if su.MaxAttempts == 0 {
+		su.MaxAttempts = 3
+	}
 	if c.DataDir == "" {
 		c.DataDir = "."
-		// 说明必须写在这里：下面立刻会把 "." 展开成绝对路径，之后再判 == "" 就永远不成立了
-		c.Defaults = append(c.Defaults, "data_dir = .（未配置，按约定补全）")
 	}
 	if !filepath.IsAbs(c.DataDir) {
 		c.DataDir = filepath.Join(baseDir, c.DataDir)
@@ -551,33 +735,25 @@ func (c *Config) applyDefaults(baseDir string) {
 		c.Command.ObjectStoreDir = filepath.Join(c.DataDir, c.Command.ObjectStoreDir)
 	}
 	// ---- 手工部署的约定路径：只写 node.id + parents[] 也能起来 ----
-	mark := func(field, val string) {
-		c.Defaults = append(c.Defaults, fmt.Sprintf("security.%s = %s（未配置，按约定补全）", field, val))
-	}
 	sec := &c.Security
 	if sec.IdentityKeyPath == "" {
 		sec.IdentityKeyPath = "keys/id_ed25519"
-		mark("identity_key_path", sec.IdentityKeyPath)
 	}
 	if sec.IdentityPubKeyPath == "" {
 		// 公钥与私钥成对预置；未显式配置时按 <私钥>.pub 推导（**不做推导生成，缺失即拒绝启动**）
 		sec.IdentityPubKeyPath = sec.IdentityKeyPath + ".pub"
-		mark("identity_pubkey_path", sec.IdentityPubKeyPath)
 	}
 	if sec.IdentityCertPath == "" {
 		sec.IdentityCertPath = "certs/node.crt"
-		mark("identity_cert_path", sec.IdentityCertPath)
 	}
 	if sec.CAKeyPath == "" {
 		sec.CAKeyPath = "keys/ca"
-		mark("ca_key_path（有子节点才需要，缺文件不影响叶子启动；与 -genkey -keydir keys 的产出同名）", sec.CAKeyPath)
 	}
 	if len(sec.CACertPaths) == 0 {
 		// 信任锚：约定目录 trust/（你的证书脚本往这里投 CA 即可，换 CA 也不用改配置）
 		dir := filepath.Join(baseDir, "trust")
 		if st, err := os.Stat(dir); err == nil && st.IsDir() {
 			sec.CACertPaths = []string{"trust"}
-			mark("ca_cert_paths（发现约定目录 trust/）", "trust")
 		}
 	}
 	if sec.Enrollment.Token == "" && sec.Enrollment.TokenPath == "" {
@@ -585,12 +761,10 @@ func (c *Config) applyDefaults(baseDir string) {
 		tp := filepath.Join(baseDir, "enroll.token")
 		if _, err := os.Stat(tp); err == nil {
 			sec.Enrollment.TokenPath = "enroll.token"
-			mark("enrollment.token_path（发现约定文件 enroll.token）", "enroll.token")
 		}
 	}
 	if c.Persist.StatePath == "" {
 		c.Persist.StatePath = "state.dat"
-		c.Defaults = append(c.Defaults, "persist.state_path = state.dat（未配置，按约定补全）")
 	}
 
 	c.Security.IdentityKeyPath = resolve(c.Security.IdentityKeyPath)
@@ -611,6 +785,7 @@ func (c *Config) applyDefaults(baseDir string) {
 		c.Security.CertReload.Paths[i] = resolve(c.Security.CertReload.Paths[i])
 	}
 	c.Security.Enrollment.TokenPath = resolve(c.Security.Enrollment.TokenPath)
+	c.SelfUpdate.Dir = resolve(c.SelfUpdate.Dir)
 	c.Persist.StatePath = resolve(c.Persist.StatePath)
 }
 
@@ -623,7 +798,8 @@ func (c *Config) applyDefaults(baseDir string) {
 //
 // 注意：这里**故意不**因为"证书不存在 + 没配入网 token"就拒绝启动 ——
 // 父端可能只配了 allow_ids 白名单（那种模式不需要 token），子端无从得知。
-// 该情况由 node.Check 作为警告提示，运行期再由父端明确拒绝（ERR_ENROLL_*）。
+// 于是它会先以"待入网"状态起来，运行期再由父端明确拒绝（ERR_ENROLL_BAD_PERMIT /
+// ERR_ENROLL_NOT_ALLOWED，日志里写着原因）。
 //
 // 返回：
 //
@@ -682,6 +858,14 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("invalid security.cert_reload.on_change %q (reconnect|lazy)", c.Security.CertReload.OnChange)
 	}
+	switch c.SelfUpdate.OnMismatch {
+	case "", "sync", "warn":
+	default:
+		return fmt.Errorf("invalid selfupdate.on_mismatch %q (sync|warn)", c.SelfUpdate.OnMismatch)
+	}
+	if c.SelfUpdate.MaxBytes < 0 || c.SelfUpdate.ChunkSize < 0 || c.SelfUpdate.MaxAttempts < 0 {
+		return errors.New("selfupdate 的 max_bytes / chunk_size / max_attempts 不能为负数")
+	}
 	if c.Security.Enrollment.TokenPath != "" {
 		if _, err := os.Stat(c.Security.Enrollment.TokenPath); err != nil {
 			return fmt.Errorf("security.enrollment.token_path: %w", err)
@@ -689,7 +873,7 @@ func (c *Config) Validate() error {
 	}
 	// 注意：**不在这里**因为"证书不存在 + 没配 token"就拒绝启动 ——
 	// 父端可能只配了 allow_ids 白名单（那种模式不需要 token），子端无从得知。
-	// 这种情况由 node.Check 作为警告提示，并在运行期由父端明确拒绝（ERR_ENROLL_*）。
+	// 于是它会先以"待入网"状态起来，运行期再由父端明确拒绝（ERR_ENROLL_*）。
 	return nil
 }
 

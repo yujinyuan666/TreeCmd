@@ -372,21 +372,6 @@ func loadIdentityForReload(cfg *config.Config) (*identityBundle, error) {
 	return b, nil
 }
 
-// watchPathsDigest 返回当前在监视的路径与最近一次内容摘要，供诊断接口展示。
-//
-// 接收者 n 是本节点实例；未启用热重载（reloader 为空）时返回 nil 与空串。
-//
-// 返回：
-//
-//	[]string — 参与变更判定的路径列表
-//	string   — 上次内容摘要
-func (n *Node) watchPathsDigest() ([]string, string) {
-	if n.reloader == nil {
-		return nil, ""
-	}
-	return n.reloader.paths, n.reloader.digest
-}
-
 // canonTime 把证书的到期时间格式化成 RFC3339 字符串，便于写进日志。
 //
 // 参数：

@@ -43,7 +43,6 @@ go build -o bin/treecmd-node ./cmd/node
 > ① `state.dat` 与证书身份不一致 → **以证书为准**并告警（否则必然过不了启动强校验）；
 > ② 父端若用 `enrollment.allow_ids` 白名单，白名单里要填"这个节点实际拿到的 ID" —— 首启后看启动日志
 > （`node.id 未写定 → 本次生成 … node_id=<ID>`）或读 `state.dat` 的 `self.id` 即可拿到。
-> `-check` 是只读自检：会说"启动时生成 `<ID>` 并写入 `<state.dat>`"，但不落盘、也不碰配置。
 
 `node.name` / `node.remark` **只作展示用途**，不参与任何权限判定与摘要计算，也**不进 `config_hash`**：
 改个显示名不会被当成拓扑变更。它们随每次注册上行（父端在 `/v1/tree` 里就能看到名字），
@@ -60,28 +59,30 @@ curl -s 'localhost:18443/v1/health?depth=-1&detail=true&timeout=20s'   # 逐层�
 > 补充：**根节点仍然必须自带证书**（没有父可以签发它）。"根 + 无证书"会拒绝启动，
 > 与 id 写没写无关 —— id 可以从证书取，证书本身没有就只能自带。
 
-### 手工部署（四个便捷入口）
+### 手工部署（三个便捷入口）
 
 ```bash
 # 根节点**首次启动前**：生成它自己的信任锚材料（一次性 bootstrap，见 docs/手动部署指南.md 第二节）
 # 根没有父，没有谁能给它签发证书，所以这一步必须在根的第一次启动之前做一次
 ./scripts/init_root.sh <节点目录> <根节点ID>
 
-# 生成带注释的样例配置：root（完整）/ child（最小：只需要"我是谁 + 父地址"）/ relay / leaf
-./bin/treecmd-node -print-sample-config child > node.yaml
-
 # 一次性生成本节点密钥对（程序**启动路径绝不生成密钥**，这是显式的部署工具）
 ./bin/treecmd-node -genkey -keydir keys            # 还有下级就加 -with-ca
 
-# 部署前自检：只读配置与证书，不监听、不连接、不落盘；并把"按约定补全了什么"逐条列出来
-./bin/treecmd-node -check -config node.yaml
+# 配置从 examples/node.yaml 抄一份即可（唯一一份权威样例：头部有"按角色最简起步"，
+# 正文逐字段标了【根/中继/叶】必填性与默认值；写出来的是根形态，中继/叶按标记增删）
+cp examples/node.yaml node.yaml
 
-# 起停 / 自检 / 换证后重载 / 配置热更
-./scripts/start_node.sh <node.yaml>            # 启动（先自检再后台起）
+# 起停 / 换证后重载 / 配置热更
+./scripts/start_node.sh <node.yaml>            # 启动（后台起、记 pid）
 ./scripts/start_node.sh reload <node.yaml>     # = kill -USR1：证书脚本换证后立即重载
 ./scripts/start_node.sh conf   <node.yaml>     # = kill -HUP：配置热更
 ./scripts/start_node.sh stop   <node.yaml>
 ```
+
+> 配置或身份材料有问题时不用提前检查：**启动强校验就在启动路径上** ——
+> 任一条不过就 `REFUSE TO START: ...` 并以非零码退出，日志里把原因写清楚，
+> `start_node.sh` 会把日志尾部直接打给你看。
 
 ### 可视化测试台（`test/`）
 
@@ -121,7 +122,55 @@ parents:
 | **证书撤下可自愈** | 证书文件被删 → 子节点自动重新入网把文件补回；根节点则继续用内存里的旧证书服务（并记 `result=missing`） |
 | **首启顺序无关** | 子先起、父后起也能收敛：没证书/连不上都不会让进程退出，按退避（1s→2s→4s…30s）持续重试 |
 
-### 身份硬约束：私钥 + 公钥必须预置
+### 可执行文件一致性：连上即比对，不一致就自同步
+
+树是"父下发、子执行"的，子如果跑的是另一份镜像，行为就可能与父不一致 —— 而这类不一致的
+症状是**"行为诡异"而不是"报错"**，是最难排查的一类故障。所以每个节点启动时先算一次自己
+可执行文件的 sha256，把它放进**运行时配置**（`cfg.Build`，`yaml:"-"`：不来自 `node.yaml`、
+不进 `config_hash`、也不落盘），之后子连上来时第一件事就是比对。
+
+| 能力 | 说明 |
+|------|------|
+| **启动算哈希** | `os.Executable` + 解析符号链接（要替换的是链接指向的**真实文件**）+ 流式 sha256，一遍过。算不出来不致命：只记 ERROR，一致性检查整体降级为"不判定" |
+| **连上第一件事** | 父在 `RegisterAck` 里回带自己的哈希 / 大小 / 签名；子拿到应答后**先比对再干活** —— 此刻心跳与拉取循环都还没起，**一条指令都还没执行过** |
+| **一致** | 只比一个字符串，零额外开销；顺手清掉上次遗留的尝试痕迹 |
+| **不一致** | `on_mismatch: sync`（默认）：就地向父 `BinaryReq` 拉取 → 逐片 crc32 + 整份 sha256 + 父签名三重校验 → 原子替换 → `syscall.Exec` **原地重启** |
+| **复用 Connect 流** | 不新增 RPC：请求与分片都走子已经建好的那条双向流。推送时**先等发送缓冲回落到一半以下再压下一片**，给同一时刻的心跳与终态帧留位置 |
+| **方向单向** | 父永远是标准答案 ⇒ **升级自上而下**（根先换，中继再换，叶子最后跟）**；反过来把根换回旧版就等于整棵树回滚**，不用逐台登录 |
+| **原地 exec** | PID 不变、fd 与环境保留，`nohup` + pidfile 的启动脚本原样可用。进程内状态全丢这件事框架本来就扛得住：`SELF_RUNNING` 的指令走 `Executor.OnRestart`，未上报结果在 `pending_result` 里等着重发，子节点断线自动重连 |
+| **三重校验** | ① mTLS；② 父用**身份密钥**对 `(父ID, 哈希, 大小)` 签名，子用父的证书公钥**离线**验签；③ 收齐后整份 sha256 逐字节校验 |
+| **只对自己签发的直接子开放** | 服务端拿对端叶子证书验自己 CA 的签名，不是直接子一律拒（`ERR_BINARY_NOT_DIRECT_CHILD`）；**发之前还复验磁盘文件仍是启动时那一份**（被换过就拒绝，绝不外发半成品） |
+| **fail-safe** | 拉取 / 落盘 / 替换任一步失败 → 保留当前镜像**继续服务** + ERROR + 指标；只有"替换成功"这一条路径必然重启 |
+| **防重启循环** | 尝试计数**先落盘再动手**（跨 exec 存活在 `state.dat` 的 `self_update` 里）：同一目标哈希在一个窗口内最多 3 次，超了就锁住并告警，窗口一过自动清零重试 |
+| **可观测** | 启动日志里有一行"运行时镜像"（hash/size/version/path）；`/v1/tree` 每个节点都带 `build_hash`，还有 `lagging_children`（>0 就是还没收敛）；指标 `selfupdate_total{result}`、`selfupdate_serve_total{result}`、`binary_info{hash}` |
+
+```yaml
+# 全部可省略（默认值就是"开启 + 不一致即同步"）
+selfupdate:
+  enabled: true            # 总开关
+  on_mismatch: sync        # sync=同步并原地重启（默认）；warn=只告警不重启（先观察一轮时用）
+  serve: true              # 是否把本节点的可执行文件发给直接子
+  chunk_size: 256KB        # 分片大小（上限 4MB）
+  max_bytes: 64MB          # 单次同步的字节上限（请求方与提供方都按它截断）
+  sync_timeout: 60s
+  max_attempts: 3          # 同一个目标哈希在 attempt_window 内最多试几次（防重启循环）
+  attempt_window: 1h
+  # dir: /opt/treecmd/staging   # 默认 = 可执行文件所在目录（**必须同文件系统**，rename 才是原子的）
+```
+
+```bash
+# 升级（推荐顺序：先只换根，剩下的它自己往下传）
+cp 新版/treecmd-node ./bin/treecmd-node     # 换的是磁盘上的文件；在跑的进程不受影响
+./scripts/start_node.sh stop/start <node.yaml>
+curl -s localhost:18443/v1/tree | grep -o '"lagging_children":[0-9]*'   # 等它归零就收敛完了
+# 回滚：把根的二进制换回旧版并重启根 —— 全树自动跟随
+```
+
+三条边界：**只支持 unix**（重启手段就是 `syscall.Exec`，本项目的部署形态也没有 Windows）；
+替换时会给上一版留一份 `<可执行文件>.prev`（回滚与排障用，程序不会自动删）；
+全程**不碰 `node.yaml`**（哈希只活在运行时配置里）。
+
+
 
 每个节点启动时都要带**自己的私钥与公钥**（`security.identity_key_path` / `security.identity_pubkey_path`）：
 
@@ -129,8 +178,8 @@ parents:
 - 三者必须完全一致：**私钥 ↔ 公钥 ↔ 证书公钥**，且证书身份 == NodeID、证书链能验到信任锚、证书未过期；
 - 有子节点的节点（根 / 中继）还必须预置 CA 私钥与 CA 证书，否则也拒绝启动。
 
-启动时的强校验是**默认生效、无需开关**的：上面每一条不满足都会 `REFUSE TO START` 并以非零码退出。
-部署前想先看结果，用 `./bin/treecmd-node -check -config node.yaml`（只读自检，不监听、不连接、不落盘）。
+启动时的强校验是**默认生效、无需开关**的：上面每一条不满足都会 `REFUSE TO START` 并以非零码退出，
+日志里把原因写清楚（这是启动路径的一部分，不需要额外的检查开关）。
 
 ### HTTP API（有对外端点的节点）
 
@@ -170,7 +219,7 @@ internal/exec/              Executor 接口（含 OnRestart）+ noop / echo / sl
 internal/node/              组装：handle / waitChildren / terminal / 租约 / 取消 / 健康 / 查询 / HTTP API
   enroll.go                 运行期入网签发：服务端（许可+白名单+PoP 校验→用 CA 私钥签公钥）+ 客户端（换取并落盘）
   reload.go                 证书热重载：stat 优先的两级变更判定 + SIGUSR1 + fail-safe + 生效策略
-  inspect.go                部署前只读自检（Check）与运维辅助（EnsureCertificate / WatchInfo）
+  build.go                  可执行文件一致性：启动算哈希 / 连上即比对 / 拉取校验 / 原地 exec 重启
   auth.go                   ReqAuth 跨跳委托凭证：入口签一次、逐跳原样透传、每跳离线验链 + 按自己白名单校验
   crl.go                    吊销列表：版本单调递增、身份密钥签名、逐跳转发、重连 CRLReq 全量对齐
   lifecycle.go              证书续签 / 配置热更 / Reconcile 对账 / 驱逐归档 / 索引待重发队列
@@ -178,15 +227,14 @@ internal/observability/     Prometheus 文本指标（零依赖）+ /metrics
 cmd/node/                   单节点入口（一个节点一个进程）
 examples/                   手工部署样例（阅读版）
   README.md                 部署阅读指南：角色对照 / 目录约定 / 字段生效时机 / 报错对照 / 检查清单
-  root.yaml                 根节点：全字段详解（每个字段标了必填/可选/默认值）
-  relay.yaml                中继节点：唯一同时要"上行 + 下行"两侧材料的角色
-  child.yaml                叶子节点：最小形态（只需"我是谁 + 父地址"）+ 约定与默认值全表
+  node.yaml                 唯一一份权威配置样例：头部"按角色最简起步"，正文逐字段标角色与默认值
 scripts/init_root.sh        根节点首次启动前的自签材料（一次性 bootstrap；其后签发与续期都归程序）
-scripts/start_node.sh       单节点起停 / 自检 / 换证重载（SIGUSR1）/ 配置热更（SIGHUP）
+scripts/start_node.sh       单节点起停 / 换证重载（SIGUSR1）/ 配置热更（SIGHUP）
 test/                       可视化测试台：本地网页 + 反向代理 + 一键起演示树（见 test/README.md）
   index.html                单文件控制台（零依赖、可离线）：总览 / 拓扑 / 健康 / 指令 / 指标
   serve.py                  本地静态服务 + /api 反向代理（默认只转发本机，零依赖）
   demo.sh                   一键起"根 + 直接叶子 + 中继 + 中继下的叶子"（3 层）+ 起控制台
+  selfupdate.sh             可执行文件自同步的端到端验证（起树 / 换版本 / 断言原地重启）
 docs/                       手动部署指南、差异处理方案、项目功能完整介绍、代码注释规范
 ```
 

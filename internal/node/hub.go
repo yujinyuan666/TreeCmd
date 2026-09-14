@@ -596,6 +596,9 @@ func (h *Hub) serveConn(stream pb.NodeService_ConnectServer, peerID string, pub 
 		path     string
 		fallback bool
 	)
+	// 父自己那份镜像的哈希 / 大小 / 签名：子连上后的第一件事就是拿它跟自己的比
+	//（见 README「可执行文件一致性」）。在事务外先算好：签名不进事务，也没必要。
+	bhash, bsize, bsig := h.n.buildForAck()
 	err := h.n.Store.Update(func(tx *store.Tx) error {
 		wm, known := tx.GetWatermark(peerID)
 		// 双主仲裁：只接受严格更大的 epoch（若已有活跃连接）
@@ -623,6 +626,7 @@ func (h *Hub) serveConn(stream pb.NodeService_ConnectServer, peerID string, pub 
 		ack = &pb.RegisterAck{
 			Ok: true, Path: path, Ancestors: ancestors, AncestorIds: ancestorIDs, StartCmdSeq: fetched,
 			ServerProtoVersion: protoVersion, Epoch: reg.Epoch,
+			ServerBinaryHash: bhash, ServerBinarySize: bsize, ServerBinarySig: bsig,
 		}
 		return nil
 	})
@@ -651,10 +655,12 @@ func (h *Hub) serveConn(stream pb.NodeService_ConnectServer, peerID string, pub 
 		NodeID: peerID, Path: path, Labels: labelsFrom(reg), Caps: reg.Capabilities,
 		Name: reg.NodeName, Remark: reg.NodeRemark,
 		ListenAddr: reg.ListenAddr, Confirmed: true, RegisteredAt: time.Now(), LastEpoch: reg.Epoch,
+		// 子上报的是"它自己那份镜像"：父端拿它和 h.n.Build().Hash 一比就知道谁没跟上
+		BuildHash: reg.GetBinaryHash(),
 	}
 	h.n.Reg.Upsert(child)
 	h.n.Log.Info("child registered", "child", shortID(peerID), "path", path, "epoch", reg.Epoch,
-		"start_seq", fetched, "resume", resume, "name", reg.NodeName)
+		"start_seq", fetched, "resume", resume, "name", reg.NodeName, "build", shortHash(reg.GetBinaryHash()))
 
 	// 注册后顺带：推 CRL（版本更高才发）+ 检查子证书是否进入续签窗口（父即时换发）
 	h.n.pushCRL(peerID)
@@ -705,6 +711,11 @@ func (h *Hub) dispatch(cc *childConn, f *pb.UpFrame) error {
 	switch body := f.Frame.(type) {
 	case *pb.UpFrame_Heartbeat:
 		return h.handleHeartbeat(cc, body.Heartbeat)
+	case *pb.UpFrame_BinaryReq:
+		// 子申请"把父那份可执行文件发给我"：起独立协程推送，绝不占住读循环
+		//（读循环一停，心跳与拉取都会跟着停）。
+		go h.serveBinary(cc, body.BinaryReq)
+		return nil
 	case *pb.UpFrame_HealthResp:
 		cc.mu.Lock()
 		ch, ok := cc.healthCh[body.HealthResp.ReqId]
@@ -940,6 +951,38 @@ func (cc *childConn) send(f *pb.DownFrame) error {
 		return errors.New("connection closed")
 	default:
 		return errors.New("send buffer full")
+	}
+}
+
+// sendThrottled 放一帧进发送缓冲，但**先等缓冲回落到一半以下**再放。
+//
+// 只给"可执行文件分片"这种大流量用。为什么需要它：sendCh 是给所有下行帧共用的
+// （心跳回应、终态、指令通知…），如果几十 MB 的分片把缓冲占满，同一时刻的
+// HeartbeatAck 就会被"缓冲满"顶掉 —— 而"续租响应必须回带终态"是必经路径，
+// 丢了会连带把租约判成过期。留一半余量就足够给控制帧腾位置。
+//
+// 接收者 cc 是 Hub 侧维护的一条子节点连接。
+//
+// 参数：
+//
+//	ctx — 等待缓冲腾空时的取消依据（一般带 selfupdate.sync_timeout 的总时限）
+//	f   — 待发送的下行帧
+//
+// 返回：
+//
+//	error — 连接已关闭 / 上下文取消时返回；缓冲腾空后由 send 的错误决定
+func (cc *childConn) sendThrottled(ctx context.Context, f *pb.DownFrame) error {
+	for {
+		if len(cc.sendCh)*2 < cap(cc.sendCh) {
+			return cc.send(f)
+		}
+		select {
+		case <-cc.done:
+			return errors.New("connection closed")
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Millisecond):
+		}
 	}
 }
 

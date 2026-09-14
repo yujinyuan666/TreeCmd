@@ -316,6 +316,9 @@ func (n *Node) Reload() error {
 	if err != nil {
 		return fmt.Errorf("reload: %w", err)
 	}
+	// Build 是程序填的运行时字段（不来自 node.yaml）：热更会整体换掉配置对象，
+	// 所以这里必须把它补回去，否则"我是哪份镜像"在新对象上就丢了。
+	fresh.Build = n.selfBuild
 	if fresh.ConfigHash() != old.ConfigHash() {
 		// 影响拓扑 / 会话 / 身份 / 父列表 / 监听地址的字段变了 → 旧会话必须失效
 		n.cfg.Store(fresh)

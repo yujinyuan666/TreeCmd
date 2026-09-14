@@ -193,21 +193,16 @@ CA_FLAG="$(openssl x509 -in "${DIR}/certs/ca.crt" -noout -text 2>/dev/null | gre
 KEY_MOD="$(openssl pkey -in "${KEY}" -noout -text 2>/dev/null | head -1 | tr -d ' ')"
 case "${KEY_MOD}" in *ED25519*) ok "身份私钥是 Ed25519" ;; *) die "身份私钥不是 Ed25519：${KEY_MOD}" ;; esac
 
-# 若有 node.yaml，顺手跑一次程序自检
+# 材料自验之后，给出"下一步"。材料到底合不合程序的口味，最终由**程序启动强校验**说了算：
+# 有问题它会打 REFUSE TO START 并以非零码退出，日志里原因写得很清楚。
 echo
 if [ -f "${DIR}/node.yaml" ]; then
-  echo "⑦ 发现 node.yaml，跑一次程序自检"
-  if "${BIN}" -check -config "${DIR}/node.yaml"; then
-    ok "程序自检通过：可以启动"
-  else
-    warn "程序自检未通过 —— 按上面的输出改 node.yaml 后再试"
-  fi
+  echo "⑦ 已有 ${DIR}/node.yaml —— 直接启动即可"
+  info "${BIN} -config ${DIR}/node.yaml"
 else
   echo "⑦ 还没有 ${DIR}/node.yaml"
-  info "生成一份带注释的根节点配置，然后启动："
-  info "  ${BIN} -print-sample-config root > ${DIR}/node.yaml"
-  info "  # 至少改 node.id 为 ${NODE_ID}，其余按约定即可"
-  info "  ${BIN} -check -config ${DIR}/node.yaml     # 自检（只读）"
+  info "从样例配置抄一份（把 node.id 改成 ${NODE_ID}，其余按约定即可）："
+  info "  cp ${REPO_DIR}/examples/node.yaml ${DIR}/node.yaml"
   info "  ${BIN} -config ${DIR}/node.yaml            # 启动"
 fi
 

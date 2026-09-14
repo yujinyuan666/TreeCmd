@@ -59,14 +59,34 @@ Python 3（系统自带的 3.9 就能跑）与一个能访问到的 treecmd 根�
 和 `scripts/init_root.sh`；仓库根默认由脚本位置推导（`test/` 的上一级），
 确实要指别处时用环境变量 `TREECMD_REPO` 覆盖。
 
+## 可执行文件自同步怎么验（`selfupdate.sh`）
+
+控制台看的是"树跑得对不对"；`selfupdate.sh` 看的是另一件事：**子节点跑的是不是父那一份镜像**。
+
+```bash
+./selfupdate.sh prepare    # 预生成 v1 / v2 两个"内容不同"的可执行文件（编译吃内存，单独跑更稳）
+./selfupdate.sh all        # 起根(v2) + 三个子节点各自以 v1 启动 → 断言它们自己跟上并原地重启
+./selfupdate.sh readonly   # 负向用例：暂存目录只读 → 断言 fail-safe（继续服务、不重启循环）
+./selfupdate.sh stop
+```
+
+它断言的是四件硬事实：① 子节点确实向父申请了镜像；② 校验通过后**原地重启**（PID 必须不变）；
+③ 磁盘上它自己那份文件真的变成了 v2 的内容；④ 整棵树收敛（根视角 `lagging_children=0`）。
+另外还跑两条对照：**同版本时不得有任何同步动作**，以及**暂存目录只读时必须继续服务**。
+
+> 脚本刻意**不**做"替换正在运行的可执行文件"这个动作。原因见 `internal/node/build.go` 的
+> `commit()`：替换必须走"写暂存文件 + rename"，而 macOS 上"原地覆盖某个可执行文件之后立刻
+> exec"会被内核直接判死（`Killed: 9`、日志一行都没有）—— 这正是程序自己用 rename 的原因。
+
 ## 运行产物（都已 gitignore）
 
-`demo.sh` 只在**本目录**下产出这些东西，不会污染仓库其它位置，也不需要提交：
+`demo.sh` / `selfupdate.sh` 只在**本目录**下产出这些东西，不会污染仓库其它位置，也不需要提交：
 
 | 路径 | 内容 |
 |---|---|
 | `demo/` | 演示集群的节点目录（含 **私钥与证书**，所以不能进版本库） |
 | `logs/` | 各节点与控制台的日志 |
 | `.demo.pids` | 进程 pid 表（`stop` / `status` 用） |
+| `.selfupdate/` | `selfupdate.sh` 的工作区：各节点的二进制副本与节点目录 |
 
-想彻底清干净：`./demo.sh stop && rm -rf demo logs .demo.pids`。
+想彻底清干净：`./demo.sh stop && ./selfupdate.sh stop && rm -rf demo logs .demo.pids .selfupdate`。

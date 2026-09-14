@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"treecmd/internal/aggregate"
+	"treecmd/internal/buildinfo"
 	"treecmd/internal/config"
 	"treecmd/internal/exec"
 	"treecmd/internal/identity"
@@ -38,6 +39,10 @@ type Node struct {
 	// 读侧一律走 Id() / rootsPool()，避免与运行中的协程竞态。
 	idPtr atomic.Pointer[identity.Identity]
 	roots atomic.Pointer[x509.CertPool]
+	// 本节点**可执行文件**的身份快照（启动时算一次，之后不再变，见 build.go）。
+	// 它是权威值；cfg.Build 只是它在"运行时配置"上的镜像（配置对象会被 SIGHUP 整体替换，
+	// 所以不能让配置成为唯一来源）。
+	selfBuild buildinfo.Info
 
 	Reg     *registry.Table
 	Store   *store.Store
@@ -171,6 +176,10 @@ func NewWithPath(cfg *config.Config, cfgPath string, logger *slog.Logger) (*Node
 	n.ancestorIDs.Store([]string(nil))
 	n.semLocal = make(chan struct{}, cfg.Command.MaxInflight)
 	n.inflight = newInflightTable()
+
+	// 启动路径的第一件事：算本节点可执行文件的哈希，放进运行时配置（cfg.Build）。
+	// 放在身份材料之前：它不依赖证书，而且"我是哪份镜像"越早出现在日志里越好。
+	n.initBuildInfo()
 
 	// 身份材料（selfRenew=true：这是真正的启动装配，允许根在启动时顺带自签续期并落盘）
 	st, err := loadIdentity(cfg, true)
@@ -778,6 +787,43 @@ func (n *Node) registerMetrics() {
 		_ = n.Store.View(func(tx *store.Tx) error { c = len(tx.ScanResults()); return nil })
 		return float64(c)
 	})
+	// ---- 可执行文件一致性（见 build.go）----
+	m.Help("selfupdate_total", "可执行文件一致性检查 / 自同步计数（result=match|mismatch|synced|settled|pull_failed|install_failed|locked|disabled|warned|unknown|self_unknown|bad_sig）")
+	m.Help("selfupdate_serve_total", "向子节点提供本节点可执行文件的计数（result=sent|rejected|error）")
+	m.Help("binary_info", "本节点可执行文件的哈希（值恒为 1，哈希在标签里）")
+	m.SetLabeled("binary_info", func() map[string]float64 {
+		info := n.Build()
+		if !info.Known() {
+			return map[string]float64{`hash="?"`: 1}
+		}
+		return map[string]float64{"hash=\"" + info.Short() + "\"": 1}
+	})
+	m.Help("binary_size_bytes", "本节点可执行文件的字节数")
+	m.SetGauge("binary_size_bytes", func() float64 { return float64(n.Build().Size) })
+	m.Help("selfupdate_lagging_children", "直接子里仍跑着与父不同镜像的数量（>0 说明还没收敛）")
+	m.SetGauge("selfupdate_lagging_children", func() float64 { return float64(n.laggingChildren()) })
+}
+
+// laggingChildren 数一数"上报的镜像哈希与我不同的直接子"有几个。
+//
+// 接收者 n 是本节点。只看已注册的子（未注册 / 没上报哈希的不算），所以它是个
+// "收敛进度"指示器：升级根之后这个数会先涨后归零。
+//
+// 返回：
+//
+//	int — 镜像与父不一致的直接子数量；本节点算不出自己哈希时返回 0
+func (n *Node) laggingChildren() int {
+	mine := n.Build()
+	if !mine.Known() {
+		return 0
+	}
+	c := 0
+	for _, ch := range n.Reg.Snapshot() {
+		if ch.BuildHash != "" && ch.BuildHash != mine.Hash {
+			c++
+		}
+	}
+	return c
 }
 
 // backgroundContext 返回后台任务用的上下文。

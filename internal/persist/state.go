@@ -45,6 +45,18 @@ type Watermarks struct {
 	RetentionFloor int64 `json:"retention_floor"`
 }
 
+// SelfUpdate 自同步更新的尝试痕迹（见 README「可执行文件一致性」）。
+//
+// 为什么必须落盘：进程镜像被 exec 原地替换后，**内存里的东西全丢了** ——
+// 只有落过盘的计数才能跨过那次重启，挡住"替换没生效 → 又连上 → 又替换 → 又重启"的循环。
+// 它回答两个问题：**这一轮在追哪个哈希**、**已经试了几次**。
+type SelfUpdate struct {
+	TargetHash string `json:"target_hash,omitempty"` // 正在追的目标哈希（= 父的镜像）
+	Attempts   int    `json:"attempts,omitempty"`    // 窗口内已尝试次数
+	FirstAt    string `json:"first_at,omitempty"`    // 本窗口第一次尝试的时刻（RFC3339Nano，UTC）
+	LastAt     string `json:"last_at,omitempty"`     // 最近一次尝试的时刻
+}
+
 // State state.dat 的内容。
 type State struct {
 	SavedAt            string       `json:"saved_at"`
@@ -55,6 +67,8 @@ type State struct {
 	ClockOffsetMS      int64        `json:"clock_offset_ms"`
 	OffsetCalibratedAt string       `json:"offset_calibrated_at"`
 	KnownChildren      []KnownChild `json:"known_children"`
+	// SelfUpdate 自同步更新的尝试痕迹；旧快照里没有这个字段 → 零值，向后兼容
+	SelfUpdate SelfUpdate `json:"self_update,omitempty"`
 }
 
 // Load 读取 state.dat 并解析成 State。

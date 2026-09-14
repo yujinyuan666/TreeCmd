@@ -272,7 +272,12 @@ func (u *Upstream) runSession(p config.Parent) error {
 	u.mu.Unlock()
 	u.n.Log.Info("registered", "path", ack.Path, "start_seq", ack.StartCmdSeq, "epoch", u.epoch, "reason", ack.Reason)
 
-	// 写协程
+	// 本会话**唯一的读协程**：读帧 → 送通道。正常阶段与"自同步阶段"共用它，
+	// 于是两个阶段都能带超时，而且读到一半放弃时帧不会丢在别处（谁在跑谁消费）。
+	frames := make(chan recvResult, 1)
+	go readFrames(ctx, stream, frames)
+
+	// 写协程（必须在下面那段"自同步"之前起来：子要先把 BinaryReq 发出去）
 	go func() {
 		for {
 			select {
@@ -286,6 +291,11 @@ func (u *Upstream) runSession(p config.Parent) error {
 			}
 		}
 	}()
+
+	// 连上后的**第一件事**：比对自己的可执行文件哈希与父的。不一致就拉取、校验、原地重启。
+	// 成功路径不会返回（进程镜像已被新镜像替换），所以下面这些只在"一致 / 跳过 / 失败兜底"时执行。
+	u.n.checkParentBuild(u, frames, ack)
+
 	// 重连后：取 CRL 全量 + 上报本地未终态指令对账 + 检查是否需要续签
 	u.sendCRLReq()
 	u.n.sendReconcile()
@@ -298,15 +308,51 @@ func (u *Upstream) runSession(p config.Parent) error {
 	// 读循环（阻塞直到连接断开）
 	defer cancel()
 	for {
-		f, err := stream.Recv()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
+		select {
+		case <-ctx.Done():
+			return nil
+		case r := <-frames:
+			if r.err != nil {
+				if errors.Is(r.err, io.EOF) {
+					return nil
+				}
+				return r.err
 			}
-			return err
+			if err := u.dispatch(r.f); err != nil {
+				u.n.Log.Warn("down frame error", "err", err)
+			}
 		}
-		if err := u.dispatch(f); err != nil {
-			u.n.Log.Warn("down frame error", "err", err)
+	}
+}
+
+// recvResult 一条下行帧的读取结果：err 非空表示流结束 / 出错（此时 f 无意义）。
+type recvResult struct {
+	f   *pb.DownFrame
+	err error
+}
+
+// readFrames 是本次会话唯一的读协程：把 stream 上的下行帧按序送进 ch，直到出错或会话结束。
+//
+// 为什么要有它（而不是在需要的地方直接 stream.Recv）：同一个 Connect 流既要被"自同步阶段"
+// 消费（收可执行文件分片），又要被"正常阶段"消费（心跳回应 / 终态 / 配置下发…），
+// 而且前者必须能带超时。把"读"收口到一个协程 + 一个通道，两个阶段就只是不同的消费者，
+// 不会出现"两个协程同时 Recv"或者"放弃读之后帧被谁吞掉"这类问题。
+//
+// 参数：
+//
+//	ctx    — 会话上下文；取消后本协程立即退出（退出前尝试把手上这帧交出去，交不掉就丢）
+//	stream — 本会话的 Connect 双向流（只读一侧）
+//	ch     — 输出通道；容量 1 即可（消费方总是紧跟其后，缓冲太大只会掩盖卡顿）
+func readFrames(ctx context.Context, stream pb.NodeService_ConnectClient, ch chan<- recvResult) {
+	for {
+		f, err := stream.Recv()
+		select {
+		case ch <- recvResult{f: f, err: err}:
+		case <-ctx.Done():
+			return
+		}
+		if err != nil {
+			return
 		}
 	}
 }
@@ -339,6 +385,9 @@ func (u *Upstream) buildRegister() *pb.RegisterRequest {
 		// 元信息（ADR-051）：随每次注册/重注册上行，父端据此展示"我是谁"
 		NodeName: u.n.C().Node.Name, NodeRemark: u.n.C().Node.Remark,
 		ProtoVersion: protoVersion,
+		// 本节点跑的是哪份镜像：父端只用它展示（/v1/tree），判定方向是反过来的
+		// ——"子跟父的比"，所以这里上行的是"我自己的哈希"，不是"我希望的哈希"。
+		BinaryHash: u.n.Build().Hash, BinarySize: u.n.Build().Size,
 	}
 }
 
@@ -382,6 +431,14 @@ func (u *Upstream) dispatch(f *pb.DownFrame) error {
 		return nil
 	case *pb.DownFrame_ConfigPush:
 		u.n.applyConfigOverrides(body.ConfigPush.Reason, body.ConfigPush.Overrides)
+		return nil
+	case *pb.DownFrame_BinaryChunk:
+		// 分片由"自同步阶段"自己消费（见 build.go 的 pullBinary）；跑到这里说明
+		// 那次同步已经放弃，而父还在把剩下的片推完。丢掉即可 —— 父推完自己会停。
+		if body.BinaryChunk.GetFinal() {
+			u.n.Log.Debug("忽略迟到的可执行文件分片（本次同步已结束）",
+				"hash", shortHash(body.BinaryChunk.GetHash()), "reason", body.BinaryChunk.GetReason())
+		}
 		return nil
 	case *pb.DownFrame_HealthReq:
 		go u.n.serveHealthReqFromParent(body.HealthReq)

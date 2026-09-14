@@ -2699,9 +2699,14 @@ type RegisterRequest struct {
 	ListenAddr   string                 `protobuf:"bytes,8,opt,name=listen_addr,json=listenAddr,proto3" json:"listen_addr,omitempty"`
 	// 节点元信息（ADR-051）：人类可读的"我是谁"，用于父端/根端展示与运维定位。
 	// 仅展示用途，不参与任何权限判定与摘要计算。
-	NodeName      string `protobuf:"bytes,9,opt,name=node_name,json=nodeName,proto3" json:"node_name,omitempty"`
-	ProtoVersion  string `protobuf:"bytes,10,opt,name=proto_version,json=protoVersion,proto3" json:"proto_version,omitempty"`
-	NodeRemark    string `protobuf:"bytes,11,opt,name=node_remark,json=nodeRemark,proto3" json:"node_remark,omitempty"`
+	NodeName     string `protobuf:"bytes,9,opt,name=node_name,json=nodeName,proto3" json:"node_name,omitempty"`
+	ProtoVersion string `protobuf:"bytes,10,opt,name=proto_version,json=protoVersion,proto3" json:"proto_version,omitempty"`
+	NodeRemark   string `protobuf:"bytes,11,opt,name=node_remark,json=nodeRemark,proto3" json:"node_remark,omitempty"`
+	// 本节点**可执行文件**的哈希（"sha256:" + 十六进制）与字节数，随每次注册 / 重注册上行。
+	// 空串 = 本节点算不出自己的哈希（读不到可执行文件），此时父端不做任何判定。
+	// 父端只用它做展示（/v1/tree 里能看见"每个子跑的是哪份镜像"），不参与任何签名。
+	BinaryHash    string `protobuf:"bytes,12,opt,name=binary_hash,json=binaryHash,proto3" json:"binary_hash,omitempty"`
+	BinarySize    int64  `protobuf:"varint,13,opt,name=binary_size,json=binarySize,proto3" json:"binary_size,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2813,6 +2818,20 @@ func (x *RegisterRequest) GetNodeRemark() string {
 	return ""
 }
 
+func (x *RegisterRequest) GetBinaryHash() string {
+	if x != nil {
+		return x.BinaryHash
+	}
+	return ""
+}
+
+func (x *RegisterRequest) GetBinarySize() int64 {
+	if x != nil {
+		return x.BinarySize
+	}
+	return 0
+}
+
 type RegisterAck struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	Ok        bool                   `protobuf:"varint,1,opt,name=ok,proto3" json:"ok,omitempty"`
@@ -2826,8 +2845,18 @@ type RegisterAck struct {
 	ServerProtoVersion string   `protobuf:"bytes,6,opt,name=server_proto_version,json=serverProtoVersion,proto3" json:"server_proto_version,omitempty"`
 	NodeBinding        []byte   `protobuf:"bytes,7,opt,name=node_binding,json=nodeBinding,proto3" json:"node_binding,omitempty"` // 根仲裁结果（本实现为父代签发；见 README 差异说明）
 	Epoch              uint64   `protobuf:"varint,8,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// 父（服务端）自己那份**可执行文件**的哈希 / 字节数 / 签名：子节点连上后的第一件事
+	// 就是拿它跟自己的比 —— 不一致就向父拉取可执行文件、校验后原地重启（见 README
+	// 「可执行文件一致性」）。空串 = 父没有这个能力（旧版本）或算不出自己的哈希，
+	// 此时子端只记一条指标，不做任何动作。
+	//
+	//	server_binary_sig = 父身份私钥对 (父 NodeID || hash || size) 的 canonical 摘要签名，
+	//	子端用父的证书公钥（mTLS 握手时已拿到）离线验签。
+	ServerBinaryHash string `protobuf:"bytes,10,opt,name=server_binary_hash,json=serverBinaryHash,proto3" json:"server_binary_hash,omitempty"`
+	ServerBinarySize int64  `protobuf:"varint,11,opt,name=server_binary_size,json=serverBinarySize,proto3" json:"server_binary_size,omitempty"`
+	ServerBinarySig  []byte `protobuf:"bytes,12,opt,name=server_binary_sig,json=serverBinarySig,proto3" json:"server_binary_sig,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *RegisterAck) Reset() {
@@ -2921,6 +2950,27 @@ func (x *RegisterAck) GetEpoch() uint64 {
 		return x.Epoch
 	}
 	return 0
+}
+
+func (x *RegisterAck) GetServerBinaryHash() string {
+	if x != nil {
+		return x.ServerBinaryHash
+	}
+	return ""
+}
+
+func (x *RegisterAck) GetServerBinarySize() int64 {
+	if x != nil {
+		return x.ServerBinarySize
+	}
+	return 0
+}
+
+func (x *RegisterAck) GetServerBinarySig() []byte {
+	if x != nil {
+		return x.ServerBinarySig
+	}
+	return nil
 }
 
 type ResumeRequest struct {
@@ -5002,6 +5052,7 @@ type UpFrame struct {
 	//	*UpFrame_QueryReq
 	//	*UpFrame_QueryResp
 	//	*UpFrame_QueryData
+	//	*UpFrame_BinaryReq
 	Frame         isUpFrame_Frame `protobuf_oneof:"frame"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -5182,6 +5233,15 @@ func (x *UpFrame) GetQueryData() *QueryData {
 	return nil
 }
 
+func (x *UpFrame) GetBinaryReq() *BinaryReq {
+	if x != nil {
+		if x, ok := x.Frame.(*UpFrame_BinaryReq); ok {
+			return x.BinaryReq
+		}
+	}
+	return nil
+}
+
 type isUpFrame_Frame interface {
 	isUpFrame_Frame()
 }
@@ -5238,6 +5298,10 @@ type UpFrame_QueryData struct {
 	QueryData *QueryData `protobuf:"bytes,13,opt,name=query_data,json=queryData,proto3,oneof"` // 回程段
 }
 
+type UpFrame_BinaryReq struct {
+	BinaryReq *BinaryReq `protobuf:"bytes,17,opt,name=binary_req,json=binaryReq,proto3,oneof"` // 申请父下发它的可执行文件（子连上后发现自己与父不一致时）
+}
+
 func (*UpFrame_Register) isUpFrame_Frame() {}
 
 func (*UpFrame_Resume) isUpFrame_Frame() {}
@@ -5263,6 +5327,8 @@ func (*UpFrame_QueryReq) isUpFrame_Frame() {}
 func (*UpFrame_QueryResp) isUpFrame_Frame() {}
 
 func (*UpFrame_QueryData) isUpFrame_Frame() {}
+
+func (*UpFrame_BinaryReq) isUpFrame_Frame() {}
 
 type HealthResp struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -5334,6 +5400,7 @@ type DownFrame struct {
 	//	*DownFrame_HeartbeatAck
 	//	*DownFrame_RevocationList
 	//	*DownFrame_CertRenewOffer
+	//	*DownFrame_BinaryChunk
 	Frame         isDownFrame_Frame `protobuf_oneof:"frame"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -5498,6 +5565,15 @@ func (x *DownFrame) GetCertRenewOffer() *CertRenewOffer {
 	return nil
 }
 
+func (x *DownFrame) GetBinaryChunk() *BinaryChunk {
+	if x != nil {
+		if x, ok := x.Frame.(*DownFrame_BinaryChunk); ok {
+			return x.BinaryChunk
+		}
+	}
+	return nil
+}
+
 type isDownFrame_Frame interface {
 	isDownFrame_Frame()
 }
@@ -5550,6 +5626,10 @@ type DownFrame_CertRenewOffer struct {
 	CertRenewOffer *CertRenewOffer `protobuf:"bytes,14,opt,name=cert_renew_offer,json=certRenewOffer,proto3,oneof"`
 }
 
+type DownFrame_BinaryChunk struct {
+	BinaryChunk *BinaryChunk `protobuf:"bytes,15,opt,name=binary_chunk,json=binaryChunk,proto3,oneof"` // 父推送自己那份可执行文件的分片（响应 BinaryReq）
+}
+
 func (*DownFrame_RegisterAck) isDownFrame_Frame() {}
 
 func (*DownFrame_CommandNotify) isDownFrame_Frame() {}
@@ -5573,6 +5653,8 @@ func (*DownFrame_HeartbeatAck) isDownFrame_Frame() {}
 func (*DownFrame_RevocationList) isDownFrame_Frame() {}
 
 func (*DownFrame_CertRenewOffer) isDownFrame_Frame() {}
+
+func (*DownFrame_BinaryChunk) isDownFrame_Frame() {}
 
 type ConfigPush struct {
 	state  protoimpl.MessageState `protogen:"open.v1"`
@@ -6279,6 +6361,178 @@ func (x *EnrollResponse) GetIssuedBy() string {
 	return ""
 }
 
+// ============================================================================
+// 可执行文件一致性：自同步更新（父下发自己那份镜像）
+// ============================================================================
+// 复用已建立的 Connect 双向流，不新增 RPC：子是**唯一发起方**（先发 BinaryReq），
+// 父只在收到请求后才会推分片（DownFrame.binary_chunk），推完最后一片即结束。
+// 方向是单向的：父永远是标准答案 —— 子向父对齐，所以升级顺序天然自上而下
+// （根先换、逐层收敛）；反过来"把根换回旧版"就等于整棵树回滚。
+type BinaryReq struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 申请方期望的哈希（就是 RegisterAck.server_binary_hash 里给的那个）。
+	// 父端逐字节比对，不等即拒（ERR_BINARY_HASH_MISMATCH）—— 避免"申请到一份已经变了的镜像"。
+	WantHash string `protobuf:"bytes,1,opt,name=want_hash,json=wantHash,proto3" json:"want_hash,omitempty"`
+	// 申请方愿意接收的字节上限；0 = 用父端配置的上限。父按 min(本字段, 父端上限) 截断。
+	MaxBytes      int64 `protobuf:"varint,2,opt,name=max_bytes,json=maxBytes,proto3" json:"max_bytes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BinaryReq) Reset() {
+	*x = BinaryReq{}
+	mi := &file_node_proto_msgTypes[64]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BinaryReq) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BinaryReq) ProtoMessage() {}
+
+func (x *BinaryReq) ProtoReflect() protoreflect.Message {
+	mi := &file_node_proto_msgTypes[64]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BinaryReq.ProtoReflect.Descriptor instead.
+func (*BinaryReq) Descriptor() ([]byte, []int) {
+	return file_node_proto_rawDescGZIP(), []int{64}
+}
+
+func (x *BinaryReq) GetWantHash() string {
+	if x != nil {
+		return x.WantHash
+	}
+	return ""
+}
+
+func (x *BinaryReq) GetMaxBytes() int64 {
+	if x != nil {
+		return x.MaxBytes
+	}
+	return 0
+}
+
+// 分片帧：一片一个 DownFrame，父端顺序推、子端顺序收（不重排、不重传）。
+// 失败 / 拒绝也走这条帧（payload 为空 + reason 非空），这样子端只维护一个收帧通道。
+type BinaryChunk struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Hash          string                 `protobuf:"bytes,1,opt,name=hash,proto3" json:"hash,omitempty"`       // 整份文件的哈希（每片都带，便于子端尽早发现"父中途换了镜像"）
+	Size          int64                  `protobuf:"varint,2,opt,name=size,proto3" json:"size,omitempty"`      // 整份文件的字节数
+	Index         int32                  `protobuf:"varint,3,opt,name=index,proto3" json:"index,omitempty"`    // 从 0 开始
+	Total         int32                  `protobuf:"varint,4,opt,name=total,proto3" json:"total,omitempty"`    // 总片数
+	Offset        int64                  `protobuf:"varint,5,opt,name=offset,proto3" json:"offset,omitempty"`  // 本片在文件里的偏移
+	Payload       []byte                 `protobuf:"bytes,6,opt,name=payload,proto3" json:"payload,omitempty"` // 明文分片（<= selfupdate.chunk_size，默认 256KB）
+	Crc32         uint32                 `protobuf:"varint,7,opt,name=crc32,proto3" json:"crc32,omitempty"`    // 对 payload 取 crc32（只查传输损坏；完整性由整份 sha256 兜底）
+	Final         bool                   `protobuf:"varint,8,opt,name=final,proto3" json:"final,omitempty"`    // 最后一片（或错误终止片）
+	Reason        string                 `protobuf:"bytes,9,opt,name=reason,proto3" json:"reason,omitempty"`   // 非空 = 出错终止（ERR_BINARY_*），此时 payload 必然为空
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BinaryChunk) Reset() {
+	*x = BinaryChunk{}
+	mi := &file_node_proto_msgTypes[65]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BinaryChunk) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BinaryChunk) ProtoMessage() {}
+
+func (x *BinaryChunk) ProtoReflect() protoreflect.Message {
+	mi := &file_node_proto_msgTypes[65]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BinaryChunk.ProtoReflect.Descriptor instead.
+func (*BinaryChunk) Descriptor() ([]byte, []int) {
+	return file_node_proto_rawDescGZIP(), []int{65}
+}
+
+func (x *BinaryChunk) GetHash() string {
+	if x != nil {
+		return x.Hash
+	}
+	return ""
+}
+
+func (x *BinaryChunk) GetSize() int64 {
+	if x != nil {
+		return x.Size
+	}
+	return 0
+}
+
+func (x *BinaryChunk) GetIndex() int32 {
+	if x != nil {
+		return x.Index
+	}
+	return 0
+}
+
+func (x *BinaryChunk) GetTotal() int32 {
+	if x != nil {
+		return x.Total
+	}
+	return 0
+}
+
+func (x *BinaryChunk) GetOffset() int64 {
+	if x != nil {
+		return x.Offset
+	}
+	return 0
+}
+
+func (x *BinaryChunk) GetPayload() []byte {
+	if x != nil {
+		return x.Payload
+	}
+	return nil
+}
+
+func (x *BinaryChunk) GetCrc32() uint32 {
+	if x != nil {
+		return x.Crc32
+	}
+	return 0
+}
+
+func (x *BinaryChunk) GetFinal() bool {
+	if x != nil {
+		return x.Final
+	}
+	return false
+}
+
+func (x *BinaryChunk) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
 var File_node_proto protoreflect.FileDescriptor
 
 const file_node_proto_rawDesc = "" +
@@ -6520,7 +6774,7 @@ const file_node_proto_rawDesc = "" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x18\n" +
 	"\amissing\x18\x02 \x03(\x05R\amissing\x12\x14\n" +
 	"\x05final\x18\x03 \x01(\bR\x05final\x12\x16\n" +
-	"\x06reason\x18\x04 \x01(\tR\x06reason\"\xc0\x02\n" +
+	"\x06reason\x18\x04 \x01(\tR\x06reason\"\x82\x03\n" +
 	"\x0fRegisterRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x16\n" +
 	"\x06pubkey\x18\x02 \x01(\fR\x06pubkey\x12\x10\n" +
@@ -6535,7 +6789,11 @@ const file_node_proto_rawDesc = "" +
 	"\rproto_version\x18\n" +
 	" \x01(\tR\fprotoVersion\x12\x1f\n" +
 	"\vnode_remark\x18\v \x01(\tR\n" +
-	"nodeRemark\"\x99\x02\n" +
+	"nodeRemark\x12\x1f\n" +
+	"\vbinary_hash\x18\f \x01(\tR\n" +
+	"binaryHash\x12\x1f\n" +
+	"\vbinary_size\x18\r \x01(\x03R\n" +
+	"binarySize\"\xa1\x03\n" +
 	"\vRegisterAck\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x16\n" +
 	"\x06reason\x18\x02 \x01(\tR\x06reason\x12\x12\n" +
@@ -6545,7 +6803,11 @@ const file_node_proto_rawDesc = "" +
 	"\rstart_cmd_seq\x18\x05 \x01(\x03R\vstartCmdSeq\x120\n" +
 	"\x14server_proto_version\x18\x06 \x01(\tR\x12serverProtoVersion\x12!\n" +
 	"\fnode_binding\x18\a \x01(\fR\vnodeBinding\x12\x14\n" +
-	"\x05epoch\x18\b \x01(\x04R\x05epoch\"\x9b\x01\n" +
+	"\x05epoch\x18\b \x01(\x04R\x05epoch\x12,\n" +
+	"\x12server_binary_hash\x18\n" +
+	" \x01(\tR\x10serverBinaryHash\x12,\n" +
+	"\x12server_binary_size\x18\v \x01(\x03R\x10serverBinarySize\x12*\n" +
+	"\x11server_binary_sig\x18\f \x01(\fR\x0fserverBinarySig\"\x9b\x01\n" +
 	"\rResumeRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1d\n" +
 	"\n" +
@@ -6739,7 +7001,7 @@ const file_node_proto_rawDesc = "" +
 	"payloadSig\x12\x14\n" +
 	"\x05final\x18\a \x01(\bR\x05final\x12\x1f\n" +
 	"\vsigner_cert\x18\b \x01(\fR\n" +
-	"signerCert\"\xd1\x06\n" +
+	"signerCert\"\x89\a\n" +
 	"\aUpFrame\x12#\n" +
 	"\rproto_version\x18\x01 \x01(\tR\fprotoVersion\x12\x17\n" +
 	"\amsg_seq\x18\x02 \x01(\x04R\x06msgSeq\x12\x17\n" +
@@ -6761,12 +7023,14 @@ const file_node_proto_rawDesc = "" +
 	"\n" +
 	"query_resp\x18\f \x01(\v2\x15.treecmd.v1.QueryRespH\x00R\tqueryResp\x126\n" +
 	"\n" +
-	"query_data\x18\r \x01(\v2\x15.treecmd.v1.QueryDataH\x00R\tqueryDataB\a\n" +
+	"query_data\x18\r \x01(\v2\x15.treecmd.v1.QueryDataH\x00R\tqueryData\x126\n" +
+	"\n" +
+	"binary_req\x18\x11 \x01(\v2\x15.treecmd.v1.BinaryReqH\x00R\tbinaryReqB\a\n" +
 	"\x05frame\"[\n" +
 	"\n" +
 	"HealthResp\x12\x15\n" +
 	"\x06req_id\x18\x01 \x01(\tR\x05reqId\x126\n" +
-	"\bresponse\x18\x02 \x01(\v2\x1a.treecmd.v1.HealthResponseR\bresponse\"\xc0\x06\n" +
+	"\bresponse\x18\x02 \x01(\v2\x1a.treecmd.v1.HealthResponseR\bresponse\"\xfe\x06\n" +
 	"\tDownFrame\x12#\n" +
 	"\rproto_version\x18\x01 \x01(\tR\fprotoVersion\x12\x17\n" +
 	"\amsg_seq\x18\x02 \x01(\x04R\x06msgSeq\x12<\n" +
@@ -6786,7 +7050,8 @@ const file_node_proto_rawDesc = "" +
 	"configPush\x12?\n" +
 	"\rheartbeat_ack\x18\f \x01(\v2\x18.treecmd.v1.HeartbeatAckH\x00R\fheartbeatAck\x12E\n" +
 	"\x0frevocation_list\x18\r \x01(\v2\x1a.treecmd.v1.RevocationListH\x00R\x0erevocationList\x12F\n" +
-	"\x10cert_renew_offer\x18\x0e \x01(\v2\x1a.treecmd.v1.CertRenewOfferH\x00R\x0ecertRenewOfferB\a\n" +
+	"\x10cert_renew_offer\x18\x0e \x01(\v2\x1a.treecmd.v1.CertRenewOfferH\x00R\x0ecertRenewOffer\x12<\n" +
+	"\fbinary_chunk\x18\x0f \x01(\v2\x17.treecmd.v1.BinaryChunkH\x00R\vbinaryChunkB\a\n" +
 	"\x05frame\"B\n" +
 	"\n" +
 	"ConfigPush\x12\x16\n" +
@@ -6843,7 +7108,20 @@ const file_node_proto_rawDesc = "" +
 	"cert_chain\x18\x03 \x01(\fR\tcertChain\x12\"\n" +
 	"\rca_cert_chain\x18\x04 \x01(\fR\vcaCertChain\x12$\n" +
 	"\x0enot_after_unix\x18\x05 \x01(\x03R\fnotAfterUnix\x12\x1b\n" +
-	"\tissued_by\x18\x06 \x01(\tR\bissuedBy*\xdb\x01\n" +
+	"\tissued_by\x18\x06 \x01(\tR\bissuedBy\"E\n" +
+	"\tBinaryReq\x12\x1b\n" +
+	"\twant_hash\x18\x01 \x01(\tR\bwantHash\x12\x1b\n" +
+	"\tmax_bytes\x18\x02 \x01(\x03R\bmaxBytes\"\xd7\x01\n" +
+	"\vBinaryChunk\x12\x12\n" +
+	"\x04hash\x18\x01 \x01(\tR\x04hash\x12\x12\n" +
+	"\x04size\x18\x02 \x01(\x03R\x04size\x12\x14\n" +
+	"\x05index\x18\x03 \x01(\x05R\x05index\x12\x14\n" +
+	"\x05total\x18\x04 \x01(\x05R\x05total\x12\x16\n" +
+	"\x06offset\x18\x05 \x01(\x03R\x06offset\x12\x18\n" +
+	"\apayload\x18\x06 \x01(\fR\apayload\x12\x14\n" +
+	"\x05crc32\x18\a \x01(\rR\x05crc32\x12\x14\n" +
+	"\x05final\x18\b \x01(\bR\x05final\x12\x16\n" +
+	"\x06reason\x18\t \x01(\tR\x06reason*\xdb\x01\n" +
 	"\x0eLocalExecState\x12\x1b\n" +
 	"\x17LOCAL_STATE_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17LOCAL_STATE_NOT_STARTED\x10\x01\x12\x1c\n" +
@@ -6936,7 +7214,7 @@ func file_node_proto_rawDescGZIP() []byte {
 }
 
 var file_node_proto_enumTypes = make([]protoimpl.EnumInfo, 11)
-var file_node_proto_msgTypes = make([]protoimpl.MessageInfo, 64)
+var file_node_proto_msgTypes = make([]protoimpl.MessageInfo, 66)
 var file_node_proto_goTypes = []any{
 	(LocalExecState)(0),           // 0: treecmd.v1.LocalExecState
 	(CommandStatus)(0),            // 1: treecmd.v1.CommandStatus
@@ -7013,28 +7291,30 @@ var file_node_proto_goTypes = []any{
 	(*EnrollChallengeResp)(nil),   // 72: treecmd.v1.EnrollChallengeResp
 	(*EnrollRequest)(nil),         // 73: treecmd.v1.EnrollRequest
 	(*EnrollResponse)(nil),        // 74: treecmd.v1.EnrollResponse
-	(*timestamppb.Timestamp)(nil), // 75: google.protobuf.Timestamp
+	(*BinaryReq)(nil),             // 75: treecmd.v1.BinaryReq
+	(*BinaryChunk)(nil),           // 76: treecmd.v1.BinaryChunk
+	(*timestamppb.Timestamp)(nil), // 77: google.protobuf.Timestamp
 }
 var file_node_proto_depIdxs = []int32{
 	3,   // 0: treecmd.v1.Target.mode:type_name -> treecmd.v1.TargetMode
 	11,  // 1: treecmd.v1.Command.target:type_name -> treecmd.v1.Target
-	75,  // 2: treecmd.v1.Command.created_at:type_name -> google.protobuf.Timestamp
-	75,  // 3: treecmd.v1.Command.deadline:type_name -> google.protobuf.Timestamp
-	75,  // 4: treecmd.v1.Command.origin_deadline:type_name -> google.protobuf.Timestamp
+	77,  // 2: treecmd.v1.Command.created_at:type_name -> google.protobuf.Timestamp
+	77,  // 3: treecmd.v1.Command.deadline:type_name -> google.protobuf.Timestamp
+	77,  // 4: treecmd.v1.Command.origin_deadline:type_name -> google.protobuf.Timestamp
 	5,   // 5: treecmd.v1.Command.on_failure:type_name -> treecmd.v1.FailurePolicy
 	4,   // 6: treecmd.v1.Command.aggregate:type_name -> treecmd.v1.AggregateStrategy
 	12,  // 7: treecmd.v1.Command.hop_chain:type_name -> treecmd.v1.HopAttest
 	1,   // 8: treecmd.v1.CommandRecord.status:type_name -> treecmd.v1.CommandStatus
-	75,  // 9: treecmd.v1.CommandRecord.updated_at:type_name -> google.protobuf.Timestamp
-	75,  // 10: treecmd.v1.Lease.expire_at:type_name -> google.protobuf.Timestamp
+	77,  // 9: treecmd.v1.CommandRecord.updated_at:type_name -> google.protobuf.Timestamp
+	77,  // 10: treecmd.v1.Lease.expire_at:type_name -> google.protobuf.Timestamp
 	2,   // 11: treecmd.v1.AssignmentRecord.status:type_name -> treecmd.v1.AssignStatus
 	15,  // 12: treecmd.v1.AssignmentRecord.lease:type_name -> treecmd.v1.Lease
-	75,  // 13: treecmd.v1.AssignmentRecord.last_reclaim_at:type_name -> google.protobuf.Timestamp
-	75,  // 14: treecmd.v1.AssignmentRecord.updated_at:type_name -> google.protobuf.Timestamp
-	75,  // 15: treecmd.v1.AssignmentRecord.backoff_until:type_name -> google.protobuf.Timestamp
-	75,  // 16: treecmd.v1.AssignmentRecord.child_deadline:type_name -> google.protobuf.Timestamp
+	77,  // 13: treecmd.v1.AssignmentRecord.last_reclaim_at:type_name -> google.protobuf.Timestamp
+	77,  // 14: treecmd.v1.AssignmentRecord.updated_at:type_name -> google.protobuf.Timestamp
+	77,  // 15: treecmd.v1.AssignmentRecord.backoff_until:type_name -> google.protobuf.Timestamp
+	77,  // 16: treecmd.v1.AssignmentRecord.child_deadline:type_name -> google.protobuf.Timestamp
 	0,   // 17: treecmd.v1.LocalCommandRecord.local_state:type_name -> treecmd.v1.LocalExecState
-	75,  // 18: treecmd.v1.LocalCommandRecord.updated_at:type_name -> google.protobuf.Timestamp
+	77,  // 18: treecmd.v1.LocalCommandRecord.updated_at:type_name -> google.protobuf.Timestamp
 	18,  // 19: treecmd.v1.ChildAttest.descendants:type_name -> treecmd.v1.ChildAttest
 	10,  // 20: treecmd.v1.ResultRef.kind:type_name -> treecmd.v1.ResultRefKind
 	0,   // 21: treecmd.v1.Report.local_state:type_name -> treecmd.v1.LocalExecState
@@ -7043,21 +7323,21 @@ var file_node_proto_depIdxs = []int32{
 	0,   // 24: treecmd.v1.ChildReportRecord.local_state:type_name -> treecmd.v1.LocalExecState
 	19,  // 25: treecmd.v1.ChildReportRecord.result_ref:type_name -> treecmd.v1.ResultRef
 	18,  // 26: treecmd.v1.ChildReportRecord.children:type_name -> treecmd.v1.ChildAttest
-	75,  // 27: treecmd.v1.ChildReportRecord.received_at:type_name -> google.protobuf.Timestamp
+	77,  // 27: treecmd.v1.ChildReportRecord.received_at:type_name -> google.protobuf.Timestamp
 	0,   // 28: treecmd.v1.PendingResultRecord.local_state:type_name -> treecmd.v1.LocalExecState
 	18,  // 29: treecmd.v1.PendingResultRecord.children:type_name -> treecmd.v1.ChildAttest
 	9,   // 30: treecmd.v1.PendingResultRecord.sink:type_name -> treecmd.v1.ResultSink
 	19,  // 31: treecmd.v1.PendingResultRecord.result_ref:type_name -> treecmd.v1.ResultRef
-	75,  // 32: treecmd.v1.PendingResultRecord.received_at:type_name -> google.protobuf.Timestamp
-	75,  // 33: treecmd.v1.PendingResultRecord.next_retry_at:type_name -> google.protobuf.Timestamp
-	75,  // 34: treecmd.v1.ChildWatermark.last_seen_at:type_name -> google.protobuf.Timestamp
-	75,  // 35: treecmd.v1.ChildWatermark.evicted_at:type_name -> google.protobuf.Timestamp
+	77,  // 32: treecmd.v1.PendingResultRecord.received_at:type_name -> google.protobuf.Timestamp
+	77,  // 33: treecmd.v1.PendingResultRecord.next_retry_at:type_name -> google.protobuf.Timestamp
+	77,  // 34: treecmd.v1.ChildWatermark.last_seen_at:type_name -> google.protobuf.Timestamp
+	77,  // 35: treecmd.v1.ChildWatermark.evicted_at:type_name -> google.protobuf.Timestamp
 	1,   // 36: treecmd.v1.ResultRecord.status:type_name -> treecmd.v1.CommandStatus
 	0,   // 37: treecmd.v1.ResultRecord.local_state:type_name -> treecmd.v1.LocalExecState
 	19,  // 38: treecmd.v1.ResultRecord.result_ref:type_name -> treecmd.v1.ResultRef
 	18,  // 39: treecmd.v1.ResultRecord.children:type_name -> treecmd.v1.ChildAttest
-	75,  // 40: treecmd.v1.ResultRecord.created_at:type_name -> google.protobuf.Timestamp
-	75,  // 41: treecmd.v1.ResultRecord.expire_at:type_name -> google.protobuf.Timestamp
+	77,  // 40: treecmd.v1.ResultRecord.created_at:type_name -> google.protobuf.Timestamp
+	77,  // 41: treecmd.v1.ResultRecord.expire_at:type_name -> google.protobuf.Timestamp
 	13,  // 42: treecmd.v1.Delivery.command:type_name -> treecmd.v1.Command
 	25,  // 43: treecmd.v1.FetchResponse.deliveries:type_name -> treecmd.v1.Delivery
 	18,  // 44: treecmd.v1.StreamBegin.children:type_name -> treecmd.v1.ChildAttest
@@ -7068,12 +7348,12 @@ var file_node_proto_depIdxs = []int32{
 	38,  // 49: treecmd.v1.Heartbeat.load:type_name -> treecmd.v1.LoadMetrics
 	40,  // 50: treecmd.v1.HeartbeatAck.terminal:type_name -> treecmd.v1.TerminalNotice
 	1,   // 51: treecmd.v1.TerminalNotice.status:type_name -> treecmd.v1.CommandStatus
-	75,  // 52: treecmd.v1.ResultIndexUp.expire_at:type_name -> google.protobuf.Timestamp
+	77,  // 52: treecmd.v1.ResultIndexUp.expire_at:type_name -> google.protobuf.Timestamp
 	47,  // 53: treecmd.v1.HealthReq.req_auth:type_name -> treecmd.v1.ReqAuth
-	75,  // 54: treecmd.v1.ReqAuth.issued_at:type_name -> google.protobuf.Timestamp
-	75,  // 55: treecmd.v1.ReqAuth.not_after:type_name -> google.protobuf.Timestamp
+	77,  // 54: treecmd.v1.ReqAuth.issued_at:type_name -> google.protobuf.Timestamp
+	77,  // 55: treecmd.v1.ReqAuth.not_after:type_name -> google.protobuf.Timestamp
 	6,   // 56: treecmd.v1.CheckResult.status:type_name -> treecmd.v1.HealthStatus
-	75,  // 57: treecmd.v1.SignerInfo.cert_not_after:type_name -> google.protobuf.Timestamp
+	77,  // 57: treecmd.v1.SignerInfo.cert_not_after:type_name -> google.protobuf.Timestamp
 	6,   // 58: treecmd.v1.ChildHealth.status:type_name -> treecmd.v1.HealthStatus
 	53,  // 59: treecmd.v1.ChildHealth.report:type_name -> treecmd.v1.HealthReport
 	51,  // 60: treecmd.v1.ChildHealth.summary:type_name -> treecmd.v1.SubtreeSummary
@@ -7089,7 +7369,7 @@ var file_node_proto_depIdxs = []int32{
 	8,   // 70: treecmd.v1.CommandTrace.role:type_name -> treecmd.v1.TraceRole
 	0,   // 71: treecmd.v1.CommandTrace.local_state:type_name -> treecmd.v1.LocalExecState
 	15,  // 72: treecmd.v1.CommandTrace.lease:type_name -> treecmd.v1.Lease
-	75,  // 73: treecmd.v1.CommandTrace.deadline:type_name -> google.protobuf.Timestamp
+	77,  // 73: treecmd.v1.CommandTrace.deadline:type_name -> google.protobuf.Timestamp
 	1,   // 74: treecmd.v1.CommandTrace.status:type_name -> treecmd.v1.CommandStatus
 	19,  // 75: treecmd.v1.CommandTrace.self_result:type_name -> treecmd.v1.ResultRef
 	54,  // 76: treecmd.v1.CommandTrace.children:type_name -> treecmd.v1.ChildTrace
@@ -7114,39 +7394,41 @@ var file_node_proto_depIdxs = []int32{
 	58,  // 95: treecmd.v1.UpFrame.query_req:type_name -> treecmd.v1.QueryReq
 	59,  // 96: treecmd.v1.UpFrame.query_resp:type_name -> treecmd.v1.QueryResp
 	60,  // 97: treecmd.v1.UpFrame.query_data:type_name -> treecmd.v1.QueryData
-	57,  // 98: treecmd.v1.HealthResp.response:type_name -> treecmd.v1.HealthResponse
-	34,  // 99: treecmd.v1.DownFrame.register_ack:type_name -> treecmd.v1.RegisterAck
-	41,  // 100: treecmd.v1.DownFrame.command_notify:type_name -> treecmd.v1.CommandNotify
-	42,  // 101: treecmd.v1.DownFrame.command_canceled:type_name -> treecmd.v1.CommandCanceled
-	46,  // 102: treecmd.v1.DownFrame.health_req:type_name -> treecmd.v1.HealthReq
-	58,  // 103: treecmd.v1.DownFrame.query_req:type_name -> treecmd.v1.QueryReq
-	59,  // 104: treecmd.v1.DownFrame.query_resp:type_name -> treecmd.v1.QueryResp
-	60,  // 105: treecmd.v1.DownFrame.query_data:type_name -> treecmd.v1.QueryData
-	40,  // 106: treecmd.v1.DownFrame.terminal:type_name -> treecmd.v1.TerminalNotice
-	64,  // 107: treecmd.v1.DownFrame.config_push:type_name -> treecmd.v1.ConfigPush
-	39,  // 108: treecmd.v1.DownFrame.heartbeat_ack:type_name -> treecmd.v1.HeartbeatAck
-	65,  // 109: treecmd.v1.DownFrame.revocation_list:type_name -> treecmd.v1.RevocationList
-	67,  // 110: treecmd.v1.DownFrame.cert_renew_offer:type_name -> treecmd.v1.CertRenewOffer
-	75,  // 111: treecmd.v1.RevocationList.issued_at:type_name -> google.protobuf.Timestamp
-	75,  // 112: treecmd.v1.EvictedEntry.archived_at:type_name -> google.protobuf.Timestamp
-	75,  // 113: treecmd.v1.EvictedEntry.expire_at:type_name -> google.protobuf.Timestamp
-	61,  // 114: treecmd.v1.NodeService.Connect:input_type -> treecmd.v1.UpFrame
-	26,  // 115: treecmd.v1.NodeService.FetchCommands:input_type -> treecmd.v1.FetchRequest
-	20,  // 116: treecmd.v1.NodeService.ReportResult:input_type -> treecmd.v1.Report
-	31,  // 117: treecmd.v1.NodeService.StreamResult:input_type -> treecmd.v1.StreamFrame
-	71,  // 118: treecmd.v1.NodeService.EnrollChallenge:input_type -> treecmd.v1.EnrollChallengeReq
-	73,  // 119: treecmd.v1.NodeService.Enroll:input_type -> treecmd.v1.EnrollRequest
-	63,  // 120: treecmd.v1.NodeService.Connect:output_type -> treecmd.v1.DownFrame
-	27,  // 121: treecmd.v1.NodeService.FetchCommands:output_type -> treecmd.v1.FetchResponse
-	28,  // 122: treecmd.v1.NodeService.ReportResult:output_type -> treecmd.v1.ReportResponse
-	32,  // 123: treecmd.v1.NodeService.StreamResult:output_type -> treecmd.v1.UploadAck
-	72,  // 124: treecmd.v1.NodeService.EnrollChallenge:output_type -> treecmd.v1.EnrollChallengeResp
-	74,  // 125: treecmd.v1.NodeService.Enroll:output_type -> treecmd.v1.EnrollResponse
-	120, // [120:126] is the sub-list for method output_type
-	114, // [114:120] is the sub-list for method input_type
-	114, // [114:114] is the sub-list for extension type_name
-	114, // [114:114] is the sub-list for extension extendee
-	0,   // [0:114] is the sub-list for field type_name
+	75,  // 98: treecmd.v1.UpFrame.binary_req:type_name -> treecmd.v1.BinaryReq
+	57,  // 99: treecmd.v1.HealthResp.response:type_name -> treecmd.v1.HealthResponse
+	34,  // 100: treecmd.v1.DownFrame.register_ack:type_name -> treecmd.v1.RegisterAck
+	41,  // 101: treecmd.v1.DownFrame.command_notify:type_name -> treecmd.v1.CommandNotify
+	42,  // 102: treecmd.v1.DownFrame.command_canceled:type_name -> treecmd.v1.CommandCanceled
+	46,  // 103: treecmd.v1.DownFrame.health_req:type_name -> treecmd.v1.HealthReq
+	58,  // 104: treecmd.v1.DownFrame.query_req:type_name -> treecmd.v1.QueryReq
+	59,  // 105: treecmd.v1.DownFrame.query_resp:type_name -> treecmd.v1.QueryResp
+	60,  // 106: treecmd.v1.DownFrame.query_data:type_name -> treecmd.v1.QueryData
+	40,  // 107: treecmd.v1.DownFrame.terminal:type_name -> treecmd.v1.TerminalNotice
+	64,  // 108: treecmd.v1.DownFrame.config_push:type_name -> treecmd.v1.ConfigPush
+	39,  // 109: treecmd.v1.DownFrame.heartbeat_ack:type_name -> treecmd.v1.HeartbeatAck
+	65,  // 110: treecmd.v1.DownFrame.revocation_list:type_name -> treecmd.v1.RevocationList
+	67,  // 111: treecmd.v1.DownFrame.cert_renew_offer:type_name -> treecmd.v1.CertRenewOffer
+	76,  // 112: treecmd.v1.DownFrame.binary_chunk:type_name -> treecmd.v1.BinaryChunk
+	77,  // 113: treecmd.v1.RevocationList.issued_at:type_name -> google.protobuf.Timestamp
+	77,  // 114: treecmd.v1.EvictedEntry.archived_at:type_name -> google.protobuf.Timestamp
+	77,  // 115: treecmd.v1.EvictedEntry.expire_at:type_name -> google.protobuf.Timestamp
+	61,  // 116: treecmd.v1.NodeService.Connect:input_type -> treecmd.v1.UpFrame
+	26,  // 117: treecmd.v1.NodeService.FetchCommands:input_type -> treecmd.v1.FetchRequest
+	20,  // 118: treecmd.v1.NodeService.ReportResult:input_type -> treecmd.v1.Report
+	31,  // 119: treecmd.v1.NodeService.StreamResult:input_type -> treecmd.v1.StreamFrame
+	71,  // 120: treecmd.v1.NodeService.EnrollChallenge:input_type -> treecmd.v1.EnrollChallengeReq
+	73,  // 121: treecmd.v1.NodeService.Enroll:input_type -> treecmd.v1.EnrollRequest
+	63,  // 122: treecmd.v1.NodeService.Connect:output_type -> treecmd.v1.DownFrame
+	27,  // 123: treecmd.v1.NodeService.FetchCommands:output_type -> treecmd.v1.FetchResponse
+	28,  // 124: treecmd.v1.NodeService.ReportResult:output_type -> treecmd.v1.ReportResponse
+	32,  // 125: treecmd.v1.NodeService.StreamResult:output_type -> treecmd.v1.UploadAck
+	72,  // 126: treecmd.v1.NodeService.EnrollChallenge:output_type -> treecmd.v1.EnrollChallengeResp
+	74,  // 127: treecmd.v1.NodeService.Enroll:output_type -> treecmd.v1.EnrollResponse
+	122, // [122:128] is the sub-list for method output_type
+	116, // [116:122] is the sub-list for method input_type
+	116, // [116:116] is the sub-list for extension type_name
+	116, // [116:116] is the sub-list for extension extendee
+	0,   // [0:116] is the sub-list for field type_name
 }
 
 func init() { file_node_proto_init() }
@@ -7175,6 +7457,7 @@ func file_node_proto_init() {
 		(*UpFrame_QueryReq)(nil),
 		(*UpFrame_QueryResp)(nil),
 		(*UpFrame_QueryData)(nil),
+		(*UpFrame_BinaryReq)(nil),
 	}
 	file_node_proto_msgTypes[52].OneofWrappers = []any{
 		(*DownFrame_RegisterAck)(nil),
@@ -7189,6 +7472,7 @@ func file_node_proto_init() {
 		(*DownFrame_HeartbeatAck)(nil),
 		(*DownFrame_RevocationList)(nil),
 		(*DownFrame_CertRenewOffer)(nil),
+		(*DownFrame_BinaryChunk)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -7196,7 +7480,7 @@ func file_node_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_node_proto_rawDesc), len(file_node_proto_rawDesc)),
 			NumEnums:      11,
-			NumMessages:   64,
+			NumMessages:   66,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

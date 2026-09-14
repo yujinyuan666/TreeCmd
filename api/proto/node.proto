@@ -380,6 +380,11 @@ message RegisterRequest {
   string node_name = 9;
   string proto_version = 10;
   string node_remark = 11;
+  // 本节点**可执行文件**的哈希（"sha256:" + 十六进制）与字节数，随每次注册 / 重注册上行。
+  // 空串 = 本节点算不出自己的哈希（读不到可执行文件），此时父端不做任何判定。
+  // 父端只用它做展示（/v1/tree 里能看见"每个子跑的是哪份镜像"），不参与任何签名。
+  string binary_hash = 12;
+  int64 binary_size = 13;
 }
 
 message RegisterAck {
@@ -394,6 +399,15 @@ message RegisterAck {
   string server_proto_version = 6;
   bytes node_binding = 7;         // 根仲裁结果（本实现为父代签发；见 README 差异说明）
   uint64 epoch = 8;
+  // 父（服务端）自己那份**可执行文件**的哈希 / 字节数 / 签名：子节点连上后的第一件事
+  // 就是拿它跟自己的比 —— 不一致就向父拉取可执行文件、校验后原地重启（见 README
+  // 「可执行文件一致性」）。空串 = 父没有这个能力（旧版本）或算不出自己的哈希，
+  // 此时子端只记一条指标，不做任何动作。
+  //   server_binary_sig = 父身份私钥对 (父 NodeID || hash || size) 的 canonical 摘要签名，
+  //   子端用父的证书公钥（mTLS 握手时已拿到）离线验签。
+  string server_binary_hash = 10;
+  int64 server_binary_size = 11;
+  bytes server_binary_sig = 12;
 }
 
 message ResumeRequest {
@@ -642,6 +656,7 @@ message UpFrame {
     QueryReq query_req = 11;   // 上行段
     QueryResp query_resp = 12; // 回程段
     QueryData query_data = 13; // 回程段
+    BinaryReq binary_req = 17; // 申请父下发它的可执行文件（子连上后发现自己与父不一致时）
   }
 }
 
@@ -666,6 +681,7 @@ message DownFrame {
     HeartbeatAck heartbeat_ack = 12;
     RevocationList revocation_list = 13;
     CertRenewOffer cert_renew_offer = 14;
+    BinaryChunk binary_chunk = 15; // 父推送自己那份可执行文件的分片（响应 BinaryReq）
   }
 }
 
@@ -749,6 +765,35 @@ message EnrollResponse {
   bytes ca_cert_chain = 4;    // CA 证书链（仅当请求带了 ca_pubkey 才返回，PEM 串接）
   int64 not_after_unix = 5;
   string issued_by = 6;       // 签发者（父）NodeID
+}
+
+// ============================================================================
+// 可执行文件一致性：自同步更新（父下发自己那份镜像）
+// ============================================================================
+// 复用已建立的 Connect 双向流，不新增 RPC：子是**唯一发起方**（先发 BinaryReq），
+// 父只在收到请求后才会推分片（DownFrame.binary_chunk），推完最后一片即结束。
+// 方向是单向的：父永远是标准答案 —— 子向父对齐，所以升级顺序天然自上而下
+// （根先换、逐层收敛）；反过来"把根换回旧版"就等于整棵树回滚。
+message BinaryReq {
+  // 申请方期望的哈希（就是 RegisterAck.server_binary_hash 里给的那个）。
+  // 父端逐字节比对，不等即拒（ERR_BINARY_HASH_MISMATCH）—— 避免"申请到一份已经变了的镜像"。
+  string want_hash = 1;
+  // 申请方愿意接收的字节上限；0 = 用父端配置的上限。父按 min(本字段, 父端上限) 截断。
+  int64 max_bytes = 2;
+}
+
+// 分片帧：一片一个 DownFrame，父端顺序推、子端顺序收（不重排、不重传）。
+// 失败 / 拒绝也走这条帧（payload 为空 + reason 非空），这样子端只维护一个收帧通道。
+message BinaryChunk {
+  string hash = 1;   // 整份文件的哈希（每片都带，便于子端尽早发现"父中途换了镜像"）
+  int64 size = 2;    // 整份文件的字节数
+  int32 index = 3;   // 从 0 开始
+  int32 total = 4;   // 总片数
+  int64 offset = 5;  // 本片在文件里的偏移
+  bytes payload = 6; // 明文分片（<= selfupdate.chunk_size，默认 256KB）
+  uint32 crc32 = 7;  // 对 payload 取 crc32（只查传输损坏；完整性由整份 sha256 兜底）
+  bool final = 8;    // 最后一片（或错误终止片）
+  string reason = 9; // 非空 = 出错终止（ERR_BINARY_*），此时 payload 必然为空
 }
 
 // ============================================================================
