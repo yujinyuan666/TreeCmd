@@ -35,6 +35,7 @@ func (n *Node) StartAPI() error {
 	mux.HandleFunc("/v1/health/summary", n.handleHealth)
 	mux.HandleFunc("/v1/tree", n.handleTree)
 	mux.HandleFunc("/v1/crl", n.handleCRL)
+	mux.HandleFunc("/v1/forget", n.handleForget)
 	// /metrics：以 Prometheus 文本格式（text/plain; version=0.0.4）导出本节点指标。
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
@@ -267,6 +268,117 @@ func (n *Node) handleCRL(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeErr(w, 405, "ERR_METHOD_NOT_ALLOWED", "use GET or POST")
 	}
+}
+
+// handleForget 处理 /v1/forget：清理本节点名下失效的直接子节点（见 docs/失效节点清理与版本一致性设计.md）。
+//
+// 接收者 n 是本节点实例。三个动作：
+//
+//	GET  /v1/forget?node=<guid>[&mode=garbage|stale][&force=1]
+//	     —— 只读预览：会不会被允许、会被删掉哪些条目（不改任何数据）
+//	POST /v1/forget?node=<guid>[&mode=...][&force=1][&purge=1]
+//	     —— 真正清理这个 NodeID
+//	POST /v1/forget?all=1[&mode=...][&force=1]
+//	     —— 批量：对本节点名下所有子节点逐个尝试，逐条返回结果
+//
+// 参数：
+//
+//	w — HTTP 响应写入器
+//	r — 请求；除 GET/POST 外返回 405
+//
+// 被拒绝时（在线 / 太新 / 不在 garbage 范围 / 查无此人）返回非 2xx，且响应体里带着完整的
+// plan（含 reason 与 hint：下一步该加哪个参数），便于脚本按 reason 分支处理。
+func (n *Node) handleForget(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	opts := ForgetOptions{
+		NodeID: q.Get("node"),
+		Mode:   q.Get("mode"),
+		Force:  isTrue(q.Get("force")),
+		Purge:  isTrue(q.Get("purge")),
+	}
+	switch r.Method {
+	case http.MethodGet:
+		plan, err := n.ForgetPreview(opts)
+		if err != nil {
+			writeErr(w, statusForForget(err), errCodeOf(err), err.Error())
+			return
+		}
+		n.Metrics.Inc("forget_total", "result", "dry_run")
+		writeJSON(w, 200, plan)
+	case http.MethodPost:
+		if isTrue(q.Get("all")) {
+			plans, ok := n.ForgetAll(opts)
+			writeJSON(w, 200, map[string]any{
+				"candidates": len(plans), "forgotten": ok, "results": plans,
+			})
+			return
+		}
+		if opts.NodeID == "" {
+			writeErr(w, 400, "ERR_BAD_REQUEST", "missing ?node=<guid>（批量请用 ?all=1）")
+			return
+		}
+		plan, err := n.Forget(opts)
+		if err != nil {
+			// 判定不允许：把完整 plan 一起回给调用方（reason 决定 HTTP 状态码）。
+			writeJSON(w, statusForForget(err), map[string]any{
+				"error": errCodeOf(err), "message": err.Error(), "plan": plan,
+			})
+			return
+		}
+		writeJSON(w, 200, plan)
+	default:
+		writeErr(w, 405, "ERR_METHOD_NOT_ALLOWED", "use GET (preview) or POST (apply)")
+	}
+}
+
+// isTrue 识别查询参数里的"打开"取值（1/true）。
+//
+// 参数：
+//
+//	s — 查询参数原文
+//
+// 返回：s 为 "1" 或 "true" 时为 true，其余（含空串）为 false。
+func isTrue(s string) bool { return s == "1" || s == "true" }
+
+// errCodeOf 从错误文本里取出机器可读的错误码（前缀到第一个冒号为止）。
+//
+// 参数：
+//
+//	err — 形如 "ERR_CHILD_ONLINE: ..." 的错误
+//
+// 返回：错误码；取不到时返回 "ERR_INTERNAL"。
+func errCodeOf(err error) string {
+	s := err.Error()
+	if i := strings.IndexAny(s, ":， "); i > 0 {
+		return s[:i]
+	}
+	if s != "" {
+		return s
+	}
+	return "ERR_INTERNAL"
+}
+
+// statusForForget 把清理失败的判定原因映射成 HTTP 状态码。
+//
+// 参数：
+//
+//	err — Forget / planForget 返回的错误
+//
+// 返回：409（在线冲突 / 需要 mode=stale）、412（沉默时长不够，需 force）、404（查无此人）、
+// 500（存储写入失败），以及无法识别时的默认值 400。
+func statusForForget(err error) int {
+	s := err.Error()
+	switch {
+	case strings.Contains(s, forgetErrOnline), strings.Contains(s, forgetErrNeedsStale):
+		return 409
+	case strings.Contains(s, forgetErrTooRecent):
+		return 412
+	case strings.Contains(s, forgetErrNotFound):
+		return 404
+	case strings.Contains(s, "ERR_STORE"):
+		return 500
+	}
+	return 400
 }
 
 // handleTree 处理 GET /v1/tree：返回本节点视角的整棵树快照（JSON）。

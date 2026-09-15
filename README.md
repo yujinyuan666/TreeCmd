@@ -190,14 +190,80 @@ POST /v1/commands/{id}/cancel         取消
 POST /v1/commands/{id}/retry?node=X   子节点重跑（RetryNode）
 GET  /v1/health[?command_id=&depth=&detail=&timeout=]   健康度 / 指令轨迹 双模式
 GET  /v1/tree                         本节点视角的拓扑
+GET  /v1/crl                          查看本节点的吊销列表
+POST /v1/crl?node=X                   吊销某节点（写本地 CRL、版本 +1、下发给直接子）
+GET  /v1/forget?node=X                清理预览：某子节点会不会被允许清理、会被删掉什么（只读）
+POST /v1/forget?node=X                清理失效的直接子节点（见下节）
 GET  /v1/healthz
+GET  /metrics                         Prometheus 文本
 ```
 
 ```bash
 curl -s -XPOST localhost:18443/v1/commands -d '{"type":"echo","payload":"aGVsbG8=","aggregate":"TREE"}'
+# 手写的对外 API 调用（internal/exec/apis）：整棵子树各调一次上游，结果按 TREE 保层级聚合
+curl -s -XPOST localhost:18443/v1/commands -d '{"type":"uuid_v4","aggregate":"TREE"}'
+curl -s -XPOST localhost:18443/v1/commands -d '{"type":"remote_time","aggregate":"TREE"}'   # 各节点对时
 curl -s "localhost:18443/v1/health?depth=-1&timeout=20s"
 curl -s "localhost:18443/v1/health?command_id=<ID>&depth=2&detail=true"
 ```
+
+### 失效节点清理：`/v1/forget`
+
+误启动的实例、注册被拒但调过一元 RPC 的节点，会在父端留下**再也回不来的记录** ——
+它们永远出现在 `/v1/tree`、把健康检查的 `known` 撑大、让节点长期显示 DEGRADED。
+根因是"只增不减"：子节点掉线与被驱逐都**不删**内存注册表与 `state.dat.known_children`
+（后者每 30s 由注册表全量重建，重启时又被预热回注册表，形成闭环）。
+
+`/v1/forget` 就是这条回收通道，全部动作都在本节点的**一条 bbolt 写事务**里完成：
+
+| 能力 | 说明 |
+|------|------|
+| **按 UUID 清理** | `POST /v1/forget?node=<UUIDv7>`；不带额外参数时走**最保守**的默认模式 |
+| **先预览再动手** | `GET` 是只读预演：会不会被允许、会被删掉哪些条目（含计数），**不改任何数据** |
+| **在线的一律不删** | 正在滚动重启的子节点会被 `hub.conn` 命中 → 拒绝；`force` 也**不能**越过这条护栏 |
+| **默认只清孤立残留** | `mode=garbage`（默认）只清"从未进入过注册表"的垃圾；清"曾连上过的直接子"必须显式 `mode=stale` |
+| **`force=1` 是二次确认** | 越过"沉默时长"与"模式范围"两条判定，只保留在线护栏 |
+| **纯删除，不写半截** | 一次事务内删 `assignments`(+反向索引) / `child_watermark` / `evicted_children`；失败整体回滚 |
+| **默认保留结果副本** | `child_reports`（父端权威结果）默认**保留**（那可能是某条指令唯一一份已完成结果）；`purge=1` 才删 |
+| **顺手解开 cmdlog** | 删掉死子的未终态 assignment 后，`MinUnfinishedSeq` 才能推进 —— 否则一个死子会**永久钉住整棵树的 cmdlog 水位** |
+| **内存与快照一起收敛** | 事务成功后才 `Reg.Remove` 并立即 `saveState()`，否则 30s 后周期落盘会把 `known_children` 写回来 |
+| **可批量** | `POST /v1/forget?all=1` 对本节点名下所有直接子逐个尝试，逐条返回结果 |
+| **可审计** | 日志 `AUDIT-FORGET`（childID / mode / force / 各桶删除条数 / 保留报告数）；指标 `forget_total{result}` |
+
+```yaml
+# 两个阈值决定"要多沉默才算失效"（都是误删防护，可不配）
+forget:
+  grace: 1h            # 孤立残留的沉默阈值（防"正在重试注册、马上会成功"的节点被误清）
+  dead_threshold: 24h  # 长期离线真子的判定线（与 command.eviction_timeout 同值）
+```
+
+```bash
+ROOT=localhost:18443           # 该子节点的**直接父**的 API 地址
+
+# 1) 先预览：它会告诉你为什么允许/拒绝，以及下一步该加什么参数
+curl -s "$ROOT/v1/forget?node=<UUIDv7>"
+
+# 2) 最保守的清理（只对"从未进过注册表"的孤立残留生效）
+curl -s -XPOST "$ROOT/v1/forget?node=<UUIDv7>"
+
+# 3) 曾连上过的失效节点：显式声明它是长期离线的
+curl -s -XPOST "$ROOT/v1/forget?node=<UUIDv7>&mode=stale"
+# 4) 确认无误、要立刻删（越过沉默时长判定）
+curl -s -XPOST "$ROOT/v1/forget?node=<UUIDv7>&force=1"
+# 5) 连它名下的结果副本一起清
+curl -s -XPOST "$ROOT/v1/forget?node=<UUIDv7>&force=1&purge=1"
+# 6) 批量：本节点名下所有"可清"的子节点
+curl -s -XPOST "$ROOT/v1/forget?all=1&mode=garbage"
+```
+
+拒绝时返回非 2xx，响应体里 `reason` 是机器可读的原因、`hint` 直接告诉你该加什么参数：
+`409 ERR_CHILD_ONLINE`（在线）/ `409 ERR_NEEDS_STALE`（在注册表里，需 `mode=stale`）/
+`412 ERR_TOO_RECENT`（沉默不够，需 `force=1`）/ `404 ERR_CHILD_NOT_FOUND`（查无此人）。
+
+> **为什么 CLI 不直连数据库**：运行中的节点独占 `state.db`（`store.Open` 锁超时 5s），
+> 离线进程根本打不开库，所以清理必须走 HTTP 在进程内完成。
+> **为什么不做"掉线即自动删"**：会误伤滚动重启中的正常子节点，也丢掉了运维信息 —— 改为显式命令 + 预览。
+> 设计取舍见 `docs/失效节点清理与版本一致性设计.md`（ADR-052）。
 
 ## 目录结构
 
@@ -216,12 +282,14 @@ internal/store/             bbolt：meta / commands / cmdlog / assignments / ass
 internal/registry/          直接子节点表、路径前缀路由、祖先链与环检测（不做 Target 筛选）
 internal/aggregate/         TREE / MERGE / SUM / COUNT / CUSTOM + OnFailure 精确判定公式
 internal/exec/              Executor 接口（含 OnRestart）+ noop / echo / sleep / fail + 安全空执行器
+  apis/                     手写的对外 API 调用：**一个 API 一个函数**（uuid_v4 …）+ Register(reg) 登记进执行器表
 internal/node/              组装：handle / waitChildren / terminal / 租约 / 取消 / 健康 / 查询 / HTTP API
   enroll.go                 运行期入网签发：服务端（许可+白名单+PoP 校验→用 CA 私钥签公钥）+ 客户端（换取并落盘）
   reload.go                 证书热重载：stat 优先的两级变更判定 + SIGUSR1 + fail-safe + 生效策略
   build.go                  可执行文件一致性：启动算哈希 / 连上即比对 / 拉取校验 / 原地 exec 重启
   auth.go                   ReqAuth 跨跳委托凭证：入口签一次、逐跳原样透传、每跳离线验链 + 按自己白名单校验
   crl.go                    吊销列表：版本单调递增、身份密钥签名、逐跳转发、重连 CRLReq 全量对齐
+  forget.go                 失效节点清理（/v1/forget）：判定口径 + 在线护栏 + 一条事务清四个桶 + 批量
   lifecycle.go              证书续签 / 配置热更 / Reconcile 对账 / 驱逐归档 / 索引待重发队列
 internal/observability/     Prometheus 文本指标（零依赖）+ /metrics
 cmd/node/                   单节点入口（一个节点一个进程）
@@ -235,6 +303,7 @@ test/                       可视化测试台：本地网页 + 反向代理 + �
   serve.py                  本地静态服务 + /api 反向代理（默认只转发本机，零依赖）
   demo.sh                   一键起"根 + 直接叶子 + 中继 + 中继下的叶子"（3 层）+ 起控制台
   selfupdate.sh             可执行文件自同步的端到端验证（起树 / 换版本 / 断言原地重启）
+  forget.sh                 失效节点清理的端到端验证（起树 / 在线拒绝 / 掉线后清理 / 重启断言不回灌）
 docs/                       手动部署指南、差异处理方案、项目功能完整介绍、代码注释规范
 ```
 

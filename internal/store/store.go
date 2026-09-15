@@ -474,6 +474,32 @@ func (t *Tx) DeleteAssignmentsOfCommand(cmdID string) error {
 	return nil
 }
 
+// DeleteAssignmentsOfChild 删除某个子节点名下的全部 Assignment，反向索引一并删除。
+//
+// 走的是 assign_child 反向索引（键为 "childID/commandID"），所以"这个子名下有哪些指令"
+// 可以直接前缀扫出来，不必全表遍历 assignments 桶。
+//
+// 先取出 commandID 列表再逐条删，避免边遍历游标边修改桶。
+//
+// 参数：
+//
+//	childID — 子节点 ID
+//
+// 返回：
+//
+//	error — 任意一次删除失败时返回，后续条目不再删除
+func (t *Tx) DeleteAssignmentsOfChild(childID string) error {
+	for _, cmdID := range t.CommandIDsOfChild(childID) {
+		if err := t.tx.Bucket(bAssign).Delete(k(cmdID, childID)); err != nil {
+			return err
+		}
+		if err := t.tx.Bucket(bAssignIdx).Delete(k(childID, cmdID)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ScanAssignments 返回 assignments 桶的全量快照。
 //
 // 调用方拿到的是一份拷贝，迭代之后可以另行写入，避免边遍历边改桶。
@@ -593,6 +619,50 @@ func (t *Tx) DeleteChildReportsOfCommand(cmdID string) error {
 	}
 	for _, kk := range keys {
 		if err := t.tx.Bucket(bChildRep).Delete(kk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ChildReportIDsOfChild 返回某个子节点名下的全部 commandID（清理失效子节点用）。
+//
+// 注意键方向：child_reports 的键是 "commandID/childID"（与 assignments 同向），
+// **不能**按子节点前缀连续扫 —— 这里只能全表遍历、按记录里的 ChildId 字段过滤。
+// 所以它只用于"清理失效子节点"这类低频运维动作；正常路径请走按指令的
+// DeleteChildReportsOfCommand。
+//
+// 参数：
+//
+//	childID — 子节点 ID
+//
+// 返回：
+//
+//	[]string — 命中的 commandID；反序列化失败的条目会被跳过
+func (t *Tx) ChildReportIDsOfChild(childID string) []string {
+	var out []string
+	_ = t.tx.Bucket(bChildRep).ForEach(func(_, v []byte) error {
+		r := &pb.ChildReportRecord{}
+		if err := proto.Unmarshal(v, r); err == nil && r.ChildId == childID {
+			out = append(out, r.CommandId)
+		}
+		return nil
+	})
+	return out
+}
+
+// DeleteChildReportsOfChild 删除某个子节点名下的全部子报告。
+//
+// 参数：
+//
+//	childID — 子节点 ID
+//
+// 返回：
+//
+//	error — 任意一次删除失败时返回
+func (t *Tx) DeleteChildReportsOfChild(childID string) error {
+	for _, cmdID := range t.ChildReportIDsOfChild(childID) {
+		if err := t.tx.Bucket(bChildRep).Delete(k(cmdID, childID)); err != nil {
 			return err
 		}
 	}
@@ -990,6 +1060,45 @@ func (t *Tx) GetEvicted(childID, cmdID string) (*pb.EvictedEntry, bool) {
 //	error — 删除失败时返回
 func (t *Tx) DeleteEvicted(childID, cmdID string) error {
 	return t.tx.Bucket(bEvicted).Delete(k(childID, cmdID))
+}
+
+// EvictedCommandIDsOfChild 返回某个子节点名下的全部归档 commandID（清理失效子节点用）。
+//
+// evicted_children 的键是 "childID/commandID"，可以按前缀连续扫。
+//
+// 参数：
+//
+//	childID — 子节点 ID
+//
+// 返回：
+//
+//	[]string — 命中的 commandID（按键序）
+func (t *Tx) EvictedCommandIDsOfChild(childID string) []string {
+	var out []string
+	c := t.tx.Bucket(bEvicted).Cursor()
+	prefix := []byte(childID + "/")
+	for kk, _ := c.Seek(prefix); kk != nil && hasPrefix(kk, prefix); kk, _ = c.Next() {
+		out = append(out, string(kk[len(prefix):]))
+	}
+	return out
+}
+
+// DeleteEvictedOfChild 清除某个子节点名下的全部归档条目。
+//
+// 参数：
+//
+//	childID — 子节点 ID
+//
+// 返回：
+//
+//	error — 任意一次删除失败时返回
+func (t *Tx) DeleteEvictedOfChild(childID string) error {
+	for _, cmdID := range t.EvictedCommandIDsOfChild(childID) {
+		if err := t.tx.Bucket(bEvicted).Delete(k(childID, cmdID)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ScanEvicted 遍历归档，返回全部条目。

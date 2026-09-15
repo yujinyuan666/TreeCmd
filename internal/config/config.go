@@ -319,6 +319,47 @@ type SelfUpdateSection struct {
 	Dir string `yaml:"dir"`
 }
 
+// ForgetSection 失效节点清理参数（`/v1/forget`，见 docs/失效节点清理与版本一致性设计.md）。
+//
+// 背景：误启动的实例、注册失败但调过一元 RPC 的节点，会在父端留下再也回不来的记录
+// （内存注册表 + state.dat.known_children + bbolt 的若干桶），需要一个显式命令把它们清掉。
+// 这两个阈值决定"要多沉默才算失效"，是**误删防护**：正在滚动重启的子节点不该被清掉。
+type ForgetSection struct {
+	// Grace 孤立残留（从未进过注册表的垃圾）的最小沉默时长，默认 1h。
+	// 防的是"刚重试注册、马上就会成功"的节点被误清。
+	Grace time.Duration `yaml:"grace"`
+	// DeadThreshold 长期离线真子的判定线，默认 24h（与 command.eviction_timeout 同值）。
+	DeadThreshold time.Duration `yaml:"dead_threshold"`
+}
+
+// GraceDuration 返回归一化后的孤立残留沉默阈值。
+//
+// 接收者 s 是 forget 段的配置。
+//
+// 返回：
+//
+//	time.Duration — 未配置或非正数时取 1h
+func (s *ForgetSection) GraceDuration() time.Duration {
+	if s.Grace <= 0 {
+		return time.Hour
+	}
+	return s.Grace
+}
+
+// DeadThresholdDuration 返回归一化后的"长期离线"阈值。
+//
+// 接收者 s 是 forget 段的配置。
+//
+// 返回：
+//
+//	time.Duration — 未配置或非正数时取 24h（与驱逐超时同值）
+func (s *ForgetSection) DeadThresholdDuration() time.Duration {
+	if s.DeadThreshold <= 0 {
+		return 24 * time.Hour
+	}
+	return s.DeadThreshold
+}
+
 // SelfUpdateEnabled 报告可执行文件一致性检查是否开启（没配就当开启）。
 //
 // 接收者 s 是 selfupdate 段的配置。
@@ -477,6 +518,7 @@ type Config struct {
 	Query        QuerySection        `yaml:"query"`
 	Registration RegistrationSection `yaml:"registration"`
 	SelfUpdate   SelfUpdateSection   `yaml:"selfupdate"`
+	Forget       ForgetSection       `yaml:"forget"`
 	Persist      PersistSection      `yaml:"persist"`
 	API          APISection          `yaml:"api"`
 	DataDir      string              `yaml:"data_dir"`
