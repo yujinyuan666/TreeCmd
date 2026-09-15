@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"treecmd/internal/exec"
+	"treecmd/internal/exec/apis"
 )
 
 // Logger 在 slog.Logger 之上补 Errorf/Warnf 等格式化方法（便于把方案里的注释直接落成日志）。
@@ -76,3 +79,18 @@ func minDuration(a, b time.Duration) time.Duration {
 
 // itoa 把 int 转成十进制字符串。
 func itoa(i int) string { return fmt.Sprintf("%d", i) }
+
+// newExecRegistry 装配执行器注册表：项目内置的 noop / echo / sleep / fail，
+// 再加上手写在 internal/exec/apis 里的对外 API 调用（uuid_v4 等）。
+//
+// 单独抽成一个函数是为了让"本节点能做哪些类型的指令"只有**一处**答案 ——
+// SubmitCommand 的能力闸门看的是它，以后要给父端上报能力也是从这里取。
+//
+// 返回：
+//
+//	*exec.Registry — 可直接赋给 Node.Exec 的注册表
+func newExecRegistry() *exec.Registry {
+	reg := exec.NewRegistry()
+	apis.Register(reg)
+	return reg
+}

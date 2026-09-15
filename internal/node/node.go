@@ -157,7 +157,7 @@ func NewWithPath(cfg *config.Config, cfgPath string, logger *slog.Logger) (*Node
 		cfgPath: cfgPath,
 		Log:     &Logger{logger.With("node", shortID(cfg.Node.ID))},
 		Reg:     registry.New(cfg.Node.ID, "/"),
-		Exec:    exec.NewRegistry(), events: map[string]chan struct{}{},
+		Exec:    newExecRegistry(), events: map[string]chan struct{}{},
 		resending: map[string]bool{}, stopCh: make(chan struct{}), fetchNotify: make(chan struct{}, 1),
 		certSignal: make(chan string, 4), challenges: map[string]enrollChallenge{},
 		queryCh:   map[string]chan *pb.QueryResp{},
