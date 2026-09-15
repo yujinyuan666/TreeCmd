@@ -422,7 +422,7 @@ go build ./...        # 生成后一定要编译一遍
 | **`QueryData` 分片回传** | >256KB 的查询结果：先回元数据 `QueryResp{has_data}`，再沿同一回程发 `QueryData` 分片（逐片 gzip + crc32 + 持有者身份签名、**首片带证书链供入口离线验链**）；入口收齐拼装；超 `query_response_max_bytes` 降级为引用；校验失败回"校验失败"而不是 `NOT_FOUND` |
 | **`ReqAuth` 跨跳委托** | 入口签一份短时委托（ViewerID / EntryCert / EntrySig / NotAfter / Kind / **ParamsHash 只绑定跨跳不变的 command_id+detail+Kind**）；每跳用预置根证书**离线**验链验签，再按**自己的** `health_viewers`（默认"直接父 + root"）/`query_viewers`（默认放行）决定是否服务/转发；拒绝落审计日志 |
 | **CUSTOM 聚合器注册** | `aggregate.RegisterCustom/LookupCustom`；`aggregate=CUSTOM` 必须给 `aggregate_name`（随指令逐跳透传），未注册 → `ERR_UNKNOWN_CUSTOM_AGGREGATOR`；声明 `NeedsSelfResult()` 而未开 `raw_children` → 提交期即拒；内置 `subtree_count` / `audit_raw` 两个示例 |
-| **`/metrics`** | 手写 Prometheus 文本（零依赖）：`node_up`、`children_count/known`、`command_inflight/pending_total`、`partial_total`、`pending_result_backlog`、`retention_floor`、`result_index_entries`、`clock_offset_ms`、`command_terminal_total{status}`、`fail_rate_1h`、`result_stored_total`、`lease_reclaim_total`、`untrusted_origin_rejected_total` … |
+| **`/metrics`** | 手写 Prometheus 文本（零依赖）：`node_up`、`children_count/known`、`command_inflight/pending_total`、`partial_total`、`pending_result_backlog`、`retention_floor`、`result_index_entries`、`clock_offset_ms`、`command_terminal_total{status}`、`fail_rate_1h`、`result_stored_total`、`untrusted_origin_rejected_total`、`selfupdate_total{result}`、`selfupdate_lagging_children`、`binary_info{hash}`、`forget_total{result}` … |
 | **祖先 NodeID 链** | `RegisterAck.ancestor_ids`：环检测与 `health_viewers` 默认白名单（"直接父 + **root**"）都要按 ID 判定 —— 根的路径是 `"/"`，从路径里取不出它的 NodeID |
 | **健康扫描可取消** | 健康/轨迹递归跟随 HTTP 请求的 `ctx`：调用方放弃即停止扇出与等待，避免"被丢弃的扫描"在后台堆积 |
 
