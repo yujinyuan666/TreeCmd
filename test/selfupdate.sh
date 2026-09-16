@@ -162,6 +162,10 @@ cmd_all() {
   : > "${PIDFILE}"
   "${HERE}/demo.sh" stop >/dev/null 2>&1 || true   # 端口先让出来
   rm -f "${DEMO}/.demo.pids" 2>/dev/null || true
+  # 根的片存（<可执行文件所在目录>/pieces/<完整 NodeID>/）也要清：不清的话根的镜像清单会被
+  # 上一轮留下的 manifest 命中，于是"已为本节点镜像生成片清单"那行不再出现 —— 断言会假失败，
+  # 而真正想验的"清单是怎么来的"也看不到了（踩过）。
+  rm -rf "${REPO}/bin/pieces" 2>/dev/null || true
   # 日志必须清空：脚本靠"日志里最后一行的哈希 / 有没有申请镜像"做断言，
   # 上一轮的遗留行会把断言骗过去（踩过：取到了上一轮中继的 NodeID）。
   for f in root leaf1 relay leaf2 leaf-ok leaf-ro; do : > "${LOGS}/${f}.log"; done
@@ -189,13 +193,32 @@ cmd_all() {
   for n in leaf1 relay; do
     local log="${LOGS}/${n}.log"
     grep -q '已向父申请它的可执行文件' "${log}" || die "${n} 没有向父申请镜像"
-    grep -q '父的可执行文件已收齐并校验通过'  "${log}" || die "${n} 没有看到校验通过"
+    # 两种收齐方式都要认：拿到清单 → 从片存拼装；老流程 → 直接边收边写暂存文件
+    grep -Eq '父的可执行文件已收齐并校验通过|已从片存拼装出完整镜像并校验通过' "${log}" \
+      || die "${n} 没有看到校验通过"
     grep -q '准备原地重启'             "${log}" || die "${n} 没有走原地重启"
     local disk; disk="$(short_hash "${bindir}/${n}")"
     [ "${disk}" = "${h2}" ] \
       && ok "${n}：申请 → 校验通过 → 原地重启，磁盘上那份文件现在是 v2（${disk}）" \
       || die "${n} 磁盘上的文件不是 v2（${disk}）"
   done
+
+  step "③b 断言分片清单 + 片级 sha256（§4：片能对外转发的前提）"
+  # 父要为"自己那份镜像"生成清单才能给；两条都要看得到
+  grep -q '已为本节点镜像生成片清单' "${LOGS}/root.log" || die "根没有生成镜像片清单"
+  grep -q '已下发镜像清单' "${LOGS}/root.log" || die "根没有下发过镜像片清单"
+  ok "根：为自己的镜像生成了片清单并下发（片级 sha256 的来源）"
+  for n in leaf1 relay; do
+    grep -q '已拿到镜像清单（片级 sha256）' "${LOGS}/${n}.log" \
+      || die "${n} 没有拿到片清单（会退化成只靠 crc32 的旧流程）"
+  done
+  ok "leaf1 / relay：都拿到了片清单 → 每片过 sha256（crc32 只当传输预检）"
+  # 片存必须**按节点隔离**：目录名是完整 NodeID（UUIDv7 的前缀是时间戳，同批启动的节点会撞车）
+  local pdir="${bindir}/pieces"
+  [ -d "${pdir}" ] || die "没有片存目录 ${pdir}"
+  local ndirs; ndirs="$(find "${pdir}" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
+  [ "${ndirs}" -ge 2 ] && ok "片存按节点隔离：${ndirs} 个节点各有自己的片目录" \
+    || die "片存没有按节点隔离（只 ${ndirs} 个目录，多个节点会互相污染）"
 
   step "④ 断言中继往下游提供：leaf2 挂在中继下面，同样以 v1 启动"
   # 中继的 NodeID：优先读它自己的 state.dat（权威、不受日志内容影响），
@@ -215,6 +238,14 @@ cmd_all() {
   grep -q '已向父申请它的可执行文件' "${LOGS}/leaf2.log" || die "leaf2 没有向中继申请镜像"
   [ "$(short_hash "${bindir}/leaf2")" = "${h2}" ] && ok "leaf2 从中继拿到了 v2（中继确实会向下游提供）" \
     || die "leaf2 的文件不是 v2"
+  # §4 的通路证据：中继**从自己的片存**给 leaf2 供片（而不是从磁盘读自己的可执行文件）。
+  # 这正是"边收边转发"的落点 —— 片存里只可能有过了 sha256 的片，所以不必等"磁盘文件
+  # 仍是启动时那份"，也就不必等自己收完 + 重启。本脚本的这个时序（leaf2 在中继收敛后才起）
+  # 只能确定性地验证"片存供片"这一段；"边收边转发"的强形式（中继还在收就给孙发）
+  # 取决于两个进程的时序，无法稳定复现，所以不在这里断言。
+  grep -q 'source=piece-store' "${LOGS}/relay.log" \
+    && ok "中继是从片存给 leaf2 供片的（source=piece-store，「边收边转发」的通路已打通）" \
+    || die "中继没有从片存供片（看 ${LOGS}/relay.log 里「开始向子推送」那行的 source=）"
 
   step "⑤ 断言：重启是"原地 exec"，不是"退出等拉起"（PID 必须不变）"
   for n in leaf1 relay leaf2; do
@@ -233,9 +264,9 @@ cmd_all() {
   [ "$(short_hash "${base}/bin/leaf-ok")" = "${h2}" ] && ok "它的文件也没被动过"
 
   step "⑦ 收敛视图：根 /v1/tree 与 /metrics"
-  tree_field 'json.dumps({"build_hash":d["build_hash"],"build_version":d["build_version"],"lagging_children":d["lagging_children"],"selfupdate_enforced":d["selfupdate_enforced"],"children":[{"name":c["node_name"],"build_hash":c["build_hash"],"mismatch":c["build_mismatch"]} for c in d["children"]]},ensure_ascii=False)'
+  tree_field 'json.dumps({"build_hash":d["build_hash"],"build_version":d["build_version"],"lagging_children":d["lagging_children"],"selfupdate_enforced":d["selfupdate_enforced"],"cert_days":d["cert_not_after_days"],"ca_days":d["ca_not_after_days"],"piece_store":d["piece_store"],"children":[{"name":c["node_name"],"build_hash":c["build_hash"],"mismatch":c["build_mismatch"],"ca_days":c["ca_not_after_days"]} for c in d["children"]]},ensure_ascii=False)'
   curl -s --max-time 5 "http://${ROOT_API}/metrics" \
-    | grep -E '^(selfupdate_total|selfupdate_serve_total|selfupdate_lagging_children|binary_info)' | head -8 || true
+    | grep -E '^(selfupdate_total|selfupdate_serve_total|selfupdate_serve_pieces_total|selfupdate_lagging_children|binary_info)' | head -8 || true
   [ "$(tree_field 'd["lagging_children"]')" = "0" ] && ok "lagging_children=0（全树收敛）" || die "还有节点没跟上"
 
   step "⑧ 负向用例：暂存目录只读 → fail-safe（继续服务、不重启循环）"

@@ -201,6 +201,7 @@ footer{color:var(--fg3);padding:18px 16px 32px;max-width:1180px;margin:0 auto;fo
         <div id="cmdResult"></div>
         <div id="cmdActions" class="field" style="margin-top:10px" hidden>
           <button id="btnCancel">取消指令</button>
+          <button id="btnTrace">查指令轨迹</button>
           <div class="field"><label for="retryNode">retry node</label>
             <select id="retryNode"></select><button id="btnRetry">重试该子节点</button></div>
         </div>
@@ -280,7 +281,9 @@ function b64(str) {                       // UTF-8 安全的 base64
 
 function statusBadge(s) {
   const t = String(s || '').replace('COMMAND_STATUS_', '');
-  const cls = {COMPLETED:'ok', FAILED:'bad', RUNNING:'info', CANCELED:'warn', PARTIAL:'warn'}[t] || '';
+  // 键必须与 proto 的 CommandStatus 逐字对齐：取消态是 CANCELLED（**双 L**，没有 CANCELED），
+  // 而且别漏 TIMEOUT —— 漏了它超时的徽章就没有配色，看着像"状态未知"。
+  const cls = {COMPLETED:'ok', FAILED:'bad', TIMEOUT:'bad', CANCELLED:'warn', PARTIAL:'warn', RUNNING:'info'}[t] || '';
   return `<span class="badge ${cls}">${esc(t)}</span>`;
 }
 
@@ -398,7 +401,9 @@ async function loadTree() {
         <span class="sub">${esc(c.node_remark || '')}</span>
         <span class="spacer"></span>
         <span class="sub mono">${esc(c.node_id)}</span>
-        <span class="sub">caps=${esc((c.caps || []).join(','))}</span>
+        ${c.build_mismatch ? '<span class="badge warn">镜像未收敛</span>' : ''}
+        ${c.ca_not_after_days ? `<span class="sub">CA ${c.ca_not_after_days}d</span>` : ''}
+        ${c.online ? '' : '<span class="sub muted">离线</span>'}
       </div>`).join('') || '<div class="muted" style="padding:6px 0">（无直接子节点）</div>'}
     </div>`;
 
@@ -553,7 +558,13 @@ async function submitCmd() {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   });
   if (!r.ok) {
-    const msg = r.body && r.body.error ? `${r.body.error}：${r.body.detail || ''}` : JSON.stringify(r.body);
+    // 两种错误体都要认：节点 API 是 {error, message}（internal/node/api.go 的 writeErr），
+    // 而本地代理 serve.py 自己的报错是 {error, detail}。
+    // 只认一个就会把原因整个吞掉 —— 以前只读 detail，于是节点侧的一致拒绝在页面上
+    // 只剩一个光秃秃的 ERR_XXX，后面什么都没有。
+    const b = r.body || {};
+    const why = b.message || b.detail;
+    const msg = b.error ? `${b.error}${why ? '：' + why : ''}` : JSON.stringify(r.body);
     $('cmdTimeline').innerHTML = `<span class="t">已拒绝</span>`;
     $('cmdResult').innerHTML = `<div class="errbox">HTTP ${r.status}\n${esc(msg)}</div>`;
     logCmd({ ...body, status: `HTTP ${r.status}`, error: msg });
@@ -567,7 +578,10 @@ async function submitCmd() {
   pollCmd(command_id, t0);
 }
 
-const TERMINAL = ['COMMAND_STATUS_COMPLETED', 'COMMAND_STATUS_FAILED', 'COMMAND_STATUS_CANCELED'];
+// 终态集合（与 proto 的 CommandStatus 对齐）。**CANCELLED 是双 L**（没有 CANCELED），
+// 而且必须带上 TIMEOUT —— 少了它，超时的指令会被当成"还在跑"，页面会一直往下轮询到 120 次上限。
+const TERMINAL = ['COMMAND_STATUS_COMPLETED', 'COMMAND_STATUS_FAILED',
+  'COMMAND_STATUS_TIMEOUT', 'COMMAND_STATUS_CANCELLED'];
 
 async function pollCmd(id, t0, round = 1) {
   const r = await api(`/v1/commands/${encodeURIComponent(id)}`);
@@ -665,6 +679,7 @@ $('btnConnect').onclick = connect;
 $('btnRefresh').onclick = refreshAll;
 $('btnSubmit').onclick = submitCmd;
 $('btnCancel').onclick = cancelCmd;
+$('btnTrace').onclick = traceCmd;
 $('btnRetry').onclick = retryCmd;
 $('btnClearLog').onclick = () => { localStorage.removeItem('tc_log'); renderLog(); };
 $('btnHealth').onclick = loadHealth;

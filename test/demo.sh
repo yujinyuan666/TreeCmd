@@ -128,6 +128,15 @@ cmd_start() {
   else
     ok "复用已有的根材料"
   fi
+  # 入网许可必须与根材料**同批**存在：上面走了"复用"分支时它可能已经被删过
+  # （它是运行期产物、不入 git，也常被清理脚本带走）。根缺了它就直接起不来
+  # （load config failed: security.enrollment.token_path: no such file），
+  # 而子节点会因为没有可拷贝的 token 而失败 —— 以前是悄悄起不来，很难查。
+  if [ ! -f "${DEMO}/root/enroll.token" ]; then
+    openssl rand -hex 24 > "${DEMO}/root/enroll.token"
+    chmod 600 "${DEMO}/root/enroll.token"
+    ok "补回了缺失的入网许可 enroll.token"
+  fi
   write_config "${DEMO}/root" "demo-root" "演示根节点" "${ROOT_LISTEN}" ""
   start_one_debug root "${DEMO}/root"
   sleep 2
