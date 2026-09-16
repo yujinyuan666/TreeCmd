@@ -41,7 +41,7 @@ go build -o bin/treecmd-node ./cmd/node
 >
 > 两条边界：
 > ① `state.dat` 与证书身份不一致 → **以证书为准**并告警（否则必然过不了启动强校验）；
-> ② 父端若用 `enrollment.allow_ids` 白名单，白名单里要填"这个节点实际拿到的 ID" —— 首启后看启动日志
+> ② `node.id` 留空时程序会在上线前把它写进 `state.dat`；想知道拿到了什么 ID，首启后看启动日志
 > （`node.id 未写定 → 本次生成 … node_id=<ID>`）或读 `state.dat` 的 `self.id` 即可拿到。
 
 `node.name` / `node.remark` **只作展示用途**，不参与任何权限判定与摘要计算，也**不进 `config_hash`**：
@@ -64,7 +64,10 @@ curl -s 'localhost:18443/v1/health?depth=-1&detail=true&timeout=20s'   # 逐层�
 ```bash
 # 根节点**首次启动前**：生成它自己的信任锚材料（一次性 bootstrap，见 docs/手动部署指南.md 第二节）
 # 根没有父，没有谁能给它签发证书，所以这一步必须在根的第一次启动之前做一次
-./scripts/init_root.sh <节点目录> <根节点ID>
+./scripts/init_root.sh                         # **不带参数** = 就地在当前目录初始化，NodeID 自动生成 UUIDv7
+./scripts/init_root.sh /opt/treecmd/root       # 也可以指定目录（NodeID 仍自动生成）
+./scripts/init_root.sh /opt/treecmd/root <ID>  # 目录 + ID 都指定（天数是第 3、4 个位置参数）
+./scripts/make_bootstrap.sh <本节点目录>       # 产出「入网引导凭据」（许可 + 本节点 CA 链）给下级
 
 # 一次性生成本节点密钥对（程序**启动路径绝不生成密钥**，这是显式的部署工具）
 ./bin/treecmd-node -genkey -keydir keys            # 还有下级就加 -with-ca
@@ -98,7 +101,8 @@ cd test
 控制台是单文件网页（零依赖、可离线），配一个**只转发本机**的本地代理解决跨源；
 `./demo.sh start` 起的是一棵**真实进程树**，不是 mock。细节见 `test/README.md`。
 
-**子节点的配置可以只有两项**（其余按约定补全：`keys/id_ed25519`、`certs/node.crt`、`trust/`、`enroll.token`…）：
+**子节点的配置可以只有两项**（其余按约定补全：`keys/id_ed25519`、`certs/node.crt`、`enroll.token`…）
+—— 材料上**只需要"自己的密钥 + 父给的一份凭据"**，**不需要从根拷任何证书**：
 
 ```yaml
 node:
@@ -108,19 +112,30 @@ parents:
     addr: 127.0.0.1:19443
 ```
 
+首次入网用的信任锚口径是**你的父**（父的 `certs/node.crt.ca` 整份文件，含父 CA 一路到根）；
+入网成功之后连它也可以删掉 —— 信任锚改由**本节点自己的证书链**自举（见下表最后一行）。
+
 ### 证书生命周期：程序签发 / 程序续期 / 替换自动重载
 
 | 能力 | 说明 |
 |------|------|
 | **根自签续期** | 根没有父、没有任何人能给它续签，但它自己就持有 CA 材料 ⇒ 剩余有效期不足生命期 1/3 时**自己重签自己**（`startSelfRenewLoop`）；**启动时若证书已进窗口（含已过期）也先续再启动** ⇒ 根的证书同样是"第一次启动之后不用管" |
-| **有效期口径** | **身份证书 30 天**（换来换去只影响自己，所以短）、**CA 证书 10 年**（换 CA 要全树重新分发 `trust/`，所以长且**不参与自动续期**）。续签窗口在生命期 2/3 处 ⇒ 每约 20 天换一次，留足容错 |
+| **有效期口径** | **身份证书 30 天**、**CA 证书 10 年**（都可用 `security.identity_cert_days` / `security.ca_cert_days` 覆盖；**默认值就是历史行为，改它不影响拓扑、不进 `config_hash`**）。续签窗口在生命期 2/3 处 ⇒ 身份证书每约 20 天换一次，留足容错 |
+| **CA 证书也能在线轮换** | CA 证书**只换证书、不换密钥**（`ReissueCAFor`）：公钥不变 ⇒ 下级手里的旧 CA 证书在有效期内仍然有效、`trust/` 完全不用动、下级也不用重新入网。中继向**父**申请（`CertRenewReq.want_ca` + 提交当前那张 CA 证书证明"同一把密钥"），根则自己续（**先续 CA 证书、再用新 CA 证书重签身份证书**，顺序不能反）。指标 `ca_rotate_total{result}` |
 | **运行期入网签发** | 子节点没有证书也能上线：`EnrollChallenge`（一次性 nonce）→ 子用**自己私钥**签 PoP → 提交身份公钥(+CA 公钥)与入网许可 → **父用自己的 CA 私钥签这两个公钥** → 子校验后原子写盘 + 热切换。**私钥全程不出本机**，程序既不生成也不接收私钥 |
+| **入网引导凭据** | 子节点要的两样东西（**许可** = "父要不要收我"、**父的 CA 链** = "对端是不是父"）装进**一份文件**（`enroll.token`，格式见 `identity.ParseBootstrap`），由父一条 `scripts/make_bootstrap.sh` 产出 ⇒ 部署一个子节点**只拷一个文件**，不必再单独拷 CA。**许可**是唯一的授权判据：父端没配它就拒绝一切入网（它挡不住"自报某个 ID + 自建一对密钥"：NodeID 是公开信息、与密钥对没有密码学绑定） |
 | **证书热重载** | 轮询（默认 30s，只做 `stat`，变了才读内容）+ **`SIGUSR1` 立即生效**；监视身份私钥/公钥/证书 + 本节点 CA 证书/私钥 + 全部信任锚 |
 | **fail-safe** | 新证书**任何一项校验不过**（格式/身份/链/有效期）就**继续用当前证书**并打 ERROR —— 绝不会因为脚本投放了半个文件把在跑的节点弄挂。指标 `cert_reload_total{result=ok\|failed\|missing\|nochange}` |
-| **生效范围** | 信任锚与对端证书只影响新连接；只有**本节点身份证书/私钥**变了才主动重连一次（`cert_reload.on_change: reconnect`；设 `lazy` 则完全不打断现有会话） |
+| **生效范围** | 信任锚与对端证书只影响新连接；只有**本节点身份证书/私钥**变了才主动重连一次（`cert_reload.on_change: reconnect`；设 `lazy` 则完全不打断现有会话）。**换自己的 CA 证书不触发重连** —— TLS 上出示的是身份证书链，里面本来就不含自己的 CA 证书 |
+| **信任锚口径 = 你的父** | `ca_cert_paths` 放的是**父的** `certs/node.crt.ca`（整份文件，含父 CA 到根）—— **不需要从根拷任何东西**。链能不能验通只看"能否接到某个锚"，`LoadOrScanTrustAnchors` 会把文件里的**整条链**都纳入锚池，所以"放父的"与"放根的"判定结果完全等价；而每个节点只对自己的父负责 ⇒ 换父、换根都只影响父那一层 |
+| **信任锚可自举** | 入网拿到的证书链本身就是 `[我, 父CA, …, 根CA]` ⇒ 它自己就是现成的锚。`identity.ChainAnchors` 把 `chain[1:]`（跳过自己的叶子证书）登记成锚，于是**入网成功后 `trust/` 与 `security.ca_cert_paths` 都可以删掉**，日志留一行「信任锚来自自身证书链自举」。这条**不放宽任何语义**：链里的父 CA 本来就已经作为中间证书参与验链。注意别只截取"父那一张"，漏掉根会让**上级节点签发的跨跳委托（`ReqAuth`）在孙节点上验不过** |
 | **信任锚给目录** | `ca_cert_paths: [trust]` —— 目录下 `*.crt`/`*.pem` 全部加载；**换 CA 只换文件、不改配置** |
 | **证书撤下可自愈** | 证书文件被删 → 子节点自动重新入网把文件补回；根节点则继续用内存里的旧证书服务（并记 `result=missing`） |
 | **首启顺序无关** | 子先起、父后起也能收敛：没证书/连不上都不会让进程退出，按退避（1s→2s→4s…30s）持续重试 |
+
+> **CA 证书能在线轮换、但 CA 密钥不能。** 本机制只解决"证书到期 / 想缩短 CA 证书寿命"这一类需求。
+> 真要**换 CA 密钥**（真换 CA）仍然需要全树重新分发 `trust/` —— 那是另一件事，
+> 但可以靠"信任锚双活"慢慢推进：`ca_cert_paths` 里同时放新旧两张根证书，等所有子都换完再撤旧的。
 
 ### 可执行文件一致性：连上即比对，不一致就自同步
 
@@ -134,15 +149,20 @@ parents:
 | **启动算哈希** | `os.Executable` + 解析符号链接（要替换的是链接指向的**真实文件**）+ 流式 sha256，一遍过。算不出来不致命：只记 ERROR，一致性检查整体降级为"不判定" |
 | **连上第一件事** | 父在 `RegisterAck` 里回带自己的哈希 / 大小 / 签名；子拿到应答后**先比对再干活** —— 此刻心跳与拉取循环都还没起，**一条指令都还没执行过** |
 | **一致** | 只比一个字符串，零额外开销；顺手清掉上次遗留的尝试痕迹 |
-| **不一致** | `on_mismatch: sync`（默认）：就地向父 `BinaryReq` 拉取 → 逐片 crc32 + 整份 sha256 + 父签名三重校验 → 原子替换 → `syscall.Exec` **原地重启** |
+| **不一致** | `on_mismatch: sync`（默认）：就地向父 `BinaryReq` 拉取 → 逐片 crc32 + **片级 sha256（清单）** + 整份 sha256 + 父签名四重校验 → 原子替换 → `syscall.Exec` **原地重启** |
+| **分片清单先行** | 子先 `BinaryManifestReq` 要一份"这份镜像由哪些片组成、每片 sha256 是多少"（`hub.manifestFor`：优先用片存里继承来的那份，没有就从本节点镜像现算）。拿到清单后**片级校验从 crc32 升级为 sha256** —— 这是"片可以对外转发"的唯一依据。拿不到清单（旧版本父 / `piece_store=false`）就**回退到老流程**，绝不因此不工作 |
+| **片存 + 边收边转发** | 过校验的片落在 `<暂存目录>/pieces/<本节点ID>/`（**按节点隔离**，因为多个节点的可执行文件常同处一目录）。于是中继**还没收完、还没重启**就能把已收到的片转发给自己的直接子 ⇒ 收敛从"逐层串行"变成"流水线"。片存是**可丢的缓存**，删掉只会让下次从 0 重来 |
+| **断点续传** | `BinaryReq.from_index` + 片存的"从第 0 片起的**连续前缀**"。片已集齐时（上次在拼装/替换前中断）直接拼装、不再向父申请一片。**最终统一从片存拼装**（而不是边收边追加）—— 续传时前半段只存在于片存里，追加会得到错位的文件 |
 | **复用 Connect 流** | 不新增 RPC：请求与分片都走子已经建好的那条双向流。推送时**先等发送缓冲回落到一半以下再压下一片**，给同一时刻的心跳与终态帧留位置 |
 | **方向单向** | 父永远是标准答案 ⇒ **升级自上而下**（根先换，中继再换，叶子最后跟）**；反过来把根换回旧版就等于整棵树回滚**，不用逐台登录 |
 | **原地 exec** | PID 不变、fd 与环境保留，`nohup` + pidfile 的启动脚本原样可用。进程内状态全丢这件事框架本来就扛得住：`SELF_RUNNING` 的指令走 `Executor.OnRestart`，未上报结果在 `pending_result` 里等着重发，子节点断线自动重连 |
-| **三重校验** | ① mTLS；② 父用**身份密钥**对 `(父ID, 哈希, 大小)` 签名，子用父的证书公钥**离线**验签；③ 收齐后整份 sha256 逐字节校验 |
-| **只对自己签发的直接子开放** | 服务端拿对端叶子证书验自己 CA 的签名，不是直接子一律拒（`ERR_BINARY_NOT_DIRECT_CHILD`）；**发之前还复验磁盘文件仍是启动时那一份**（被换过就拒绝，绝不外发半成品） |
+| **三重校验** | ① mTLS；② 父用**身份密钥**对 `(父ID, 哈希, 大小)` 签名，子用父的证书公钥**离线**验签；③ 每片 sha256（有清单时）+ 收齐后整份 sha256 逐字节校验 |
+| **只对自己签发的直接子开放** | 服务端拿对端叶子证书验自己 CA 的签名，不是直接子一律拒（`ERR_BINARY_NOT_DIRECT_CHILD`）。片存里只可能有**过了 sha256 的片**，所以从片存供片不需要"磁盘文件仍是启动时那份"这个前提；从**自己的可执行文件**供片时必须复验（被换过就拒绝，绝不外发半成品） |
+| **读片只认片号** | 片存的读取入口只接受**片号**（`Get(hash, index)`），绝不接受任意 offset —— 否则它就是一个任意文件读取的口子。目录权限 0700、按目标哈希分目录 |
+| **供片并发有闸门** | `max_serve_concurrency`（默认 4）：中继可能一边向父拉、一边给多个孙推。满了**等到超时才拒**（`ERR_BINARY_BUSY`）而不是立刻拒 —— 子端一次失败要等下一轮重连才重试，立刻拒太容易拖慢收敛 |
 | **fail-safe** | 拉取 / 落盘 / 替换任一步失败 → 保留当前镜像**继续服务** + ERROR + 指标；只有"替换成功"这一条路径必然重启 |
 | **防重启循环** | 尝试计数**先落盘再动手**（跨 exec 存活在 `state.dat` 的 `self_update` 里）：同一目标哈希在一个窗口内最多 3 次，超了就锁住并告警，窗口一过自动清零重试 |
-| **可观测** | 启动日志里有一行"运行时镜像"（hash/size/version/path）；`/v1/tree` 每个节点都带 `build_hash`，还有 `lagging_children`（>0 就是还没收敛）；指标 `selfupdate_total{result}`、`selfupdate_serve_total{result}`、`binary_info{hash}` |
+| **可观测** | 启动日志里有一行"运行时镜像"（hash/size/version/path）；`/v1/tree` 每个节点都带 `build_hash`、还有 `lagging_children`（>0 就是还没收敛）与 **`piece_store`**（每份镜像的 `have`/`total`/`bytes`/`ready` —— 流水线跑到哪了一目了然）；指标 `selfupdate_total{result}`、`selfupdate_serve_total{result}`、`selfupdate_pieces_received_total{result}`、`selfupdate_serve_pieces_total{source}`、`binary_info{hash}` |
 
 ```yaml
 # 全部可省略（默认值就是"开启 + 不一致即同步"）
@@ -156,6 +176,9 @@ selfupdate:
   max_attempts: 3          # 同一个目标哈希在 attempt_window 内最多试几次（防重启循环）
   attempt_window: 1h
   # dir: /opt/treecmd/staging   # 默认 = 可执行文件所在目录（**必须同文件系统**，rename 才是原子的）
+  piece_store: true        # 镜像分片缓存：过 sha256 的片落盘，"边收边转发"+断点续传（默认开）
+  max_serve_concurrency: 4 # 同时向几个直接子供片（中继一边向父拉、一边给孙推时要限流）
+  # piece_store_max_bytes: 128MB  # 片存上限，默认 = max_bytes × 2；超了按最近使用时间清
 ```
 
 ```bash
@@ -187,7 +210,7 @@ curl -s localhost:18443/v1/tree | grep -o '"lagging_children":[0-9]*'   # 等它
 POST /v1/commands                     提交指令（本节点即 OriginID 与聚合终点）
 GET  /v1/commands/{id}                结果查询（跨节点沿路径前缀路由到持有者）
 POST /v1/commands/{id}/cancel         取消
-POST /v1/commands/{id}/retry?node=X   子节点重跑（RetryNode）
+POST /v1/commands/{id}/retry?node=X   子节点重跑（RetryNode）；次数用尽时**父判该子失败**并回报 judged=FAILED
 GET  /v1/health[?command_id=&depth=&detail=&timeout=]   健康度 / 指令轨迹 双模式
 GET  /v1/tree                         本节点视角的拓扑
 GET  /v1/crl                          查看本节点的吊销列表
@@ -263,7 +286,7 @@ curl -s -XPOST "$ROOT/v1/forget?all=1&mode=garbage"
 > **为什么 CLI 不直连数据库**：运行中的节点独占 `state.db`（`store.Open` 锁超时 5s），
 > 离线进程根本打不开库，所以清理必须走 HTTP 在进程内完成。
 > **为什么不做"掉线即自动删"**：会误伤滚动重启中的正常子节点，也丢掉了运维信息 —— 改为显式命令 + 预览。
-> 设计取舍见 `docs/失效节点清理与版本一致性设计.md`（ADR-052）。
+> 设计取舍见 ADR-052；实现与逐条说明在 `internal/node/forget.go` 的注释里。
 
 ## 目录结构
 
@@ -271,7 +294,8 @@ curl -s -XPOST "$ROOT/v1/forget?all=1&mode=garbage"
 api/proto/node.proto        协议定义：**手写的唯一契约**（64 message / 11 enum / 1 service / 6 rpc）
 internal/pb/                protoc 生成的 Go 绑定（7,467 行）；**勿手改**，重新生成方式见本节末尾
 internal/identity/          UUIDv7、Ed25519、与系统树同构的 PKI、证书签发与链校验、启动强校验、mTLS
-  lifecycle.go              信任锚目录扫描 + PathStamp/PathDigest（变更判定）+ 按公钥签发 + 入网握手 TLS
+  lifecycle.go              信任锚目录扫描 + **信任锚自举（ChainAnchors）** + PathStamp/PathDigest（变更判定）
+                            + 按公钥签发 + 入网握手 TLS
 internal/config/            node.yaml 加载 / 校验（含 renew_at×3 ≤ lease_ttl 硬约束）/ config_hash 白名单
   nodeid.go                 node.id 解析：配置 → 证书身份 → state.dat → 生成（**只读，不写任何文件**，ADR-050）
 internal/canon/             canonical 编码（确定性序列化）+ NodeID 16 字节大端升序排序
@@ -297,6 +321,9 @@ examples/                   手工部署样例（阅读版）
   README.md                 部署阅读指南：角色对照 / 目录约定 / 字段生效时机 / 报错对照 / 检查清单
   node.yaml                 唯一一份权威配置样例：头部"按角色最简起步"，正文逐字段标角色与默认值
 scripts/init_root.sh        根节点首次启动前的自签材料（一次性 bootstrap；其后签发与续期都归程序）
+                            **不带参数即可跑**：目录默认当前目录、NodeID 现场生成 UUIDv7
+                            并产出该节点的「入网引导凭据」enroll.token（许可 + 它自己的 CA 链）
+scripts/make_bootstrap.sh   给任何有下级的节点产出/升级入网引导凭据（默认沿用已有许可，不轮换）
 scripts/start_node.sh       单节点起停 / 换证重载（SIGUSR1）/ 配置热更（SIGHUP）
 test/                       可视化测试台：本地网页 + 反向代理 + 一键起演示树（见 test/README.md）
   index.html                单文件控制台（零依赖、可离线）：总览 / 拓扑 / 健康 / 指令 / 指标
@@ -304,7 +331,7 @@ test/                       可视化测试台：本地网页 + 反向代理 + �
   demo.sh                   一键起"根 + 直接叶子 + 中继 + 中继下的叶子"（3 层）+ 起控制台
   selfupdate.sh             可执行文件自同步的端到端验证（起树 / 换版本 / 断言原地重启）
   forget.sh                 失效节点清理的端到端验证（起树 / 在线拒绝 / 掉线后清理 / 重启断言不回灌）
-docs/                       手动部署指南、差异处理方案、项目功能完整介绍、代码注释规范
+docs/                       手动部署指南、项目功能完整介绍、代码注释规范、四项外部经验借鉴方案
 ```
 
 ### 代码注释约定
@@ -374,7 +401,20 @@ go build ./...        # 生成后一定要编译一遍
 - **拉模式工作队列**：`FetchCommands` 返回"seq 增量的新指令 ∪ 名下 Assignment 重投"，投递由 Assignment + 租约驱动，
   与内容水位解耦（3.1/3.2/ADR-022/036）；父端不信任客户端 `since_seq`（取 `max(客户端, 父侧权威水位)`）；
   响应构造与水位落盘同一事务，**绝不回退**；`fetch_response_max_bytes`(3.5MB) 父端兜底截断
-- **租约**：`LeaseTTL` 只做活性检测、租约过期即回收（只看父时钟）、回收不推进 `attempt`、`LocalBusy` 短退避（3.4）
+- **租约**：`LeaseTTL` 只做活性检测、租约过期即回收（只看父时钟）、回收不推进 `attempt`（3.4）
+- **下发背压（在途窗口）**：父端"已经交到子手上、还没回终态"的分派条数有上限，补上"只有字节上限"的缺口 ——
+  没有它，一个子可以一次把它名下所有分派全拉走。
+  「在途」= Assignment 处于 `LEASED` 且租约仍有效（`PENDING`、以及 `LEASED` 但租约已过期的僵尸租约都不算，
+  否则一次父重启就能把窗口占满、把自己锁死）。
+  `max_dispatch_inflight_per_child`（默认 8；因为单条指令对每个子只有 1 个 Assignment，所以它只在你
+  同时压了 >8 条指令给同一个子时才生效）、`max_dispatch_inflight`（默认 0 = 不限）、
+  `dispatch_window_adaptive`（按在线子数自适应，只会收紧）；超窗时**只限速、不丢任务**，
+  计数落在 `dispatch_throttled_total{reason}` 上
+- **`LocalBusy` 指数退避**：子说"忙"是它**本机全局**的（本地并发闸门满了），所以一批指令会被**同时**退回来。
+  固定间隔会让它们在同一时刻齐刷刷重投、把刚要缓过来的子再打一遍；改成
+  `min(local_busy_backoff << (n-1), local_busy_backoff_max)`（默认 3s 起、60s 封顶）让重投时刻自然错开。
+  `attempt` 依旧不推进（退避只决定"什么时候再投"，不决定"第几次尝试"）；
+  连续次数只在两处归零：收到 `InflightHint`（子报告正在跑，唯一的正向证据）与租约回收（状态不可知）
 - **本地三态**：`NOT_STARTED/SELF_RUNNING/SELF_DONE/SELF_FAILED/SELF_CANCELLED/COMPLETED`；
   `SELF_RUNNING` 先落盘再执行（`OnRestart` 的唯一触发条件）；`SELF_DONE` 与两个本地终态绝不重跑（3.5，ADR-016/039）
 - **终态单事务**：`terminal()` 一个 bbolt 事务里写 `local_state` + `CommandRecord.Status` + 结果归宿
@@ -382,6 +422,17 @@ go build ./...        # 生成后一定要编译一遍
 - **`waitChildren` 状态机**：进入顺序"重建上下文 → 审退出原因标记 → 命中对账 → 判空 → 写 RUNNING"；
   独立 `Deadline` timer + 带 jitter 的 tick；`applyEvent` 后立即判 `OnFailure` 上限；
   退出前落定未上报子的 Assignment 并落"退出原因标记"；`Cancelled/Deadline` 三态互斥（3.16，ADR-042/047/049）
+- **收尾语义的三个要点**（都是"看着像小细节、踩过才知道要紧"的那类）：
+  - **死线是兜底，不是"到点就抹掉已到手的事实"**：死线分支会**先复查等待集合**，
+    已经没有待上报的子时按**正常完成**收敛 —— `select` 在"最后一个子上报"与"死线到点"同刻就绪时
+    是随机挑分支的，不做这次复查就会判出 `TIMEOUT`，而 `result` 里其实全齐了。
+  - **收尾时点名"始终没有上报的子"**：父会给**注册表里的每个直接子**建 Assignment（下发即执行，
+    不做筛选），所以一个已废弃的**残留子节点**（重建过密钥 / 换过机器，旧 NodeID 留在 `known_children` 里）
+    会让**之后每条指令**都白等到期限。日志里点名 + 给出 `/v1/forget` 的预览/清理命令，
+    是运维唯一的线索（状态码只会说 TIMEOUT）。
+  - **重试预算用尽 ⇒ 父侧判定该子失败**：`max_retry_node_count`（默认 3）用尽时把该子置为 `FAILED`
+    （参与失败策略的 `NotDone` 统计，但**不进背书链** —— 它没有 Report.Sig，硬塞就是伪造背书），
+    并回报 `judged: FAILED`。否则运维唯一的自救手段会用完即止，指令只能继续干等死线
 - **`child_reports` 持久化闭环**：接受子报告 = 单事务（写权威副本 + 置 Assignment 终态 + 记生效 attempt），
   `ok=true` 语义 = "已持久化接受"；`waitChildren` 进入时由它重建已完成的支（ADR-048/049）
 - **补报**：`pending_result` 先落盘 → 上报 → 收到 `ok` 才清理；三级路径（内联 / 分片 / 引用）由 `reportUpstream`
@@ -422,7 +473,7 @@ go build ./...        # 生成后一定要编译一遍
 | **`QueryData` 分片回传** | >256KB 的查询结果：先回元数据 `QueryResp{has_data}`，再沿同一回程发 `QueryData` 分片（逐片 gzip + crc32 + 持有者身份签名、**首片带证书链供入口离线验链**）；入口收齐拼装；超 `query_response_max_bytes` 降级为引用；校验失败回"校验失败"而不是 `NOT_FOUND` |
 | **`ReqAuth` 跨跳委托** | 入口签一份短时委托（ViewerID / EntryCert / EntrySig / NotAfter / Kind / **ParamsHash 只绑定跨跳不变的 command_id+detail+Kind**）；每跳用预置根证书**离线**验链验签，再按**自己的** `health_viewers`（默认"直接父 + root"）/`query_viewers`（默认放行）决定是否服务/转发；拒绝落审计日志 |
 | **CUSTOM 聚合器注册** | `aggregate.RegisterCustom/LookupCustom`；`aggregate=CUSTOM` 必须给 `aggregate_name`（随指令逐跳透传），未注册 → `ERR_UNKNOWN_CUSTOM_AGGREGATOR`；声明 `NeedsSelfResult()` 而未开 `raw_children` → 提交期即拒；内置 `subtree_count` / `audit_raw` 两个示例 |
-| **`/metrics`** | 手写 Prometheus 文本（零依赖）：`node_up`、`children_count/known`、`command_inflight/pending_total`、`partial_total`、`pending_result_backlog`、`retention_floor`、`result_index_entries`、`clock_offset_ms`、`command_terminal_total{status}`、`fail_rate_1h`、`result_stored_total`、`untrusted_origin_rejected_total`、`selfupdate_total{result}`、`selfupdate_lagging_children`、`binary_info{hash}`、`forget_total{result}` … |
+| **`/metrics`** | 手写 Prometheus 文本（零依赖）：`node_up`、`children_count/known`、`command_inflight/pending_total`、`partial_total`、`pending_result_backlog`、`retention_floor`、`result_index_entries`、`clock_offset_ms`、`command_terminal_total{status}`、`fail_rate_1h`、`result_stored_total`、`untrusted_origin_rejected_total`、`selfupdate_total{result}`、`selfupdate_lagging_children`、`binary_info{hash}`、`forget_total{result}`、`dispatch_throttled_total{reason}`、`local_busy_total`、`child_dispatch_inflight{child}`、`dispatch_window_per_child`、`dispatch_window_total` … |
 | **祖先 NodeID 链** | `RegisterAck.ancestor_ids`：环检测与 `health_viewers` 默认白名单（"直接父 + **root**"）都要按 ID 判定 —— 根的路径是 `"/"`，从路径里取不出它的 NodeID |
 | **健康扫描可取消** | 健康/轨迹递归跟随 HTTP 请求的 `ctx`：调用方放弃即停止扇出与等待，避免"被丢弃的扫描"在后台堆积 |
 
@@ -447,8 +498,9 @@ go build ./...        # 生成后一定要编译一遍
    - **`AttestDepth ≥ 2` 的递归背书校验**：`Descendants` 已回传，但父端默认只验直接子层，未实现审计态的递归验签；
    - **健康请求的应用层限流**：`health.rate_limit_per_sec` 已在配置里，未接入限流器（单飞互斥已实现）；
    - **`ConfigPush` 的下行策略**：仅支持父手写 `overrides` 下发，未做"根推到全树"的中心化分发；
-   - **入网许可的时效性**：`enrollment.token` 是长期共享串（父端无状态），没有"一次性许可 / 许可过期"机制；
-     要更强的话可换成"每节点一枚一次性许可（用后即废）"，目前靠 `allow_ids` 白名单 + 保留期由人工撤销；
+   - **入网许可的时效性**：`enrollment.token` 是长期共享串（父端无状态），没有"一次性许可 / 许可过期"机制
+     （它是**必需**的 —— 没有许可就拒绝一切入网）；
+     要更强的话可以升级成"每节点一枚一次性许可（用后即废）"，那时"这次准入发给谁"才真正可限定；
    - **证书热重载不跟随符号链接目标**（按 `stat` 的 size+mtime 判定）；若你的脚本用 `ln -sf` 变更新链接目标，
      `lstat` 层面的 mtime 也会变，实测可触发；但若只替换目标文件内容而不动链接，则依赖目标文件的 mtime 变化。
 3. **`AttestDepth` 已改为 `optional int32`**（不再有 0 值歧义）：不传 = 默认 1，显式 `0` = 无上限（全树背书）。

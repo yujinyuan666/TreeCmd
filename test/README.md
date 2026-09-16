@@ -37,9 +37,9 @@ python3 serve.py --target 10.0.0.5:18443 --allow-any-host
 | 标签页 | 对应接口 | 说明 |
 |---|---|---|
 | 总览 | `/v1/tree` | 根的角色/名字/备注/listen、在线子节点数、结果索引条数 |
-| 拓扑 | `/v1/tree` | 本节点 + 直接子节点的树形视图（**只有一层**，见下） |
+| 拓扑 | `/v1/tree` | 本节点 + 直接子节点的树形视图（**只有一层**，见下）；每个子带「镜像是否收敛」与「它自己的 CA 还剩几天」 |
 | 健康 | `/v1/health?depth=-1&detail=true` | 全树扫描：本节点 checks、子树汇总、每个直接子的状态与"它下面还连着几个" |
-| 指令 | `/v1/commands` | 8 个预设场景 + 手填全部字段；提交后自动轮询到终态，TREE 聚合结果可递归展开；支持取消 / 按子节点重试 |
+| 指令 | `/v1/commands` | 8 个预设场景 + 手填全部字段；提交后自动轮询到终态，TREE 聚合结果可递归展开；支持取消 / **查指令轨迹** / 按子节点重试 |
 | 指标 | `/metrics` | 关键指标卡 + 全部 Prometheus 条目 |
 
 预设场景：全树 echo(TREE)、全树计数(COUNT)、慢指令 sleep 2s、全树失败(fail)、
@@ -78,8 +78,47 @@ Python 3（系统自带的 3.9 就能跑）与一个能访问到的 treecmd 根�
 > `commit()`：替换必须走"写暂存文件 + rename"，而 macOS 上"原地覆盖某个可执行文件之后立刻
 > exec"会被内核直接判死（`Killed: 9`、日志一行都没有）—— 这正是程序自己用 rename 的原因。
 
-## 手写 API 调用怎么验（`uuid_v4.sh`）
+## CA 证书在线轮换怎么验（`ca-rotate.sh` + `ca-rotate/`）
 
+`demo.sh` 看的是树跑得对不对，`selfupdate.sh` 看的是子节点跑的是不是父那一份镜像，
+`uuid_v4.sh` 看的是每个节点各自调外部 HTTP；`ca-rotate.sh` 看的是**第四条链路**：
+**CA 证书能不能在运行期换掉、而不用全树重新分发 `trust/`**。
+
+```bash
+./ca-rotate.sh          # 完整验证
+./ca-rotate.sh keep     # 跑完留着树（自己 ./demo.sh stop）
+```
+
+它断言四件事：
+
+① 根确实轮换了 CA 证书（日志 `CA 证书已轮换` + `certs/node.crt.ca` 内容变化）；
+② **轮换的是证书、不是密钥** —— 前后公钥逐字节相同（这是"下级不用换 trust/"的全部依据）；
+③ 程序**没有碰信任锚文件**（`certs/ca.crt` 指纹不变）；
+④ 树仍然可用：用旧 CA 签发的子节点照旧连上、指令照旧跑完。
+
+**为什么要先把证书"做旧"**：续签窗口的判据是"剩余有效期 < 生命期 1/3"，而刚签出来的证书
+永远不落在窗口里。所以脚本先用 `test/ca-rotate` 把根的 CA 证书 NotBefore 往前挪 20 小时、
+生命期压到 22 小时，这样它下次启动就必然在窗口里 —— "轮换"才可能被确定性地触发。
+
+`test/ca-rotate/main.go`（`//go:build ignore`，所以不进 `go build ./...`）有三个模式：
+
+```bash
+# 自检：不算文件、不起进程，在内存里跑完整机制并断言四条不变量（含一条负向）
+go run test/ca-rotate/main.go -selftest
+
+# 做旧：把某节点目录的 CA 证书 NotBefore 往前挪、生命期缩短
+go run test/ca-rotate/main.go -dir test/demo/root -life 22h -age 20h
+
+# 判链：用**产品代码里那个** ChainVerifier 判"某条链能不能接到某个锚"，并打印 SKI/AKI
+go run test/ca-rotate/main.go -verify-anchor <锚文件> -verify-chain <链文件>
+```
+
+> `-verify` 这个模式是排查"链为什么验不过"的第一现场：证书的 `SubjectKeyId` 由**生成方式**
+> 决定（Go 与 openssl 算出来的不一样），而 Go 的链构建会先按 AKI→SKI 找签发者。
+> 更隐蔽的是 **`RawSubject` 的字节** —— `openssl x509 -subject` 会把 RDN 顺序归一化后打印，
+> 所以"看起来同名"的两张证书字节可能不同。
+
+## 手写 API 调用怎么验（`uuid_v4.sh`）
 `demo.sh` 看的是树跑得对不对，`selfupdate.sh` 看的是子节点跑的是不是父那一份镜像；
 `uuid_v4.sh` 看的是第三条链路：**每个节点各自去调一次外部 HTTP 接口，结果逐跳回传到发起节点**。
 
@@ -94,6 +133,139 @@ Python 3（系统自带的 3.9 就能跑）与一个能访问到的 treecmd 根�
 脚本会先看 `bin/treecmd-node` 是否比 `cmd/`、`internal/` 下的源码旧，旧了自动重建 ——
 "改了代码没重建、跑出来是旧行为"是最容易误判的一次踩坑（尤其是新加的执行器类型没被识别时）。
 
+## 下发背压（在途窗口）怎么验（`backpressure.sh` + `backpressure/`）
+
+`demo.sh` 看树跑得对不对，`selfupdate.sh` 看镜像一不一致，`uuid_v4.sh` 看外部 API 调用，
+`ca-rotate.sh` 看 CA 证书能不能在线换；`backpressure.sh` 看的是**下发侧有没有刹车**：
+
+```bash
+./backpressure.sh          # 全部三步（约 45 秒）
+./backpressure.sh stop     # 只停树
+COUNT=50 ./backpressure.sh # 改批量
+```
+
+它断言三件事：
+
+① **窗口生效**：一次提交 20 条，**任何一个子的在途分派数在任何时刻都不超过窗口**（默认 8）。
+   在途 = `LEASED` 且租约仍有效（`PENDING`、以及租约已过期的僵尸租约都不算）；
+② **限速不丢任务**：20 条最终全部 `COMMAND_STATUS_COMPLETED`；
+③ **对照组**：把窗口热更成 0（不限），同一批会被**一次拉走**（峰值在途 20 > 8）。
+
+第 ③ 步不是凑数的：它是**唯一能证明"① 的上限来自窗口"**的实验 —— 否则"峰值刚好 8"完全可能
+只是"任务本来就快、天然堆不起来"的巧合。它顺带还验证了新字段的 SIGHUP 热更通路。
+
+`backpressure/` 下两个小工具，各自单一职责：
+
+| 文件 | 干什么 |
+|---|---|
+| `probe.py` | 只做观测：提交 N 条、高频采样 `/metrics` 的 `child_dispatch_inflight`（取**峰值**，平均值会把超窗那一刻抹平）、轮询到终态，最后打一行 JSON。判断留在 shell 侧 |
+| `inject.py` | 只做一件事：把一组 `command.*` **幂等**地写进某个 `node.yaml`（用一对标记包成可反复覆盖的块）。直接 `echo >>` 追加是不行的 —— 第二次改就会写出**两个 `command:` 段**，而 yaml.v3 对重复键直接报错，节点下次启动都起不来 |
+
+> 脚本会把 `renew_at` 与 `tick_interval` 热更小（2s / 1s）来提速：`renew_at` 既是子的续租周期、
+> **也是它的拉取周期**（`upstream.go` 的 `fetchLoop`），而父只在提交那一刻通知一次，所以"限速"
+> 的实际轮次间隔就是它。**这两个加速项不会放松断言** —— 拉得越勤，给"超过窗口"的机会越多。
+> 另外 `renew_at` 有硬约束 `renew_at × 3 ≤ lease_ttl`（默认 90s），2s 远在范围内。
+>
+> 这个加速最初**没有生效**，反过来暴露了一个真问题：`fetchLoop` 原先用 `time.NewTicker(renew_at)`，
+> 周期在会话建立那一刻就被固定住了，**HUP 改 `renew_at` 对已建立的会话无效** ——
+> 于是脚本白等了 62s（实测轮次间隔 10.3s / 22.4s，都落在同一个 30s 网格上）。
+> 现在两个周期循环（`fetchLoop` / `heartbeatLoop`）都改成"1 秒一小步 + 每步现读配置"，
+> 阶段 A 因此从 62s 降到 19s。默认 30s 周期下行为与 Ticker 完全一致。
+
+## 指令收尾语义怎么验（`command-deadline.sh`）
+
+前几套脚本看的是"链路通不通"；`command-deadline.sh` 看的是**指令收尾时的三件事**，
+它们都属于"注释或文档承诺了、但实现漏了"那一类：
+
+```bash
+./command-deadline.sh          # 全部（约 40 秒）
+./command-deadline.sh stop     # 只停树
+```
+
+| 断言 | 在证什么 |
+|---|---|
+| `echo` + 8s 死线 ⇒ 必须 `TIMEOUT` | 死线仍然有效（不能因为下面两条把它弄成摆设） |
+| 收尾日志点名"始终没有上报的子" + 给 `/v1/forget` 指引 | 残留子节点会让**之后每条指令**都白等到期限；日志是运维唯一的线索（状态码只会说 TIMEOUT） |
+| 对同一个子连打 retry 到预算用尽 ⇒ 回报 `judged: FAILED`，指令随之收敛为 `FAILED` | `max_retry_node_count` 承诺的"超了由父直接判定失败"，否则运维唯一能表达的手段会用完即止 |
+
+**用例怎么构造（关键，也已经踩过坑）**：**不能用"杀掉一个子节点"**。
+第一版脚本就是这么写的，拿到的是 `FAILED` 而不是 `TIMEOUT` —— 被杀的子确实留在注册表里，
+但指令**不会因此卡住**（另一条分支先把它带走了：那次结果 JSON 的 `failed[]` 指的是中继，
+整条指令 200ms 内就按失败策略收敛了）。
+
+真正会"卡到期限"的只有**注册表里有、但本进程从未连上过的残留子节点** ——
+它没有断线事件可触发。所以脚本分两阶段：先 `demo.sh start` 起一次完整树（让根的 `state.dat`
+记下两个直接子的身份），然后**只手工起 根 + 中继 + 中继下的叶子，故意不启动那个直接叶子**。
+手工起（而不是 `demo.sh start`）是因为后者会重建子节点目录、**换掉 NodeID**。
+
+> 两个附带的坑，都写在脚本注释里：
+> ① 必须等**中继自己的子**也注册完再提交指令 —— 不等的话，中继那份**逐跳递减**的死线先到，
+> 它会按超时上报，根就跟着按失败策略收敛，根本轮不到根自己的死线；
+> ② `shortID` 只取 NodeID 前 8 位，而 NodeID 是 UUIDv7（时间有序）—— 同一毫秒启动的两个子
+> 前缀会一样，所以脚本在做"点名的是谁"这条断言前会先确认这次没撞前缀。
+
+## 信任锚自举怎么验（`zero-trust.sh`）
+
+前面几个脚本看的是"树跑得对不对 / 镜像一致 / CA 轮换 / 每节点调外部 API / 背压 / 收尾语义"；
+`zero-trust.sh` 看的是**部署面**那一条：**子节点的信任锚可以从自己的证书链推出来**
+（`identity.ChainAnchors`），于是"入网成功之后 `trust/` 与 `security.ca_cert_paths` 都可以删掉"。
+
+```bash
+./zero-trust.sh          # 跑完整验证，结束后自动清场
+./zero-trust.sh keep     # 跑完留着树（自己 ./zero-trust.sh stop 收）
+```
+
+它串起九步，每一步都断言一件**硬事实**：
+
+| 步 | 断言 |
+|---|---|
+| ⓪ | `scripts/init_root.sh` 的**零参数**形态：材料落在**当前目录**、NodeID 现场生成 UUIDv7（证书 CN 就是它），且 `node.yaml` 里**不写** `node.id` 也能起来 —— 程序按 ADR-050 从证书身份读回同一枚 ID |
+| ① | 根自签上线（`init_root.sh` + HTTP API） |
+| ② | 中继用**父（根）的** `certs/node.crt.ca` 入网成功（锚的口径是"你的父"，不是"树的根"） |
+| ③ | **只删 `trust/`、配置里仍写着 `ca_cert_paths` ⇒ 必须拒绝启动**（fail-fast，不静默降级） |
+| ④ | 连 `ca_cert_paths` 一起删 ⇒ 启动成功 + 注册成功 + 日志如实说明锚的来源（`from_credential=1 from_self_chain=1`，两者内嵌的都是同一张根 CA，去重后 1 张） |
+| ⑤ | 叶子拿到的是**父（中继）的** CA 而不是根 CA：整份文件含 2 张证书、首张 CN 含中继 ID |
+| ⑥ | 叶子同样删锚后仍能起来 —— 这一步同时证明**中继能用自举锚验自己子的证书** |
+| ⑦ | 无证书 + 无任何锚 ⇒ **必须拒绝启动**（首跳没有可验的锚，谁也不许裸奔） |
+| ⑧ | 整树指令跑到 `COMPLETED`（证明这棵树"能用"，而不只是"能起来"） |
+
+> 为什么第 ③ 步要单独当一条断言：`ca_cert_paths` 配了就必须存在，这是**刻意**的 fail-fast ——
+> 静默降级成"没有锚"会让节点起来以后以"谁都不信"的状态空转，比启动直接失败难查得多。
+
+脚本自身有两道**防假通过**的措施，改动它时别删：① 每次启动一个节点前先把上一份日志挪成
+`<名字>.prev.log` 再建空文件 —— 否则"等待某条日志出现"的断言会命中**上一次启动**的记录而假通过
+（实测踩到：第 ④ 步重启中继时 `wait_registered` 立刻命中第 ② 步那条 `msg=registered`）；
+② 开跑前用 `lsof` 体检端口，占用即**明确失败** —— 上一轮被断言中断时留下的旧节点照样在监听，
+不查就会让"根已上线"变成本次验收串到旧树上的假象。
+
+## 入网授权策略怎么验（`enroll-policy.sh`）
+
+`zero-trust.sh` 看的是"信任锚从哪来"，`enroll-policy.sh` 看的是**另一半：谁可以进来、凭什么进来**。
+这两件事正交 —— 锚管"对端是不是我父"（身份），许可管"父要不要收我"（授权），缺一不可。
+**入网认证只有许可一个口径**（曾经的 `allow_ids` 白名单已删除，见下第 ④ 步）。
+
+```bash
+./enroll-policy.sh          # 跑完自动清场
+./enroll-policy.sh keep     # 跑完留着树（自己 ./enroll-policy.sh stop 收）
+```
+
+它串起六步，每步都断言一件硬事实：
+
+| 步 | 断言 |
+|---|---|
+| ① | 父端产出**入网引导凭据**（`scripts/make_bootstrap.sh`：permit + 自己的 CA 链） |
+| ② | 子节点**只带这一份凭据**就能入网 —— 目录里没有 `trust/`、也没配 `ca_cert_paths` |
+| ③ | 许可串不对 ⇒ `ERR_ENROLL_BAD_PERMIT`，且**没有签发任何证书** |
+| ④ | **父端没配许可** ⇒ `ERR_ENROLL_NO_PERMIT_POLICY`，同样不签证书。这条正是"**自报一个公开 NodeID + 自建一对密钥**"那条授权绕过的回归 —— 当年"配了 `allow_ids` 白名单、没配许可"也放行；该字段已删除，现在入网认证只留许可一个口径 |
+| ⑤ | 把凭据放回后又能正常入网（证明第 ④ 步拒的是"没有许可"，不是把树弄坏了） |
+
+> 三条断言都额外检查了"**证书文件根本没被写出来**"—— 光有错误码不代表没绕过。
+>
+> 两个容易写错的细节（都踩过）：① 父端配置里 `enrollment` 是 `security` 的子键，
+> 追加时若落到 `api:` 后面就会被当成未知键**静默忽略**（程序是非严格 YAML），
+> 于是"看起来配了"其实没生效；② 配置里不写 `token_path` 时，约定会自动补 `enroll.token`
+> **只要目录里真有这个文件** ⇒ "文件在"就等于"父端有许可"，第 ④/⑥ 步必须先把文件挪走。
+
 ## 运行产物（都已 gitignore）
 
 `demo.sh` / `selfupdate.sh` 只在**本目录**下产出这些东西，不会污染仓库其它位置，也不需要提交：
@@ -104,5 +276,10 @@ Python 3（系统自带的 3.9 就能跑）与一个能访问到的 treecmd 根�
 | `logs/` | 各节点与控制台的日志 |
 | `.demo.pids` | 进程 pid 表（`stop` / `status` 用） |
 | `.selfupdate/` | `selfupdate.sh` 的工作区：各节点的二进制副本与节点目录 |
+| `zerotrust/` + `.zerotrust.pids` | `zero-trust.sh` 的工作区：一棵三层小树的节点目录、日志与 pid 表 |
+| `enroll-policy/` + `.enroll-policy.pids` | `enroll-policy.sh` 的工作区：一个根 + 一个反复重入网的子节点 |
 
-想彻底清干净：`./demo.sh stop && ./selfupdate.sh stop && rm -rf demo logs .demo.pids .selfupdate`。
+想彻底清干净：`./demo.sh stop && ./selfupdate.sh stop && ./zero-trust.sh stop && ./enroll-policy.sh stop && rm -rf demo zerotrust enroll-policy logs .demo.pids .selfupdate .zerotrust.pids .enroll-policy.pids`。
+
+> 各验收脚本自己清场时一律用 `mv` 把上一轮状态挪到临时目录、**不用 `rm`** ——
+> 本仓库的测试环境踩过"批量删除被沙箱拦下、脚本半途而废"的坑；挪走还顺便留了现场可回查。

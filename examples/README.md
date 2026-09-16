@@ -28,6 +28,9 @@ parents:
     addr: 127.0.0.1:19443
 ```
 
+材料上再加**密钥对 + 父的 CA 证书链 + 入网许可**就能起（见第 2 节脚注 ⁴：`trust/` 里放的是
+**父**的 `certs/node.crt.ca`，不是根的 CA；而它只在首次入网时用得着）。
+
 ---
 
 ## 2. 每个节点的目录里该有什么
@@ -43,13 +46,22 @@ parents:
 | `certs/node.crt` | 本节点**身份证书** | 根：自签；其余：**向父入网换取**¹（程序签发） | 必需¹ | 必需¹ | 必需 |
 | `certs/node.crt.ca` | 本节点**CA 证书**（给子签发） | 父在入网时一并签发；根由 `init_root.sh` 产出 | — | 必需 | 必需 |
 | `keys/ca` | 本节点**CA 私钥**（给子签发）² | `treecmd-node -genkey -with-ca` | — | 必需 | 必需 |
-| `trust/*.crt` | **信任锚**（校验父与对端） | 部署时投放（根自签的 CA 证书） | 必需 | 必需 | 可选³ |
-| `enroll.token` | **入网许可**（与父端一致，`chmod 600`） | 部署时投放（两边内容必须一致） | 需要入网时 | 需要入网时 | — |
+| `trust/*.crt` | **信任锚**（校验父与对端）⁴ | 部署时投放（**父的** CA 证书链） | 可选⁵ | 可选⁵ | 可选³ |
+| `enroll.token` | **入网引导凭据**（许可 + 父的 CA 链）⁵ | `scripts/make_bootstrap.sh <父目录>` 产出，**整份**拷给子节点 | 需要入网时 | 需要入网时 | — |
 
 > ¹ 叶子 / 中继可以先**不放**身份证书：启动会以"待入网"状态起来，向父申请，由父用它自己的 CA 私钥签发后写入 `certs/node.crt`。**根没有父可签发，所以必须自带。**
 > ² CA 私钥**必须是你自己预置的**（默认路径 `keys/ca`）—— 父不可能把自己的私钥给你。
 > 这就是 `-genkey` 要加 `-with-ca` 的原因。
 > ³ 根缺省会拿自己的 CA 证书当信任锚。
+> ⁴ **口径是"你的父"，不是"树的根"**：放父的 `certs/node.crt.ca`（**整份文件**，内容含父 CA
+> 一路到根）就行，**不需要从根拷任何东西** —— 每个节点只对自己的父节点负责。
+> ⚠️ 要放**整份文件**：只截取"父那一张"、把根漏掉的话，**上级节点签发的跨跳委托
+> （`ReqAuth`）在孙节点上会验不过** —— 那些链的末端是根。
+> ⁵ **推荐做法是只用 `enroll.token` 这一份文件**：它由父产出，里面同时装着
+> ①**入网许可**（父授权你进来 —— 这是"父要不要收我"的**唯一**判据）
+> ②**父的 CA 证书链**（首跳要能验到父）。凭据里既然带了锚，`trust/` 与 `security.ca_cert_paths`
+> 就都不用配了；而入网成功后连凭据也可以删 —— 信任锚会从**本节点自己的证书链**自举
+> （链本身就是 `[我, 父CA, …, 根CA]`）。
 
 生成密钥对的命令：
 
@@ -81,28 +93,37 @@ treecmd-node -genkey -keydir keys -with-ca
 mkdir -p trust certs && cp <根节点自签产出的 CA 证书> trust/
 cp ../../examples/node.yaml node.yaml        # 保留根形态：改 node.id / listen 即可
 treecmd-node -config node.yaml
+#   入网凭据由 scripts/init_root.sh 一并产出（enroll.token = 许可 + 根自己的 CA 链）
 
-# ② 根：投放入网许可（子节点要用同一串）
-printf 'your-shared-token' > enroll.token && chmod 600 enroll.token
-mkdir -p ../../relay/trust && cp trust/root_ca.crt ../../relay/trust/
-
-# ③ 中继：生成密钥对（含 CA，因为有下级）→ 启动
+# ② 中继：生成密钥对（含 CA，因为有下级）→ 拷**父（根）产出的凭据** → 启动
 cd /srv/treecmd/relay
 treecmd-node -genkey -keydir keys -with-ca
-printf 'your-shared-token' > enroll.token && chmod 600 enroll.token
+cp ../root/enroll.token enroll.token && chmod 600 enroll.token   # 一份文件：许可 + 根的 CA 链
 cp ../../examples/node.yaml node.yaml        # 照 node.yaml 头部"中继"那段增删：
                                              # 填自己的 id + listen，补 parents[]
 treecmd-node -config node.yaml               # 自动向父入网换证 → 自动注册
 
-# ④ 叶子：只要密钥对 + 信任锚 + 许可
+# ③ 中继：入网成功后给**自己的下级**产出凭据（它这时才拿到自己的 CA 证书）
+../../scripts/make_bootstrap.sh /srv/treecmd/relay
+
+# ④ 叶子：只要密钥对 + 一份父给的凭据
 cd /srv/treecmd/leaf
 treecmd-node -genkey -keydir keys            # 叶子不加 -with-ca
-mkdir -p trust && cp ../relay/trust/root_ca.crt trust/
-printf 'your-shared-token' > enroll.token && chmod 600 enroll.token
+cp ../relay/enroll.token enroll.token && chmod 600 enroll.token  # 凭证里已含中继的 CA 链
 cp ../../examples/node.yaml node.yaml        # 照 node.yaml 头部"叶"那段增删：
-                                             # 只留 node.id + parents[]（删掉 listen 与 ca_*）
+                                             # 只留 node.id + parents[] + enrollment
 treecmd-node -config node.yaml
+
+# ⑤ 入网成功之后：enroll.token 与 security.ca_cert_paths 都可以删了
+#    信任锚改由本节点自己的证书链自举（链里就带着父 CA 一路到根），
+#    日志里会出现「信任锚未配置 security.ca_cert_paths，来自…」并注明来源。
+#    —— 也就是说"再部署一个子节点"只需要：自己的密钥 + 父产出的那一份凭据。
 ```
+
+> **为什么每个子节点拿的是"自己父"给的凭据，而不是根给的**：凭据里内嵌的是**父自己的**
+> CA 证书链（含父 CA 一路到根）。链能不能验通只看"能否接到**某个**信任锚"，
+> 所以"放父的整条链"与"放根 CA"判定完全等价 —— 但子节点从此不必认识根，
+> 换父、换根都只影响它父那一层。
 
 ### 用附带脚本起停（推荐）
 
@@ -138,9 +159,9 @@ sleep 2 && curl -s "127.0.0.1:18443/v1/commands/$CID" | python3 -m json.tool
 | `command.*`、`health.*`、`query.*`、`persist.interval` | **SIGHUP 即刻生效**，不重注册 |
 | `security.trusted_origins`、`security.health_viewers`、`query.query_viewers` | **SIGHUP 即刻生效**，不重注册 |
 | `security.cert_reload.*` | **SIGHUP 即刻生效**，不重注册 |
-| `security.enrollment.token` / `token_path` / `challenge_ttl` | **SIGHUP 即刻生效**，不重注册（换 token 不需要重注册） |
+| `security.enrollment.token` / `token_path` / `challenge_ttl` | **SIGHUP 即刻生效**，不重注册（换凭据不需要重注册） |
 | `selfupdate.*` | **SIGHUP 即刻生效**，不重注册。⚠️ 它**不在父可下发的白名单里**（`ConfigPush` 只接受 `command./health./query./persist.`），全树改这一项要逐节点改文件 + SIGHUP |
-| `node.id`、`node.listen`、`parents[]`、`security.identity_*`、`security.ca_*`、`security.enrollment.enabled|allow_ids`、`registration.backfill` | **SIGHUP ⇒ 自动触发全量重注册**（这些进 `config_hash`，旧会话作废并重连） |
+| `node.id`、`node.listen`、`parents[]`、`security.identity_*`、`security.ca_*`、`security.enrollment.enabled`、`registration.backfill` | **SIGHUP ⇒ 自动触发全量重注册**（这些进 `config_hash`，旧会话作废并重连） |
 
 **证书相关（不由 `node.yaml` 控制；签发与续期在程序里，文件被替换时由外部触发重载）：**
 
@@ -177,7 +198,9 @@ sleep 2 && curl -s "127.0.0.1:18443/v1/commands/$CID" | python3 -m json.tool
 | `cert identity "X" != node id "Y"` | `node.id` 与证书里的身份不一致 | 让两者统一（改 `node.id`，或让签发方按这个 ID 重签） |
 | `CA certificate ... missing（该节点有子节点，必须有 CA 材料）` | 根 / 中继缺 CA 证书 | 用 `-genkey -with-ca` 重新生成，或由脚本投放 `certs/node.crt.ca` |
 | `CA private key missing（本节点有子节点，必须预置）` | 根 / 中继缺 CA 私钥 | 同上（`-with-ca`） |
-| `security.ca_cert_paths: ... no such file or directory` | 信任锚路径不存在 / 目录是空的 | 投放 CA 证书到 `trust/`，或把 `ca_cert_paths` 指向正确位置 |
+| `security.ca_cert_paths: ... no such file or directory` | 信任锚路径不存在 / 目录是空的 | 投放**父的** CA 证书链到 `trust/`（父的 `certs/node.crt.ca` 整份文件），或把 `ca_cert_paths` 指向正确位置。⚠️ 已入网的节点要交给自举时，请把 `trust/` 目录**整个删掉**（并删掉 `ca_cert_paths`）—— 留一个**空目录**会被判成"配了锚却没证书"而拒绝启动 |
+| `trust anchor dir ...: 目录里没有证书文件` | `trust/` 存在但是空的（null 目录也会被当成"配了锚"） | 放一份父的 `certs/node.crt.ca` 进去；或删掉该目录与 `ca_cert_paths` 交给自举 |
+| `待入网但没有任何信任锚（security.ca_cert_paths）` | 还没有证书（首次入网），又没给任何锚 | 把**父的** `certs/node.crt.ca` 配进 `security.ca_cert_paths` —— 只要一份父的，不需要根 |
 | `lease constraint violated: renew_at(..)×3 > lease_ttl(..)` | 租约硬约束被违反 | 让 `renew_at × 3 ≤ lease_ttl`（默认 30s / 90s 正好满足） |
 | `invalid security.cert_reload.on_change` | 值写错 | 只能 `reconnect` 或 `lazy` |
 | `security.enrollment.token_path: no such file` | 配了 `token_path` 但文件不存在 | 投放 `enroll.token`（或改用 `token:` 直接写） |
@@ -188,12 +211,14 @@ sleep 2 && curl -s "127.0.0.1:18443/v1/commands/$CID" | python3 -m json.tool
 | 现象 | 排查方向 |
 |---|---|
 | 一直重连、日志有 `upstream session ended` | 父没起 / `parents[].addr` 写错（要填父的 **`listen`**，不是 `api.http_addr`）/ 父的端口没监听 |
-| `CERT_UNTRUSTED` / `peer chain untrusted` | 你节点的信任锚里没有**签发父证书的那个 CA** —— 把该 CA 投放进 `trust/` |
+| `CERT_UNTRUSTED` / `peer chain untrusted` | 你节点的信任锚里没有**签发父证书的那个 CA** —— 把**父的** `certs/node.crt.ca` 投放进 `trust/`（整份文件，含父 CA 到根） |
 | `peer identity "X" != expected "Y"` | `parents[].id` 写的不是父的真实 NodeID |
 | `ERR_CYCLE` | 环：这个 NodeID 出现在了自己的祖先链上（父的真实 ID 填错了，或拓扑配成了环） |
 | `CERT_REVOKED` | 该节点在本地 CRL 中（`curl /v1/crl` 可查） |
 | 健康检查里某些节点 `UNREACHABLE` | 该节点进程没起 / 网络不通 / 刚断线正在退避重连 |
-| 入网被拒（`ERR_ENROLL_*`） | 许可串与父端不一致；或父端配了 `allow_ids` 而没有把本节点 ID 列进去；或父端 `enrollment.enabled=false` |
+| 入网被拒（`ERR_ENROLL_*`） | `BAD_PERMIT` = 凭据里的许可与父端不一致（子端多半拿的是别的父的凭据）；`NO_PERMIT_POLICY` = **父端自己没配许可**，那它拒绝一切入网（入网认证只有许可一个口径）；`DISABLED` = 父端 `enrollment.enabled=false` |
+| `REFUSE TO START: 待入网但没有任何信任锚` | 手上还没有证书（无从自举），又没给锚 | 把**父产出的引导凭据**（`make_bootstrap.sh`）拷成本节点的 `enroll.token` —— 一份文件里既带许可也带父的 CA 链；或按脚注 ⁴ 单独投放父的 CA 链 |
+| `REFUSE TO START: …引导凭据…不合法` | `enroll.token` 内容不符合凭据格式（例如键被拼成 `permt=`） | 按 `internal/identity/bootstrap.go` 的格式修；或重新用 `make_bootstrap.sh` 产出 |
 
 > 排错第一步永远是：**启动日志**（`REFUSE TO START: ...` 那行 + 后面写清的原因），
 > 以及在任一开了 API 的节点上看 `/v1/tree`（谁在线、谁跑的是哪份镜像）与 `/metrics`。
@@ -220,7 +245,8 @@ sleep 2 && curl -s "127.0.0.1:18443/v1/commands/$CID" | python3 -m json.tool
 - [ ] 每个节点一个独立目录、一份 `node.yaml`，`node.id` 全局唯一且与证书身份一致
 - [ ] 私钥 + 公钥已生成（`-genkey`）；根 / 中继加了 `-with-ca`
 - [ ] 根 / 中继有 `certs/node.crt.ca` 与 `keys/ca`
-- [ ] 所有非根节点的 `trust/` 里有**签发父证书的那个 CA**
+- [ ] 首次入网的节点拿到了**自己父的** `certs/node.crt.ca`（整份文件，含父 CA 到根）—— **不需要从根拷**
+- [ ] 入网成功的节点：`security.ca_cert_paths` 可以整段不写（信任锚从自己的证书链自举，日志有对应一行）
 - [ ] 子节点的 `parents[].id` / `addr` 填的是父的**真实 NodeID / `listen` 地址**
 - [ ] 入网许可在父端与子端一致（`chmod 600`）
 - [ ] 每个节点都能启动成功（日志里没有 `REFUSE TO START`）
