@@ -1124,8 +1124,17 @@ type AssignmentRecord struct {
 	// delivered_attempt = 最近一次实际投递使用的 attempt
 	NextAttempt      uint64 `protobuf:"varint,16,opt,name=next_attempt,json=nextAttempt,proto3" json:"next_attempt,omitempty"`
 	DeliveredAttempt uint64 `protobuf:"varint,17,opt,name=delivered_attempt,json=deliveredAttempt,proto3" json:"delivered_attempt,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// ---- 下发背压：连续被 LocalBusy 退回的次数（见 README「下发即执行」）----
+	// 父端据此做**指数退避**：退避 = min(local_busy_backoff << (streak-1), local_busy_backoff_max)。
+	// 归零只有两个时机，都在代码里写死：
+	//
+	//	① 收到 InflightHint（子明确报告"我正在跑 attempt N"）—— 唯一正向证据；
+	//	② 租约回收（子可能已重启，状态不可知 ⇒ 重新开始计数）。
+	//
+	// 目的：同一批指令同时被退回时，重投时刻自然错开，避免"每 3 秒齐刷刷重投一次"的同步风暴。
+	LocalBusyStreak int32 `protobuf:"varint,18,opt,name=local_busy_streak,json=localBusyStreak,proto3" json:"local_busy_streak,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *AssignmentRecord) Reset() {
@@ -1273,6 +1282,13 @@ func (x *AssignmentRecord) GetNextAttempt() uint64 {
 func (x *AssignmentRecord) GetDeliveredAttempt() uint64 {
 	if x != nil {
 		return x.DeliveredAttempt
+	}
+	return 0
+}
+
+func (x *AssignmentRecord) GetLocalBusyStreak() int32 {
+	if x != nil {
+		return x.LocalBusyStreak
 	}
 	return 0
 }
@@ -2703,10 +2719,18 @@ type RegisterRequest struct {
 	// 本节点**可执行文件**的哈希（"sha256:" + 十六进制）与字节数，随每次注册 / 重注册上行。
 	// 空串 = 本节点算不出自己的哈希（读不到可执行文件），此时父端不做任何判定。
 	// 父端只用它做展示（/v1/tree 里能看见"每个子跑的是哪份镜像"），不参与任何签名。
-	BinaryHash    string `protobuf:"bytes,12,opt,name=binary_hash,json=binaryHash,proto3" json:"binary_hash,omitempty"`
-	BinarySize    int64  `protobuf:"varint,13,opt,name=binary_size,json=binarySize,proto3" json:"binary_size,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	BinaryHash string `protobuf:"bytes,12,opt,name=binary_hash,json=binaryHash,proto3" json:"binary_hash,omitempty"`
+	BinarySize int64  `protobuf:"varint,13,opt,name=binary_size,json=binarySize,proto3" json:"binary_size,omitempty"`
+	// 本节点**自己的 CA 证书**剩余有效天数（只有根 / 中继持有 CA 证书；叶子恒为 0）。
+	//
+	// 为什么由子上报：父手上只有子的**身份**证书（mTLS 握手拿到的就是叶子证书），
+	// 完全不知道子的 CA 证书什么时候过期。而 CA 证书过期会让那个节点**下次启动直接
+	// REFUSE TO START**，所以必须让父能在 /v1/tree 里提前看见。
+	//
+	// 同样只作展示用途，不参与任何判定与签名（父不会用它来触发续签 —— 续签由子自己请求）。
+	CaNotAfterDays int32 `protobuf:"varint,14,opt,name=ca_not_after_days,json=caNotAfterDays,proto3" json:"ca_not_after_days,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *RegisterRequest) Reset() {
@@ -2812,6 +2836,13 @@ func (x *RegisterRequest) GetBinaryHash() string {
 func (x *RegisterRequest) GetBinarySize() int64 {
 	if x != nil {
 		return x.BinarySize
+	}
+	return 0
+}
+
+func (x *RegisterRequest) GetCaNotAfterDays() int32 {
+	if x != nil {
+		return x.CaNotAfterDays
 	}
 	return 0
 }
@@ -5037,6 +5068,7 @@ type UpFrame struct {
 	//	*UpFrame_QueryResp
 	//	*UpFrame_QueryData
 	//	*UpFrame_BinaryReq
+	//	*UpFrame_BinaryManifestReq
 	Frame         isUpFrame_Frame `protobuf_oneof:"frame"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -5226,6 +5258,15 @@ func (x *UpFrame) GetBinaryReq() *BinaryReq {
 	return nil
 }
 
+func (x *UpFrame) GetBinaryManifestReq() *BinaryManifestReq {
+	if x != nil {
+		if x, ok := x.Frame.(*UpFrame_BinaryManifestReq); ok {
+			return x.BinaryManifestReq
+		}
+	}
+	return nil
+}
+
 type isUpFrame_Frame interface {
 	isUpFrame_Frame()
 }
@@ -5286,6 +5327,13 @@ type UpFrame_BinaryReq struct {
 	BinaryReq *BinaryReq `protobuf:"bytes,17,opt,name=binary_req,json=binaryReq,proto3,oneof"` // 申请父下发它的可执行文件（子连上后发现自己与父不一致时）
 }
 
+type UpFrame_BinaryManifestReq struct {
+	// 申请"这份镜像由哪些片组成、每片 sha256 是多少"（见 BinaryManifestReq 的注释）。
+	// 旧版本父收到这一帧会当成未知字段忽略 —— 子端必须能在清单请求超时后回退到
+	// "只靠 crc32 + 整份 sha256"的老流程，不能因为拿不到清单就不工作。
+	BinaryManifestReq *BinaryManifestReq `protobuf:"bytes,19,opt,name=binary_manifest_req,json=binaryManifestReq,proto3,oneof"`
+}
+
 func (*UpFrame_Register) isUpFrame_Frame() {}
 
 func (*UpFrame_Resume) isUpFrame_Frame() {}
@@ -5313,6 +5361,8 @@ func (*UpFrame_QueryResp) isUpFrame_Frame() {}
 func (*UpFrame_QueryData) isUpFrame_Frame() {}
 
 func (*UpFrame_BinaryReq) isUpFrame_Frame() {}
+
+func (*UpFrame_BinaryManifestReq) isUpFrame_Frame() {}
 
 type HealthResp struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -5385,6 +5435,7 @@ type DownFrame struct {
 	//	*DownFrame_RevocationList
 	//	*DownFrame_CertRenewOffer
 	//	*DownFrame_BinaryChunk
+	//	*DownFrame_BinaryManifest
 	Frame         isDownFrame_Frame `protobuf_oneof:"frame"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -5558,6 +5609,15 @@ func (x *DownFrame) GetBinaryChunk() *BinaryChunk {
 	return nil
 }
 
+func (x *DownFrame) GetBinaryManifest() *BinaryManifest {
+	if x != nil {
+		if x, ok := x.Frame.(*DownFrame_BinaryManifest); ok {
+			return x.BinaryManifest
+		}
+	}
+	return nil
+}
+
 type isDownFrame_Frame interface {
 	isDownFrame_Frame()
 }
@@ -5614,6 +5674,11 @@ type DownFrame_BinaryChunk struct {
 	BinaryChunk *BinaryChunk `protobuf:"bytes,15,opt,name=binary_chunk,json=binaryChunk,proto3,oneof"` // 父推送自己那份可执行文件的分片（响应 BinaryReq）
 }
 
+type DownFrame_BinaryManifest struct {
+	// 分片清单（响应 BinaryManifestReq）：父先给清单、再推片。
+	BinaryManifest *BinaryManifest `protobuf:"bytes,17,opt,name=binary_manifest,json=binaryManifest,proto3,oneof"`
+}
+
 func (*DownFrame_RegisterAck) isDownFrame_Frame() {}
 
 func (*DownFrame_CommandNotify) isDownFrame_Frame() {}
@@ -5639,6 +5704,8 @@ func (*DownFrame_RevocationList) isDownFrame_Frame() {}
 func (*DownFrame_CertRenewOffer) isDownFrame_Frame() {}
 
 func (*DownFrame_BinaryChunk) isDownFrame_Frame() {}
+
+func (*DownFrame_BinaryManifest) isDownFrame_Frame() {}
 
 type ConfigPush struct {
 	state  protoimpl.MessageState `protogen:"open.v1"`
@@ -5809,9 +5876,15 @@ func (*CRLReq) Descriptor() ([]byte, []int) {
 
 // 证书续签：父 → 子即时换发（父无法对子发起 RPC，见 5.6）
 type CertRenewOffer struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	CertChain     []byte                 `protobuf:"bytes,1,opt,name=cert_chain,json=certChain,proto3" json:"cert_chain,omitempty"` // 新的身份证书链（PEM 串接）；身份密钥与 NodeID 不变
-	Reason        string                 `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	CertChain []byte                 `protobuf:"bytes,1,opt,name=cert_chain,json=certChain,proto3" json:"cert_chain,omitempty"` // 新的身份证书链（PEM 串接）；身份密钥与 NodeID 不变
+	Reason    string                 `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`
+	// 新的 **CA 证书链**（PEM 串接）。只在子节点请求了 `want_ca` 且父签发成功时非空。
+	//
+	// 轮换的是**证书**不是密钥：内容里的 CA 公钥与子节点原来那张**完全相同**，
+	// 所以子节点已入网的下一级手里的旧 CA 证书仍然有效、信任锚（根）也完全不用动
+	// —— 这是"CA 证书能在线轮换而不用全树重新分发 trust/"的全部依据。
+	CaCertChain   []byte `protobuf:"bytes,3,opt,name=ca_cert_chain,json=caCertChain,proto3" json:"ca_cert_chain,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -5860,9 +5933,22 @@ func (x *CertRenewOffer) GetReason() string {
 	return ""
 }
 
+func (x *CertRenewOffer) GetCaCertChain() []byte {
+	if x != nil {
+		return x.CaCertChain
+	}
+	return nil
+}
+
 type CertRenewReq struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Reason        string                 `protobuf:"bytes,1,opt,name=reason,proto3" json:"reason,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Reason string                 `protobuf:"bytes,1,opt,name=reason,proto3" json:"reason,omitempty"`
+	// 是否顺带请求续签本节点的 **CA 证书**（只有持有 CA 材料的中继 / 根会置位）。
+	WantCa bool `protobuf:"varint,2,opt,name=want_ca,json=wantCa,proto3" json:"want_ca,omitempty"`
+	// 本节点**当前**的 CA 叶子证书（DER，非 PEM）。父据此确认"要续的是同一把密钥"：
+	// 父会校验它 IsCA、有 certSign、CN 含子节点 ID、能验到本树的根，且公钥与将要签发的一致。
+	// 不这么绑的话，子节点就能借"续签"之名悄悄换掉 CA 密钥 —— 那是另一件事（需要重分发 trust/）。
+	CaCert        []byte `protobuf:"bytes,3,opt,name=ca_cert,json=caCert,proto3" json:"ca_cert,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -5902,6 +5988,20 @@ func (x *CertRenewReq) GetReason() string {
 		return x.Reason
 	}
 	return ""
+}
+
+func (x *CertRenewReq) GetWantCa() bool {
+	if x != nil {
+		return x.WantCa
+	}
+	return false
+}
+
+func (x *CertRenewReq) GetCaCert() []byte {
+	if x != nil {
+		return x.CaCert
+	}
+	return nil
 }
 
 // 重连对账（3.7）：子上报本地仍未终态的指令，父离线验 origin 签名后重建
@@ -6045,10 +6145,15 @@ func (x *EvictedEntry) GetExpireAt() *timestamppb.Timestamp {
 // ============================================================================
 // 运行期入网签发（7.10）：子节点**没有自带证书**时的上线路径
 // ============================================================================
-// 这两条 RPC 是唯一"允许客户端不提供证书"的入口（服务端按 ALPN `treecmd-enroll/1` 分流放行），
-// 所以鉴权必须自己扛住：一次性 nonce（防重放）+ 私钥持有证明 PoP（防拿别人的公钥申请）
-// + 入网许可 token / allow_ids 白名单。签发只做一件事：**用父自己的 CA 私钥签子提交的公钥** ——
-// 任何私钥都由子机本地持有，程序绝不代生成、也不回传。
+// 这两条 RPC 是唯一"允许客户端不提供证书"的入口（服务端按 **SNI 前缀 `enroll.`** 分流放行；
+// 不用 ALPN 是因为 gRPC 要求协商结果必须是 h2）。所以鉴权必须自己扛住：
+// 一次性 nonce（防重放）、私钥持有证明 PoP（防拿别人的公钥申请）、入网许可 token（唯一的授权判据）。
+//
+// 为什么"许可"是唯一的授权判据：NodeID 是公开信息（`/v1/tree` 就能读到），且与密钥对之间
+// 没有任何密码学绑定 —— 用"ID 名单"挡不住"自报某个 ID + 自建一对密钥"。
+//
+// 签发只做一件事：**用父自己的 CA 私钥签子提交的公钥**；任何私钥都由子机本地持有，
+// 程序绝不代生成、也不回传。
 type EnrollChallengeReq struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"` // 申请方自报 NodeID（只用于把 nonce 绑定到这次申请，本身不构成信任）
@@ -6358,7 +6463,12 @@ type BinaryReq struct {
 	// 父端逐字节比对，不等即拒（ERR_BINARY_HASH_MISMATCH）—— 避免"申请到一份已经变了的镜像"。
 	WantHash string `protobuf:"bytes,1,opt,name=want_hash,json=wantHash,proto3" json:"want_hash,omitempty"`
 	// 申请方愿意接收的字节上限；0 = 用父端配置的上限。父按 min(本字段, 父端上限) 截断。
-	MaxBytes      int64 `protobuf:"varint,2,opt,name=max_bytes,json=maxBytes,proto3" json:"max_bytes,omitempty"`
+	MaxBytes int64 `protobuf:"varint,2,opt,name=max_bytes,json=maxBytes,proto3" json:"max_bytes,omitempty"`
+	// 从第几片开始给（断点续传）。0 = 从头开始（与不传等价）。
+	//
+	// 申请方扫自己的片存后把"已经验证通过的连续前缀长度"填进来 —— 必须落在片边界上，
+	// 父端从这一片起推。这样中断一次（父重启 / 网络抖动 / 本节点 OOM）不必从 0 重来。
+	FromIndex     int64 `protobuf:"varint,3,opt,name=from_index,json=fromIndex,proto3" json:"from_index,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6407,6 +6517,140 @@ func (x *BinaryReq) GetMaxBytes() int64 {
 	return 0
 }
 
+func (x *BinaryReq) GetFromIndex() int64 {
+	if x != nil {
+		return x.FromIndex
+	}
+	return 0
+}
+
+// 清单请求：子 → 父，申请"这份镜像由哪些片组成、每片的 sha256 是多少"。
+//
+// 为什么要先要清单：分片帧上只有 crc32（**只查传输损坏**），而"边收边转发"要求
+// 中继把片转发给自己的直接子之前就能证明"这一片确实是那份镜像里的一片"。
+// 所以片级校验必须升级为 sha256，而 sha256 清单只能由持有完整镜像的一方（父）给出。
+type BinaryManifestReq struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	WantHash      string                 `protobuf:"bytes,1,opt,name=want_hash,json=wantHash,proto3" json:"want_hash,omitempty"` // 期望的整份哈希；父逐字节比对，不等即拒
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BinaryManifestReq) Reset() {
+	*x = BinaryManifestReq{}
+	mi := &file_node_proto_msgTypes[65]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BinaryManifestReq) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BinaryManifestReq) ProtoMessage() {}
+
+func (x *BinaryManifestReq) ProtoReflect() protoreflect.Message {
+	mi := &file_node_proto_msgTypes[65]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BinaryManifestReq.ProtoReflect.Descriptor instead.
+func (*BinaryManifestReq) Descriptor() ([]byte, []int) {
+	return file_node_proto_rawDescGZIP(), []int{65}
+}
+
+func (x *BinaryManifestReq) GetWantHash() string {
+	if x != nil {
+		return x.WantHash
+	}
+	return ""
+}
+
+// 清单响应：父 → 子。给了清单之后父才开始推片。
+type BinaryManifest struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Hash      string                 `protobuf:"bytes,1,opt,name=hash,proto3" json:"hash,omitempty"`                             // 整份 sha256（与 RegisterAck.server_binary_hash 一致）
+	Size      int64                  `protobuf:"varint,2,opt,name=size,proto3" json:"size,omitempty"`                            // 整份字节数
+	ChunkSize int64                  `protobuf:"varint,3,opt,name=chunk_size,json=chunkSize,proto3" json:"chunk_size,omitempty"` // 片大小（父端 selfupdate.chunk_size 的实际取值）
+	// 每片一个 sha256（32 字节），顺序与片号一致。长度 × chunk_size 应覆盖 size。
+	PieceSha256   [][]byte `protobuf:"bytes,4,rep,name=piece_sha256,json=pieceSha256,proto3" json:"piece_sha256,omitempty"`
+	Reason        string   `protobuf:"bytes,5,opt,name=reason,proto3" json:"reason,omitempty"` // 非空 = 不支持 / 出错（如旧版本父），此时其余字段无意义
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BinaryManifest) Reset() {
+	*x = BinaryManifest{}
+	mi := &file_node_proto_msgTypes[66]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BinaryManifest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BinaryManifest) ProtoMessage() {}
+
+func (x *BinaryManifest) ProtoReflect() protoreflect.Message {
+	mi := &file_node_proto_msgTypes[66]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BinaryManifest.ProtoReflect.Descriptor instead.
+func (*BinaryManifest) Descriptor() ([]byte, []int) {
+	return file_node_proto_rawDescGZIP(), []int{66}
+}
+
+func (x *BinaryManifest) GetHash() string {
+	if x != nil {
+		return x.Hash
+	}
+	return ""
+}
+
+func (x *BinaryManifest) GetSize() int64 {
+	if x != nil {
+		return x.Size
+	}
+	return 0
+}
+
+func (x *BinaryManifest) GetChunkSize() int64 {
+	if x != nil {
+		return x.ChunkSize
+	}
+	return 0
+}
+
+func (x *BinaryManifest) GetPieceSha256() [][]byte {
+	if x != nil {
+		return x.PieceSha256
+	}
+	return nil
+}
+
+func (x *BinaryManifest) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
 // 分片帧：一片一个 DownFrame，父端顺序推、子端顺序收（不重排、不重传）。
 // 失败 / 拒绝也走这条帧（payload 为空 + reason 非空），这样子端只维护一个收帧通道。
 type BinaryChunk struct {
@@ -6426,7 +6670,7 @@ type BinaryChunk struct {
 
 func (x *BinaryChunk) Reset() {
 	*x = BinaryChunk{}
-	mi := &file_node_proto_msgTypes[65]
+	mi := &file_node_proto_msgTypes[67]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6438,7 +6682,7 @@ func (x *BinaryChunk) String() string {
 func (*BinaryChunk) ProtoMessage() {}
 
 func (x *BinaryChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_node_proto_msgTypes[65]
+	mi := &file_node_proto_msgTypes[67]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6451,7 +6695,7 @@ func (x *BinaryChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BinaryChunk.ProtoReflect.Descriptor instead.
 func (*BinaryChunk) Descriptor() ([]byte, []int) {
-	return file_node_proto_rawDescGZIP(), []int{65}
+	return file_node_proto_rawDescGZIP(), []int{67}
 }
 
 func (x *BinaryChunk) GetHash() string {
@@ -6577,7 +6821,7 @@ const file_node_proto_rawDesc = "" +
 	"\x05Lease\x12\x14\n" +
 	"\x05owner\x18\x01 \x01(\tR\x05owner\x127\n" +
 	"\texpire_at\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\bexpireAt\x12\x18\n" +
-	"\aattempt\x18\x03 \x01(\x04R\aattempt\"\x8a\x06\n" +
+	"\aattempt\x18\x03 \x01(\x04R\aattempt\"\xb6\x06\n" +
 	"\x10AssignmentRecord\x12\x1d\n" +
 	"\n" +
 	"command_id\x18\x01 \x01(\tR\tcommandId\x12\x19\n" +
@@ -6599,7 +6843,8 @@ const file_node_proto_rawDesc = "" +
 	"\x0fderived_command\x18\x0e \x01(\fR\x0ederivedCommand\x12,\n" +
 	"\x12inflight_hint_seen\x18\x0f \x01(\bR\x10inflightHintSeen\x12!\n" +
 	"\fnext_attempt\x18\x10 \x01(\x04R\vnextAttempt\x12+\n" +
-	"\x11delivered_attempt\x18\x11 \x01(\x04R\x10deliveredAttempt\"\xd8\x02\n" +
+	"\x11delivered_attempt\x18\x11 \x01(\x04R\x10deliveredAttempt\x12*\n" +
+	"\x11local_busy_streak\x18\x12 \x01(\x05R\x0flocalBusyStreak\"\xd8\x02\n" +
 	"\x12LocalCommandRecord\x12\x1d\n" +
 	"\n" +
 	"command_id\x18\x01 \x01(\tR\tcommandId\x12;\n" +
@@ -6758,7 +7003,7 @@ const file_node_proto_rawDesc = "" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x18\n" +
 	"\amissing\x18\x02 \x03(\x05R\amissing\x12\x14\n" +
 	"\x05final\x18\x03 \x01(\bR\x05final\x12\x16\n" +
-	"\x06reason\x18\x04 \x01(\tR\x06reason\"\xe8\x02\n" +
+	"\x06reason\x18\x04 \x01(\tR\x06reason\"\x93\x03\n" +
 	"\x0fRegisterRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x16\n" +
 	"\x06pubkey\x18\x02 \x01(\fR\x06pubkey\x12\x10\n" +
@@ -6775,7 +7020,8 @@ const file_node_proto_rawDesc = "" +
 	"\vbinary_hash\x18\f \x01(\tR\n" +
 	"binaryHash\x12\x1f\n" +
 	"\vbinary_size\x18\r \x01(\x03R\n" +
-	"binarySizeJ\x04\b\x06\x10\aJ\x04\b\a\x10\bR\x06labelsR\fcapabilities\"\xa1\x03\n" +
+	"binarySize\x12)\n" +
+	"\x11ca_not_after_days\x18\x0e \x01(\x05R\x0ecaNotAfterDaysJ\x04\b\x06\x10\aJ\x04\b\a\x10\bR\x06labelsR\fcapabilities\"\xa1\x03\n" +
 	"\vRegisterAck\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x16\n" +
 	"\x06reason\x18\x02 \x01(\tR\x06reason\x12\x12\n" +
@@ -6983,7 +7229,7 @@ const file_node_proto_rawDesc = "" +
 	"payloadSig\x12\x14\n" +
 	"\x05final\x18\a \x01(\bR\x05final\x12\x1f\n" +
 	"\vsigner_cert\x18\b \x01(\fR\n" +
-	"signerCert\"\x89\a\n" +
+	"signerCert\"\xda\a\n" +
 	"\aUpFrame\x12#\n" +
 	"\rproto_version\x18\x01 \x01(\tR\fprotoVersion\x12\x17\n" +
 	"\amsg_seq\x18\x02 \x01(\x04R\x06msgSeq\x12\x17\n" +
@@ -7007,12 +7253,13 @@ const file_node_proto_rawDesc = "" +
 	"\n" +
 	"query_data\x18\r \x01(\v2\x15.treecmd.v1.QueryDataH\x00R\tqueryData\x126\n" +
 	"\n" +
-	"binary_req\x18\x11 \x01(\v2\x15.treecmd.v1.BinaryReqH\x00R\tbinaryReqB\a\n" +
+	"binary_req\x18\x11 \x01(\v2\x15.treecmd.v1.BinaryReqH\x00R\tbinaryReq\x12O\n" +
+	"\x13binary_manifest_req\x18\x13 \x01(\v2\x1d.treecmd.v1.BinaryManifestReqH\x00R\x11binaryManifestReqB\a\n" +
 	"\x05frame\"[\n" +
 	"\n" +
 	"HealthResp\x12\x15\n" +
 	"\x06req_id\x18\x01 \x01(\tR\x05reqId\x126\n" +
-	"\bresponse\x18\x02 \x01(\v2\x1a.treecmd.v1.HealthResponseR\bresponse\"\xfe\x06\n" +
+	"\bresponse\x18\x02 \x01(\v2\x1a.treecmd.v1.HealthResponseR\bresponse\"\xc5\a\n" +
 	"\tDownFrame\x12#\n" +
 	"\rproto_version\x18\x01 \x01(\tR\fprotoVersion\x12\x17\n" +
 	"\amsg_seq\x18\x02 \x01(\x04R\x06msgSeq\x12<\n" +
@@ -7033,7 +7280,8 @@ const file_node_proto_rawDesc = "" +
 	"\rheartbeat_ack\x18\f \x01(\v2\x18.treecmd.v1.HeartbeatAckH\x00R\fheartbeatAck\x12E\n" +
 	"\x0frevocation_list\x18\r \x01(\v2\x1a.treecmd.v1.RevocationListH\x00R\x0erevocationList\x12F\n" +
 	"\x10cert_renew_offer\x18\x0e \x01(\v2\x1a.treecmd.v1.CertRenewOfferH\x00R\x0ecertRenewOffer\x12<\n" +
-	"\fbinary_chunk\x18\x0f \x01(\v2\x17.treecmd.v1.BinaryChunkH\x00R\vbinaryChunkB\a\n" +
+	"\fbinary_chunk\x18\x0f \x01(\v2\x17.treecmd.v1.BinaryChunkH\x00R\vbinaryChunk\x12E\n" +
+	"\x0fbinary_manifest\x18\x11 \x01(\v2\x1a.treecmd.v1.BinaryManifestH\x00R\x0ebinaryManifestB\a\n" +
 	"\x05frame\"B\n" +
 	"\n" +
 	"ConfigPush\x12\x16\n" +
@@ -7045,13 +7293,16 @@ const file_node_proto_rawDesc = "" +
 	"\tsigner_id\x18\x03 \x01(\tR\bsignerId\x12\x10\n" +
 	"\x03sig\x18\x04 \x01(\fR\x03sig\x127\n" +
 	"\tissued_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\bissuedAt\"\b\n" +
-	"\x06CRLReq\"G\n" +
+	"\x06CRLReq\"k\n" +
 	"\x0eCertRenewOffer\x12\x1d\n" +
 	"\n" +
 	"cert_chain\x18\x01 \x01(\fR\tcertChain\x12\x16\n" +
-	"\x06reason\x18\x02 \x01(\tR\x06reason\"&\n" +
+	"\x06reason\x18\x02 \x01(\tR\x06reason\x12\"\n" +
+	"\rca_cert_chain\x18\x03 \x01(\fR\vcaCertChain\"X\n" +
 	"\fCertRenewReq\x12\x16\n" +
-	"\x06reason\x18\x01 \x01(\tR\x06reason\"c\n" +
+	"\x06reason\x18\x01 \x01(\tR\x06reason\x12\x17\n" +
+	"\awant_ca\x18\x02 \x01(\bR\x06wantCa\x12\x17\n" +
+	"\aca_cert\x18\x03 \x01(\fR\x06caCert\"c\n" +
 	"\tReconcile\x12\x1d\n" +
 	"\n" +
 	"command_id\x18\x01 \x01(\tR\tcommandId\x12\x18\n" +
@@ -7090,10 +7341,21 @@ const file_node_proto_rawDesc = "" +
 	"cert_chain\x18\x03 \x01(\fR\tcertChain\x12\"\n" +
 	"\rca_cert_chain\x18\x04 \x01(\fR\vcaCertChain\x12$\n" +
 	"\x0enot_after_unix\x18\x05 \x01(\x03R\fnotAfterUnix\x12\x1b\n" +
-	"\tissued_by\x18\x06 \x01(\tR\bissuedBy\"E\n" +
+	"\tissued_by\x18\x06 \x01(\tR\bissuedBy\"d\n" +
 	"\tBinaryReq\x12\x1b\n" +
 	"\twant_hash\x18\x01 \x01(\tR\bwantHash\x12\x1b\n" +
-	"\tmax_bytes\x18\x02 \x01(\x03R\bmaxBytes\"\xd7\x01\n" +
+	"\tmax_bytes\x18\x02 \x01(\x03R\bmaxBytes\x12\x1d\n" +
+	"\n" +
+	"from_index\x18\x03 \x01(\x03R\tfromIndex\"0\n" +
+	"\x11BinaryManifestReq\x12\x1b\n" +
+	"\twant_hash\x18\x01 \x01(\tR\bwantHash\"\x92\x01\n" +
+	"\x0eBinaryManifest\x12\x12\n" +
+	"\x04hash\x18\x01 \x01(\tR\x04hash\x12\x12\n" +
+	"\x04size\x18\x02 \x01(\x03R\x04size\x12\x1d\n" +
+	"\n" +
+	"chunk_size\x18\x03 \x01(\x03R\tchunkSize\x12!\n" +
+	"\fpiece_sha256\x18\x04 \x03(\fR\vpieceSha256\x12\x16\n" +
+	"\x06reason\x18\x05 \x01(\tR\x06reason\"\xd7\x01\n" +
 	"\vBinaryChunk\x12\x12\n" +
 	"\x04hash\x18\x01 \x01(\tR\x04hash\x12\x12\n" +
 	"\x04size\x18\x02 \x01(\x03R\x04size\x12\x14\n" +
@@ -7196,7 +7458,7 @@ func file_node_proto_rawDescGZIP() []byte {
 }
 
 var file_node_proto_enumTypes = make([]protoimpl.EnumInfo, 11)
-var file_node_proto_msgTypes = make([]protoimpl.MessageInfo, 66)
+var file_node_proto_msgTypes = make([]protoimpl.MessageInfo, 68)
 var file_node_proto_goTypes = []any{
 	(LocalExecState)(0),           // 0: treecmd.v1.LocalExecState
 	(CommandStatus)(0),            // 1: treecmd.v1.CommandStatus
@@ -7274,29 +7536,31 @@ var file_node_proto_goTypes = []any{
 	(*EnrollRequest)(nil),         // 73: treecmd.v1.EnrollRequest
 	(*EnrollResponse)(nil),        // 74: treecmd.v1.EnrollResponse
 	(*BinaryReq)(nil),             // 75: treecmd.v1.BinaryReq
-	(*BinaryChunk)(nil),           // 76: treecmd.v1.BinaryChunk
-	(*timestamppb.Timestamp)(nil), // 77: google.protobuf.Timestamp
+	(*BinaryManifestReq)(nil),     // 76: treecmd.v1.BinaryManifestReq
+	(*BinaryManifest)(nil),        // 77: treecmd.v1.BinaryManifest
+	(*BinaryChunk)(nil),           // 78: treecmd.v1.BinaryChunk
+	(*timestamppb.Timestamp)(nil), // 79: google.protobuf.Timestamp
 }
 var file_node_proto_depIdxs = []int32{
 	3,   // 0: treecmd.v1.Target.mode:type_name -> treecmd.v1.TargetMode
 	11,  // 1: treecmd.v1.Command.target:type_name -> treecmd.v1.Target
-	77,  // 2: treecmd.v1.Command.created_at:type_name -> google.protobuf.Timestamp
-	77,  // 3: treecmd.v1.Command.deadline:type_name -> google.protobuf.Timestamp
-	77,  // 4: treecmd.v1.Command.origin_deadline:type_name -> google.protobuf.Timestamp
+	79,  // 2: treecmd.v1.Command.created_at:type_name -> google.protobuf.Timestamp
+	79,  // 3: treecmd.v1.Command.deadline:type_name -> google.protobuf.Timestamp
+	79,  // 4: treecmd.v1.Command.origin_deadline:type_name -> google.protobuf.Timestamp
 	5,   // 5: treecmd.v1.Command.on_failure:type_name -> treecmd.v1.FailurePolicy
 	4,   // 6: treecmd.v1.Command.aggregate:type_name -> treecmd.v1.AggregateStrategy
 	12,  // 7: treecmd.v1.Command.hop_chain:type_name -> treecmd.v1.HopAttest
 	1,   // 8: treecmd.v1.CommandRecord.status:type_name -> treecmd.v1.CommandStatus
-	77,  // 9: treecmd.v1.CommandRecord.updated_at:type_name -> google.protobuf.Timestamp
-	77,  // 10: treecmd.v1.Lease.expire_at:type_name -> google.protobuf.Timestamp
+	79,  // 9: treecmd.v1.CommandRecord.updated_at:type_name -> google.protobuf.Timestamp
+	79,  // 10: treecmd.v1.Lease.expire_at:type_name -> google.protobuf.Timestamp
 	2,   // 11: treecmd.v1.AssignmentRecord.status:type_name -> treecmd.v1.AssignStatus
 	15,  // 12: treecmd.v1.AssignmentRecord.lease:type_name -> treecmd.v1.Lease
-	77,  // 13: treecmd.v1.AssignmentRecord.last_reclaim_at:type_name -> google.protobuf.Timestamp
-	77,  // 14: treecmd.v1.AssignmentRecord.updated_at:type_name -> google.protobuf.Timestamp
-	77,  // 15: treecmd.v1.AssignmentRecord.backoff_until:type_name -> google.protobuf.Timestamp
-	77,  // 16: treecmd.v1.AssignmentRecord.child_deadline:type_name -> google.protobuf.Timestamp
+	79,  // 13: treecmd.v1.AssignmentRecord.last_reclaim_at:type_name -> google.protobuf.Timestamp
+	79,  // 14: treecmd.v1.AssignmentRecord.updated_at:type_name -> google.protobuf.Timestamp
+	79,  // 15: treecmd.v1.AssignmentRecord.backoff_until:type_name -> google.protobuf.Timestamp
+	79,  // 16: treecmd.v1.AssignmentRecord.child_deadline:type_name -> google.protobuf.Timestamp
 	0,   // 17: treecmd.v1.LocalCommandRecord.local_state:type_name -> treecmd.v1.LocalExecState
-	77,  // 18: treecmd.v1.LocalCommandRecord.updated_at:type_name -> google.protobuf.Timestamp
+	79,  // 18: treecmd.v1.LocalCommandRecord.updated_at:type_name -> google.protobuf.Timestamp
 	18,  // 19: treecmd.v1.ChildAttest.descendants:type_name -> treecmd.v1.ChildAttest
 	10,  // 20: treecmd.v1.ResultRef.kind:type_name -> treecmd.v1.ResultRefKind
 	0,   // 21: treecmd.v1.Report.local_state:type_name -> treecmd.v1.LocalExecState
@@ -7305,21 +7569,21 @@ var file_node_proto_depIdxs = []int32{
 	0,   // 24: treecmd.v1.ChildReportRecord.local_state:type_name -> treecmd.v1.LocalExecState
 	19,  // 25: treecmd.v1.ChildReportRecord.result_ref:type_name -> treecmd.v1.ResultRef
 	18,  // 26: treecmd.v1.ChildReportRecord.children:type_name -> treecmd.v1.ChildAttest
-	77,  // 27: treecmd.v1.ChildReportRecord.received_at:type_name -> google.protobuf.Timestamp
+	79,  // 27: treecmd.v1.ChildReportRecord.received_at:type_name -> google.protobuf.Timestamp
 	0,   // 28: treecmd.v1.PendingResultRecord.local_state:type_name -> treecmd.v1.LocalExecState
 	18,  // 29: treecmd.v1.PendingResultRecord.children:type_name -> treecmd.v1.ChildAttest
 	9,   // 30: treecmd.v1.PendingResultRecord.sink:type_name -> treecmd.v1.ResultSink
 	19,  // 31: treecmd.v1.PendingResultRecord.result_ref:type_name -> treecmd.v1.ResultRef
-	77,  // 32: treecmd.v1.PendingResultRecord.received_at:type_name -> google.protobuf.Timestamp
-	77,  // 33: treecmd.v1.PendingResultRecord.next_retry_at:type_name -> google.protobuf.Timestamp
-	77,  // 34: treecmd.v1.ChildWatermark.last_seen_at:type_name -> google.protobuf.Timestamp
-	77,  // 35: treecmd.v1.ChildWatermark.evicted_at:type_name -> google.protobuf.Timestamp
+	79,  // 32: treecmd.v1.PendingResultRecord.received_at:type_name -> google.protobuf.Timestamp
+	79,  // 33: treecmd.v1.PendingResultRecord.next_retry_at:type_name -> google.protobuf.Timestamp
+	79,  // 34: treecmd.v1.ChildWatermark.last_seen_at:type_name -> google.protobuf.Timestamp
+	79,  // 35: treecmd.v1.ChildWatermark.evicted_at:type_name -> google.protobuf.Timestamp
 	1,   // 36: treecmd.v1.ResultRecord.status:type_name -> treecmd.v1.CommandStatus
 	0,   // 37: treecmd.v1.ResultRecord.local_state:type_name -> treecmd.v1.LocalExecState
 	19,  // 38: treecmd.v1.ResultRecord.result_ref:type_name -> treecmd.v1.ResultRef
 	18,  // 39: treecmd.v1.ResultRecord.children:type_name -> treecmd.v1.ChildAttest
-	77,  // 40: treecmd.v1.ResultRecord.created_at:type_name -> google.protobuf.Timestamp
-	77,  // 41: treecmd.v1.ResultRecord.expire_at:type_name -> google.protobuf.Timestamp
+	79,  // 40: treecmd.v1.ResultRecord.created_at:type_name -> google.protobuf.Timestamp
+	79,  // 41: treecmd.v1.ResultRecord.expire_at:type_name -> google.protobuf.Timestamp
 	13,  // 42: treecmd.v1.Delivery.command:type_name -> treecmd.v1.Command
 	25,  // 43: treecmd.v1.FetchResponse.deliveries:type_name -> treecmd.v1.Delivery
 	18,  // 44: treecmd.v1.StreamBegin.children:type_name -> treecmd.v1.ChildAttest
@@ -7330,12 +7594,12 @@ var file_node_proto_depIdxs = []int32{
 	38,  // 49: treecmd.v1.Heartbeat.load:type_name -> treecmd.v1.LoadMetrics
 	40,  // 50: treecmd.v1.HeartbeatAck.terminal:type_name -> treecmd.v1.TerminalNotice
 	1,   // 51: treecmd.v1.TerminalNotice.status:type_name -> treecmd.v1.CommandStatus
-	77,  // 52: treecmd.v1.ResultIndexUp.expire_at:type_name -> google.protobuf.Timestamp
+	79,  // 52: treecmd.v1.ResultIndexUp.expire_at:type_name -> google.protobuf.Timestamp
 	47,  // 53: treecmd.v1.HealthReq.req_auth:type_name -> treecmd.v1.ReqAuth
-	77,  // 54: treecmd.v1.ReqAuth.issued_at:type_name -> google.protobuf.Timestamp
-	77,  // 55: treecmd.v1.ReqAuth.not_after:type_name -> google.protobuf.Timestamp
+	79,  // 54: treecmd.v1.ReqAuth.issued_at:type_name -> google.protobuf.Timestamp
+	79,  // 55: treecmd.v1.ReqAuth.not_after:type_name -> google.protobuf.Timestamp
 	6,   // 56: treecmd.v1.CheckResult.status:type_name -> treecmd.v1.HealthStatus
-	77,  // 57: treecmd.v1.SignerInfo.cert_not_after:type_name -> google.protobuf.Timestamp
+	79,  // 57: treecmd.v1.SignerInfo.cert_not_after:type_name -> google.protobuf.Timestamp
 	6,   // 58: treecmd.v1.ChildHealth.status:type_name -> treecmd.v1.HealthStatus
 	53,  // 59: treecmd.v1.ChildHealth.report:type_name -> treecmd.v1.HealthReport
 	51,  // 60: treecmd.v1.ChildHealth.summary:type_name -> treecmd.v1.SubtreeSummary
@@ -7351,7 +7615,7 @@ var file_node_proto_depIdxs = []int32{
 	8,   // 70: treecmd.v1.CommandTrace.role:type_name -> treecmd.v1.TraceRole
 	0,   // 71: treecmd.v1.CommandTrace.local_state:type_name -> treecmd.v1.LocalExecState
 	15,  // 72: treecmd.v1.CommandTrace.lease:type_name -> treecmd.v1.Lease
-	77,  // 73: treecmd.v1.CommandTrace.deadline:type_name -> google.protobuf.Timestamp
+	79,  // 73: treecmd.v1.CommandTrace.deadline:type_name -> google.protobuf.Timestamp
 	1,   // 74: treecmd.v1.CommandTrace.status:type_name -> treecmd.v1.CommandStatus
 	19,  // 75: treecmd.v1.CommandTrace.self_result:type_name -> treecmd.v1.ResultRef
 	54,  // 76: treecmd.v1.CommandTrace.children:type_name -> treecmd.v1.ChildTrace
@@ -7377,40 +7641,42 @@ var file_node_proto_depIdxs = []int32{
 	59,  // 96: treecmd.v1.UpFrame.query_resp:type_name -> treecmd.v1.QueryResp
 	60,  // 97: treecmd.v1.UpFrame.query_data:type_name -> treecmd.v1.QueryData
 	75,  // 98: treecmd.v1.UpFrame.binary_req:type_name -> treecmd.v1.BinaryReq
-	57,  // 99: treecmd.v1.HealthResp.response:type_name -> treecmd.v1.HealthResponse
-	34,  // 100: treecmd.v1.DownFrame.register_ack:type_name -> treecmd.v1.RegisterAck
-	41,  // 101: treecmd.v1.DownFrame.command_notify:type_name -> treecmd.v1.CommandNotify
-	42,  // 102: treecmd.v1.DownFrame.command_canceled:type_name -> treecmd.v1.CommandCanceled
-	46,  // 103: treecmd.v1.DownFrame.health_req:type_name -> treecmd.v1.HealthReq
-	58,  // 104: treecmd.v1.DownFrame.query_req:type_name -> treecmd.v1.QueryReq
-	59,  // 105: treecmd.v1.DownFrame.query_resp:type_name -> treecmd.v1.QueryResp
-	60,  // 106: treecmd.v1.DownFrame.query_data:type_name -> treecmd.v1.QueryData
-	40,  // 107: treecmd.v1.DownFrame.terminal:type_name -> treecmd.v1.TerminalNotice
-	64,  // 108: treecmd.v1.DownFrame.config_push:type_name -> treecmd.v1.ConfigPush
-	39,  // 109: treecmd.v1.DownFrame.heartbeat_ack:type_name -> treecmd.v1.HeartbeatAck
-	65,  // 110: treecmd.v1.DownFrame.revocation_list:type_name -> treecmd.v1.RevocationList
-	67,  // 111: treecmd.v1.DownFrame.cert_renew_offer:type_name -> treecmd.v1.CertRenewOffer
-	76,  // 112: treecmd.v1.DownFrame.binary_chunk:type_name -> treecmd.v1.BinaryChunk
-	77,  // 113: treecmd.v1.RevocationList.issued_at:type_name -> google.protobuf.Timestamp
-	77,  // 114: treecmd.v1.EvictedEntry.archived_at:type_name -> google.protobuf.Timestamp
-	77,  // 115: treecmd.v1.EvictedEntry.expire_at:type_name -> google.protobuf.Timestamp
-	61,  // 116: treecmd.v1.NodeService.Connect:input_type -> treecmd.v1.UpFrame
-	26,  // 117: treecmd.v1.NodeService.FetchCommands:input_type -> treecmd.v1.FetchRequest
-	20,  // 118: treecmd.v1.NodeService.ReportResult:input_type -> treecmd.v1.Report
-	31,  // 119: treecmd.v1.NodeService.StreamResult:input_type -> treecmd.v1.StreamFrame
-	71,  // 120: treecmd.v1.NodeService.EnrollChallenge:input_type -> treecmd.v1.EnrollChallengeReq
-	73,  // 121: treecmd.v1.NodeService.Enroll:input_type -> treecmd.v1.EnrollRequest
-	63,  // 122: treecmd.v1.NodeService.Connect:output_type -> treecmd.v1.DownFrame
-	27,  // 123: treecmd.v1.NodeService.FetchCommands:output_type -> treecmd.v1.FetchResponse
-	28,  // 124: treecmd.v1.NodeService.ReportResult:output_type -> treecmd.v1.ReportResponse
-	32,  // 125: treecmd.v1.NodeService.StreamResult:output_type -> treecmd.v1.UploadAck
-	72,  // 126: treecmd.v1.NodeService.EnrollChallenge:output_type -> treecmd.v1.EnrollChallengeResp
-	74,  // 127: treecmd.v1.NodeService.Enroll:output_type -> treecmd.v1.EnrollResponse
-	122, // [122:128] is the sub-list for method output_type
-	116, // [116:122] is the sub-list for method input_type
-	116, // [116:116] is the sub-list for extension type_name
-	116, // [116:116] is the sub-list for extension extendee
-	0,   // [0:116] is the sub-list for field type_name
+	76,  // 99: treecmd.v1.UpFrame.binary_manifest_req:type_name -> treecmd.v1.BinaryManifestReq
+	57,  // 100: treecmd.v1.HealthResp.response:type_name -> treecmd.v1.HealthResponse
+	34,  // 101: treecmd.v1.DownFrame.register_ack:type_name -> treecmd.v1.RegisterAck
+	41,  // 102: treecmd.v1.DownFrame.command_notify:type_name -> treecmd.v1.CommandNotify
+	42,  // 103: treecmd.v1.DownFrame.command_canceled:type_name -> treecmd.v1.CommandCanceled
+	46,  // 104: treecmd.v1.DownFrame.health_req:type_name -> treecmd.v1.HealthReq
+	58,  // 105: treecmd.v1.DownFrame.query_req:type_name -> treecmd.v1.QueryReq
+	59,  // 106: treecmd.v1.DownFrame.query_resp:type_name -> treecmd.v1.QueryResp
+	60,  // 107: treecmd.v1.DownFrame.query_data:type_name -> treecmd.v1.QueryData
+	40,  // 108: treecmd.v1.DownFrame.terminal:type_name -> treecmd.v1.TerminalNotice
+	64,  // 109: treecmd.v1.DownFrame.config_push:type_name -> treecmd.v1.ConfigPush
+	39,  // 110: treecmd.v1.DownFrame.heartbeat_ack:type_name -> treecmd.v1.HeartbeatAck
+	65,  // 111: treecmd.v1.DownFrame.revocation_list:type_name -> treecmd.v1.RevocationList
+	67,  // 112: treecmd.v1.DownFrame.cert_renew_offer:type_name -> treecmd.v1.CertRenewOffer
+	78,  // 113: treecmd.v1.DownFrame.binary_chunk:type_name -> treecmd.v1.BinaryChunk
+	77,  // 114: treecmd.v1.DownFrame.binary_manifest:type_name -> treecmd.v1.BinaryManifest
+	79,  // 115: treecmd.v1.RevocationList.issued_at:type_name -> google.protobuf.Timestamp
+	79,  // 116: treecmd.v1.EvictedEntry.archived_at:type_name -> google.protobuf.Timestamp
+	79,  // 117: treecmd.v1.EvictedEntry.expire_at:type_name -> google.protobuf.Timestamp
+	61,  // 118: treecmd.v1.NodeService.Connect:input_type -> treecmd.v1.UpFrame
+	26,  // 119: treecmd.v1.NodeService.FetchCommands:input_type -> treecmd.v1.FetchRequest
+	20,  // 120: treecmd.v1.NodeService.ReportResult:input_type -> treecmd.v1.Report
+	31,  // 121: treecmd.v1.NodeService.StreamResult:input_type -> treecmd.v1.StreamFrame
+	71,  // 122: treecmd.v1.NodeService.EnrollChallenge:input_type -> treecmd.v1.EnrollChallengeReq
+	73,  // 123: treecmd.v1.NodeService.Enroll:input_type -> treecmd.v1.EnrollRequest
+	63,  // 124: treecmd.v1.NodeService.Connect:output_type -> treecmd.v1.DownFrame
+	27,  // 125: treecmd.v1.NodeService.FetchCommands:output_type -> treecmd.v1.FetchResponse
+	28,  // 126: treecmd.v1.NodeService.ReportResult:output_type -> treecmd.v1.ReportResponse
+	32,  // 127: treecmd.v1.NodeService.StreamResult:output_type -> treecmd.v1.UploadAck
+	72,  // 128: treecmd.v1.NodeService.EnrollChallenge:output_type -> treecmd.v1.EnrollChallengeResp
+	74,  // 129: treecmd.v1.NodeService.Enroll:output_type -> treecmd.v1.EnrollResponse
+	124, // [124:130] is the sub-list for method output_type
+	118, // [118:124] is the sub-list for method input_type
+	118, // [118:118] is the sub-list for extension type_name
+	118, // [118:118] is the sub-list for extension extendee
+	0,   // [0:118] is the sub-list for field type_name
 }
 
 func init() { file_node_proto_init() }
@@ -7440,6 +7706,7 @@ func file_node_proto_init() {
 		(*UpFrame_QueryResp)(nil),
 		(*UpFrame_QueryData)(nil),
 		(*UpFrame_BinaryReq)(nil),
+		(*UpFrame_BinaryManifestReq)(nil),
 	}
 	file_node_proto_msgTypes[52].OneofWrappers = []any{
 		(*DownFrame_RegisterAck)(nil),
@@ -7455,6 +7722,7 @@ func file_node_proto_init() {
 		(*DownFrame_RevocationList)(nil),
 		(*DownFrame_CertRenewOffer)(nil),
 		(*DownFrame_BinaryChunk)(nil),
+		(*DownFrame_BinaryManifest)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -7462,7 +7730,7 @@ func file_node_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_node_proto_rawDesc), len(file_node_proto_rawDesc)),
 			NumEnums:      11,
-			NumMessages:   66,
+			NumMessages:   68,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

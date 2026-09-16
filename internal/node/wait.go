@@ -71,6 +71,27 @@ func (n *Node) waitChildren(ctx context.Context, c *pb.Command) WaitResult {
 		if err := n.MarkUnreportedAtomic(c.Id, un, st, reason); err != nil {
 			n.Log.Warn("MarkUnreportedAtomic failed", "cmd", shortID(c.Id), "err", err)
 		}
+		// 点名"始终没有上报的子"，并给出清理手段。
+		//
+		// 为什么要专门打这一条：父给**注册表里的每一个直接子**都建 Assignment（下发即执行，
+		// 不做任何筛选），所以只要注册表里留着一个已废弃的残留子节点（重建过密钥、换过机器 ——
+		// 它的旧 NodeID 会一直留在 known_children 里），**之后每条指令都要白等它到期限**。
+		// 症状是"指令莫名其妙 TIMEOUT / PARTIAL，可别人的结果明明都是好的"，光看状态毫无线索；
+		// 日志里点到名字，运维才知道该去 /v1/forget。
+		//
+		// 这里刻意**不**改成"建 Assignment 时就告警"：那一刻 `Confirmed=false` 的子既可能是
+		// 残留节点、也可能只是"刚启动还没连上"（完全正常的瞬时状态），会天天误报。
+		// 只有"最后真的没上报"才是零误报的证据。
+		if len(un) > 0 {
+			ids := make([]string, 0, len(un))
+			for _, id := range un {
+				ids = append(ids, shortID(id))
+			}
+			n.Log.Warn("收尾时有子节点始终没有上报（本指令按退出原因收尾）；若它们其实已废弃，"+
+				"其记录会一直留在注册表里、让之后每条指令都白等到期限 —— "+
+				"GET /v1/forget?node=<id> 可预览，POST /v1/forget?all=1 可清理",
+				"cmd", shortID(c.Id), "unreported", len(un), "children", ids)
+		}
 		canon.SortAttests(childrenBuf)
 		return WaitResult{Outcomes: outcomes, Unreported: un, ParentJudged: judged,
 			Children: childrenBuf, Cancelled: cancelled, Deadline: deadline}
@@ -116,6 +137,21 @@ func (n *Node) waitChildren(ctx context.Context, c *pb.Command) WaitResult {
 		case <-ctx.Done():
 			return finalize(true, false)
 		case <-dt.C:
+			// 死线到点。**先复查一遍"是不是其实已经全到齐了"**，再决定要不要判超时。
+			//
+			// 为什么必须复查：Go 的 select 在多个 case 同时就绪时是**随机**挑一个的，所以
+			// "最后一个子的报告刚落库"与"死线刚好响"完全可能同一刻发生 —— 那时走这条分支就会
+			// 判出 TIMEOUT，而 result 里其实所有人的结果都齐了（实测症状就是这个：
+			// status=COMMAND_STATUS_TIMEOUT，result 却完整聚合好了）。
+			//
+			// 死线的语义是**兜底**（"还缺东西所以不能再等"），不是"到点就抹掉已经到手的事实"。
+			// 什么都不缺就没有"超时"可言，此时按正常完成收敛（与 ev / tk 分支同一处理）。
+			rep, wait, adj, unrep = n.partition(c.Id)
+			outcomes, childrenBuf = n.buildOutcomes(c, rep)
+			judged = parentJudgedOf(adj)
+			if len(wait) == 0 {
+				return finalize(false, false)
+			}
 			return finalize(false, true)
 		case <-ev:
 			rep, wait, adj, unrep = n.partition(c.Id)

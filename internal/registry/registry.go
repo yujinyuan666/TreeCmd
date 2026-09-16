@@ -27,6 +27,11 @@ type Child struct {
 	// BuildHash 该子节点**可执行文件**的哈希（注册时上报；见 README「可执行文件一致性」）。
 	// 仅展示用途：父端拿它和 n.Build().Hash 一比，就能在 /v1/tree 里看出"谁跑的还是旧镜像"。
 	BuildHash string
+	// CADays 该子节点**自己的 CA 证书**剩余有效天数（注册时上报；0 = 它不持有 CA 证书）。
+	//
+	// 只作展示：父端手上只有子的身份证书，看不到子的 CA 证书，而 CA 证书过期会让那个
+	// 子节点下次启动直接起不来 —— 所以由子上报，父在 /v1/tree 里提前看见。
+	CADays int32
 }
 
 // Table 直接子节点表。
@@ -114,6 +119,9 @@ func (t *Table) Upsert(c *Child) {
 		if c.BuildHash != "" {
 			old.BuildHash = c.BuildHash
 		}
+		// CA 剩余天数同理：每次注册都要覆盖 —— 它是"快到期了没有"的实时值，
+		// 停止更新会让 /v1/tree 一直显示旧的剩余天数（越显示越不准）。
+		old.CADays = c.CADays
 		old.Confirmed = c.Confirmed
 		old.RegisteredAt = c.RegisteredAt
 		old.LastEpoch = c.LastEpoch

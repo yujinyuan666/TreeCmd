@@ -121,6 +121,17 @@ type SecuritySection struct {
 	CACertPath         string   `yaml:"ca_cert_path"`  // **本节点自己的 CA 证书**（有子节点时必需，区别于信任锚）
 	CAKeyPath          string   `yaml:"ca_key_path"`   // 本节点自己的 CA 私钥（仅父 / 中继有）
 
+	// 证书生命期（天）。默认值 = 本项目历史行为：身份证书 30、CA 证书 3650（10 年）。
+	//
+	// 两个都不进 config_hash：换生命期只影响"以后签出来的证书多久过期"，
+	// 不影响拓扑 / 会话 / 身份 / 父列表，**不需要全量重注册**。
+	//
+	// 为什么 CA 证书也做成可配：CA 证书现在可以"只换证书、不换密钥"地在线轮换
+	// （见 identity.ReissueCAFor），所以把 10 年改成 1 年这类收敛策略是安全的 ——
+	// 下级不用重新分发 trust/。**默认值刻意不变**，避免存量节点的 CA 证书集体进续签窗口。
+	IdentityCertDays int `yaml:"identity_cert_days"` // 默认 30
+	CACertDays       int `yaml:"ca_cert_days"`       // 默认 3650
+
 	// 证书热重载：证书由外部脚本管理时，靠它把变更吃进来（见 README「证书生命周期」）
 	CertReload CertReloadSection `yaml:"cert_reload"`
 	// 运行期入网签发：子节点没有自带证书时，用许可向父换取证书（父签发子）
@@ -141,11 +152,21 @@ type CertReloadSection struct {
 }
 
 // EnrollmentSection 运行期入网签发（父签发子；子节点私钥不出本机）。
+//
+// 两侧共用本段：对父是"**允许别人来入网**"，对子是"**我去换证**"。
+//
+// **入网认证只有一个口径：入网许可（Token / TokenPath，两端同值）** —— 它是唯一的授权判据，
+// 父端没配它就拒绝一切入网。它承载的是"入网**引导凭据**"（见 identity.ParseBootstrap）：
+// 文件里除 permit 外还可以内嵌父的 CA 证书链，于是子节点只拷一份文件就走完首跳。
+//
+// 这里**曾经**还有一个 `allow_ids` 白名单（"只允许这些 NodeID 入网"）**已删除**：
+// NodeID 是公开信息（`/v1/tree` 就能读到），且与密钥对之间没有任何密码学绑定
+// （`node.id` 还允许留空自动生成），所以白名单挡不住"自报一个名单里的 ID + 自建一对密钥"。
+// 想限定"这一次准入发给谁"，正确做法是**每节点一枚一次性许可**，而不是给一份 ID 名单。
 type EnrollmentSection struct {
 	Enabled      *bool         `yaml:"enabled"`       // 默认 true
 	Token        string        `yaml:"token"`         // 入网许可（父端校验；子端提交同一串）
 	TokenPath    string        `yaml:"token_path"`    // 或者从文件读（优先于 token，便于脚本投放）
-	AllowIDs     []string      `yaml:"allow_ids"`     // 父端白名单：只允许这些 NodeID 入网；留空 = 只校验 token
 	ChallengeTTL time.Duration `yaml:"challenge_ttl"` // 一次性挑战有效期，默认 5m
 }
 
@@ -203,24 +224,28 @@ func (s *SecuritySection) EnrollmentEnabled() bool {
 	return s.Enrollment.Enabled == nil || *s.Enrollment.Enabled
 }
 
-// EnrollToken 取入网许可串，token_path（文件）优先于 token（直接写在配置里）。
+// EnrollCredentialRaw 取"入网引导凭据"的**原始内容**（不做任何解析）。
 //
-// 接收者 s 是 security 段的配置。从文件读时会去掉首尾空白与换行，
-// 因为脚本投放的 token 文件常带一个结尾换行。优先文件是为了方便脚本轮换许可。
+// 接收者 s 是 security 段的配置。`token_path`（文件）优先于 `token`（直接写在配置里）——
+// 优先文件是为了让脚本能投放与轮换它。**为什么不在这里解析**：凭据里既有许可、
+// 又可能内嵌父的 CA 证书链，解析要碰 x509 —— 那属于 internal/identity 的职责
+// （`identity.ParseBootstrap`，格式的权威定义也在那里）。配置层只负责"去哪拿"。
+//
+// 参数：无。
 //
 // 返回：
 //
-//	string — 入网许可；两个来源都没配时返回空串
+//	[]byte — 凭据的原始内容；两个来源都没配时返回空字节切片
 //	error  — 配了 token_path 但文件读不到时返回
-func (s *SecuritySection) EnrollToken() (string, error) {
+func (s *SecuritySection) EnrollCredentialRaw() ([]byte, error) {
 	if s.Enrollment.TokenPath != "" {
 		b, err := os.ReadFile(s.Enrollment.TokenPath)
 		if err != nil {
-			return "", fmt.Errorf("read enrollment.token_path: %w", err)
+			return nil, fmt.Errorf("read enrollment.token_path: %w", err)
 		}
-		return strings.TrimSpace(string(b)), nil
+		return b, nil
 	}
-	return strings.TrimSpace(s.Enrollment.Token), nil
+	return []byte(strings.TrimSpace(s.Enrollment.Token)), nil
 }
 
 // EnrollChallengeTTL 返回归一化后的一次性入网挑战有效期。
@@ -258,15 +283,111 @@ type CommandSection struct {
 	LeaseReclaimCap          int32             `yaml:"lease_reclaim_cap"`
 	MaxRetryNodeCount        int32             `yaml:"max_retry_node_count"`
 	LocalBusyBackoff         time.Duration     `yaml:"local_busy_backoff"`
-	PendingResendBatch       int32             `yaml:"pending_resend_batch"`
-	MaxReportConcurrency     int32             `yaml:"max_report_concurrency"`
-	IndexRepushInterval      time.Duration     `yaml:"index_repush_interval"`
-	MaxInflight              int32             `yaml:"max_inflight"`
-	TickInterval             time.Duration     `yaml:"tick_interval"`
-	ReconcileWindow          time.Duration     `yaml:"reconcile_window"`
+	// ---- 下发背压：在途窗口与退避（见 README「下发即执行」）----
+	//
+	// **"在途"的定义（全仓库一致）**：Assignment 处于 LEASED，且租约仍在有效期内。
+	// 两种都不算：PENDING（含退避中）—— 子还没拿到；LEASED 但租约已过期 —— 那是"父已经忘了"的
+	// 僵尸租约，下一轮就会被回收成 PENDING，若把它算进窗口，一次父重启就能让窗口被占满、把自己锁死。
+	//
+	// 两个窗口都是 *int32，语义是：**没配 = 默认值，显式写 0 = 不限**。
+	// 为什么不像其它字段那样"0 即默认"：这里 0 的"不限"是个**有用且必须能表达**的取值
+	// （= 完全回到加这个功能之前的行为）。代价是多一层指针，换来的是配置里能一眼看懂。
+	// 两个字段用同一套规则，运维只需要记一条。
+	MaxDispatchInflightPerChild *int32 `yaml:"max_dispatch_inflight_per_child"` // 每个直接子的在途上限（默认 8）
+	// MaxDispatchInflight 所有直接子的在途总数上限。**默认 0 = 不限** —— 这是刻意的：
+	// 固定数字必然在某个扇出规模上开始咬人（per-child 窗口是 8 时，只要直接子超过 32 个，
+	// 全局 256 就会顶住，把本来能并行的下发变成一波一波），而它想防的是"病态扇出"这种少见情况。
+	// 建议要开就按 **总数 ≥ 单子窗口 × 直接子数** 配，否则先看
+	// `dispatch_throttled_total{reason="total_window"}` 有没有涨。
+	MaxDispatchInflight *int32 `yaml:"max_dispatch_inflight"` // 所有直接子的在途总数上限（默认 0 = 不限）
+	// DispatchWindowAdaptive 打开后，per-child 窗口 = min(配置值, max(1, 全局窗口 / 在线子数))：
+	// 子在线的多就收紧、子掉线就放宽。这是 taktuk 的 `-d` work-stealing 在 treecmd 里
+	// **唯一合法的等价物** —— 任务本身不可再分配（整棵子树人人各执行一次），能借的只有
+	// "自适应在途窗口"这个效果。注意它**只会收紧**，不会超过 max_dispatch_inflight_per_child。
+	DispatchWindowAdaptive bool `yaml:"dispatch_window_adaptive"`
+	// LocalBusyBackoffMax LocalBusy 指数退避的**封顶**（默认 60s）。
+	// 退避时长 = min(local_busy_backoff << (streak-1), 这个值)；也就是说 local_busy_backoff
+	// 就是**基数**，不需要再造一个 backoff_base 字段去和它指同一件事。
+	LocalBusyBackoffMax  time.Duration `yaml:"local_busy_backoff_max"`
+	PendingResendBatch   int32         `yaml:"pending_resend_batch"`
+	MaxReportConcurrency int32         `yaml:"max_report_concurrency"`
+	IndexRepushInterval  time.Duration `yaml:"index_repush_interval"`
+	MaxInflight          int32         `yaml:"max_inflight"`
+	TickInterval         time.Duration `yaml:"tick_interval"`
+	ReconcileWindow      time.Duration `yaml:"reconcile_window"`
 	// 对象存储目录（>64MB 的大结果落这里，见 3.13 第三级）
 	ObjectStoreDir string `yaml:"object_store_dir"`
 }
+
+// 下发背压的默认窗口。**只在配置里没写这个键**时生效；显式写 0 一律表示"不限"。
+const (
+	dispatchDefaultPerChild int32 = 8 // 每个子的在途上限
+	dispatchDefaultTotal    int32 = 0 // 全局在途上限：默认不限（理由见 MaxDispatchInflight 的注释）
+)
+
+// DispatchWindowPerChild 返回归一化后的"每个直接子的在途分派上限"。
+//
+// 接收者 c 是 command 段的配置。
+//
+// 返回：
+//
+//	int32 — 没配时取 8；**0 表示不限**（会原样返回，不会被默认值顶掉）
+//
+// 默认值 8 之所以敢给，是因为窗口是**跨指令**的：单条指令对每个子只有 1 个 Assignment
+// （见 EnsureCreated），所以 8 对"一次提交一条指令"零影响，只在同一子同时积压 >8 条指令时才生效。
+func (c *CommandSection) DispatchWindowPerChild() int32 {
+	if c.MaxDispatchInflightPerChild == nil {
+		return dispatchDefaultPerChild
+	}
+	return *c.MaxDispatchInflightPerChild
+}
+
+// DispatchWindowTotal 返回全局在途分派上限。
+//
+// 接收者 c 是 command 段的配置。
+//
+// 返回：
+//
+//	int32 — 没配时取 0，也就是**不限**（这是刻意的默认，见字段注释）；0 表示不限
+func (c *CommandSection) DispatchWindowTotal() int32 {
+	if c.MaxDispatchInflight == nil {
+		return dispatchDefaultTotal
+	}
+	return *c.MaxDispatchInflight
+}
+
+// LocalBusyBackoffCap 返回 LocalBusy 指数退避的封顶时长。
+//
+// 接收者 c 是 command 段的配置。
+//
+// 返回：
+//
+//	time.Duration — 没配或非正数时取 60s；**小于基数（local_busy_backoff）时抬到基数** ——
+//	                否则 streak=1 那一次退避会比不封顶还短，指数退避就名不副实了
+func (c *CommandSection) LocalBusyBackoffCap() time.Duration {
+	d := c.LocalBusyBackoffMax
+	if d <= 0 {
+		d = 60 * time.Second
+	}
+	if c.LocalBusyBackoff > 0 && d < c.LocalBusyBackoff {
+		d = c.LocalBusyBackoff
+	}
+	return d
+}
+
+// int32Ptr 取一个 int32 的指针。
+//
+// 存在的唯一理由是配置里那几个 *int32 字段需要区分"没配"（nil）与"显式写了 0"，
+// 构造默认值时用得上；没有它就得在调用处临时声明一个变量。
+//
+// 参数：
+//
+//	v — 要取地址的整数值
+//
+// 返回：
+//
+//	*int32 — 指向 v 的副本的指针
+func int32Ptr(v int32) *int32 { return &v }
 
 // HealthSection 健康检查参数。
 type HealthSection struct {
@@ -317,9 +438,22 @@ type SelfUpdateSection struct {
 	// Dir 暂存文件放哪（默认 = 可执行文件所在目录）。
 	// 必须与被替换的文件在**同一个文件系统**上，否则 rename 退化成"复制"，就不再是原子的了。
 	Dir string `yaml:"dir"`
+
+	// PieceStore 是否启用**镜像分片缓存**（默认 true）：把收到的每一片（经片级 sha256 校验后）
+	// 落在 <dir>/pieces/ 下，于是本节点**在还没收完、还没重启**的时候就能把这些片
+	// 转发给自己的直接子 —— 收敛从"逐层串行"变成"流水线"。
+	//
+	// 关掉它就完全回到旧行为（必须整份收完 + 重启之后才能对子供片）。
+	PieceStore *bool `yaml:"piece_store"`
+	// MaxServeConcurrency 同时向几个子供片（默认 4）。中继可能一边向父拉、一边给多个孙推，
+	// 不限并发会把它自己的带宽与内存吃光。
+	MaxServeConcurrency int32 `yaml:"max_serve_concurrency"`
+	// PieceStoreMaxBytes 片存总占用上限（默认 = max_bytes 的 2 倍）；超出按最近使用时间清理。
+	// 片存是**可丢的缓存**：清掉只会让下次从 0 重来，不影响正确性。
+	PieceStoreMaxBytes ByteSize `yaml:"piece_store_max_bytes"`
 }
 
-// ForgetSection 失效节点清理参数（`/v1/forget`，见 docs/失效节点清理与版本一致性设计.md）。
+// ForgetSection 失效节点清理参数（`/v1/forget`；设计与取舍见 README 的「失效节点清理：`/v1/forget`」一节）。
 //
 // 背景：误启动的实例、注册失败但调过一元 RPC 的节点，会在父端留下再也回不来的记录
 // （内存注册表 + state.dat.known_children + bbolt 的若干桶），需要一个显式命令把它们清掉。
@@ -496,6 +630,45 @@ func (s *SelfUpdateSection) StagingDir(exePath string) string {
 	return filepath.Dir(exePath)
 }
 
+// PieceStoreEnabled 报告镜像分片缓存是否开启（没配就当开启）。
+//
+// 接收者 s 是 selfupdate 段的配置。
+//
+// 返回：
+//
+//	bool — piece_store 字段为 nil（配置里没写）时返回 true，否则返回配置的值
+func (s *SelfUpdateSection) PieceStoreEnabled() bool {
+	return s.PieceStore == nil || *s.PieceStore
+}
+
+// MaxServeConcurrencyN 返回归一化后的"同时向几个子供片"上限。
+//
+// 接收者 s 是 selfupdate 段的配置。
+//
+// 返回：
+//
+//	int32 — 未配置或非正数时取 4
+func (s *SelfUpdateSection) MaxServeConcurrencyN() int32 {
+	if s.MaxServeConcurrency <= 0 {
+		return 4
+	}
+	return s.MaxServeConcurrency
+}
+
+// PieceStoreBytes 返回归一化后的片存字节上限。
+//
+// 接收者 s 是 selfupdate 段的配置。
+//
+// 返回：
+//
+//	int64 — 未配置时取 max_bytes 的 2 倍（够放下"正在收的这份 + 上一份"）
+func (s *SelfUpdateSection) PieceStoreBytes() int64 {
+	if s.PieceStoreMaxBytes > 0 {
+		return int64(s.PieceStoreMaxBytes)
+	}
+	return 2 * s.MaxTransferBytes()
+}
+
 // PersistSection 状态落盘参数。
 type PersistSection struct {
 	StatePath string        `yaml:"state_path"`
@@ -664,6 +837,15 @@ func (c *Config) applyDefaults(baseDir string) {
 	def(&cd.ReserveForReport, 5*time.Second)
 	def(&cd.ChildStuckTimeout, 5*time.Minute)
 	def(&cd.LocalBusyBackoff, 3*time.Second)
+	def(&cd.LocalBusyBackoffMax, 60*time.Second)
+	// 下发背压：两个窗口是 *int32，**不能用上面的 def()** —— def 把 0 当"没配"，
+	// 而这里的 0 是"不限"这个有意义的取值。所以只在指针为 nil 时补默认值。
+	if cd.MaxDispatchInflightPerChild == nil {
+		cd.MaxDispatchInflightPerChild = int32Ptr(dispatchDefaultPerChild)
+	}
+	if cd.MaxDispatchInflight == nil {
+		cd.MaxDispatchInflight = int32Ptr(dispatchDefaultTotal)
+	}
 	def(&cd.IndexRepushInterval, 10*time.Minute)
 	if cd.MaxPayload == 0 {
 		cd.MaxPayload = ByteSize(1 << 20)
@@ -694,6 +876,17 @@ func (c *Config) applyDefaults(baseDir string) {
 	}
 	if cd.MaxInflight == 0 {
 		cd.MaxInflight = 64
+	}
+	// 证书生命期：默认值 = 历史行为（身份 30 天 / CA 10 年）
+	if c.Security.IdentityCertDays <= 0 {
+		c.Security.IdentityCertDays = 30
+	}
+	if c.Security.CACertDays <= 0 {
+		c.Security.CACertDays = 3650
+	}
+	// 镜像分片缓存：并发与容量都给默认值（piece_store 是 *bool，nil 即开启）
+	if c.SelfUpdate.MaxServeConcurrency <= 0 {
+		c.SelfUpdate.MaxServeConcurrency = 4
 	}
 	if cd.TickInterval == 0 {
 		t := cd.ChildStuckTimeout
@@ -790,7 +983,8 @@ func (c *Config) applyDefaults(baseDir string) {
 		sec.CAKeyPath = "keys/ca"
 	}
 	if len(sec.CACertPaths) == 0 {
-		// 信任锚：约定目录 trust/（你的证书脚本往这里投 CA 即可，换 CA 也不用改配置）
+		// 信任锚：约定目录 trust/（放**父节点的** CA 证书链即可，不需要放根的；
+		// 而且只在首次入网时用得着 —— 入网成功后信任锚会从自己的证书链自举）
 		dir := filepath.Join(baseDir, "trust")
 		if st, err := os.Stat(dir); err == nil && st.IsDir() {
 			sec.CACertPaths = []string{"trust"}
@@ -833,13 +1027,12 @@ func (c *Config) applyDefaults(baseDir string) {
 //
 // 接收者 c 应已过 applyDefaults。检查项包括：node.id 是否已确定、name/remark 的长度上限
 // 与是否含换行、形态与 listen/parents 是否搭配、parents 每项是否 id 与 addr 都非空、
-// 租约约束（只有 relay/root 查）、registration.backfill 取值、非根节点是否配了信任锚且锚文件真实存在、
+// 租约约束（只有 relay/root 查）、registration.backfill 取值、**配了的**信任锚路径是否真实存在、
 // 身份材料路径是否给出、cert_reload.on_change 取值、enrollment.token_path 是否真实存在。
 //
-// 注意：这里**故意不**因为"证书不存在 + 没配入网 token"就拒绝启动 ——
-// 父端可能只配了 allow_ids 白名单（那种模式不需要 token），子端无从得知。
-// 于是它会先以"待入网"状态起来，运行期再由父端明确拒绝（ERR_ENROLL_BAD_PERMIT /
-// ERR_ENROLL_NOT_ALLOWED，日志里写着原因）。
+// 注意：这里**故意不**因为"证书不存在 + 没配入网凭据"就拒绝启动 ——
+// 配置层看不到"证书文件在不在"，而这个结论要由启动强校验给出（它才能同时掌握
+// "有没有证书 / 有没有锚 / 能不能自举"），文案也更可操作（"待入网但没有任何信任锚"等）。
 //
 // 返回：
 //
@@ -879,12 +1072,18 @@ func (c *Config) Validate() error {
 	if c.Registration.Backfill != "NONE" && c.Registration.Backfill != "SINCE" && c.Registration.Backfill != "FROM_SEQ" {
 		return fmt.Errorf("invalid registration.backfill %q", c.Registration.Backfill)
 	}
-	if len(c.Security.CACertPaths) == 0 && c.Role() != RoleRoot {
-		return errors.New("security.ca_cert_paths is required for non-root nodes（用于校验父与对端）")
-	}
+	// 信任锚（security.ca_cert_paths）：**不再要求非根节点必须配**。
+	//
+	// 它的口径不是"树的根"，而是"我信谁" —— 也就是**我的父**：把父的 `certs/node.crt.ca`
+	// 整份文件（内容含父 CA 一路到根）指向它即可，不需要从根拷任何东西。
+	// 而且它只在**首次入网**（手上还没有证书）时必需：入网成功后信任锚可以从**自己的证书链**
+	// 自举出来（见 identity.ChainAnchors），那时这一项可以整段删掉。
+	//
+	// 这里只校验"配了的路径必须存在"。"到底够不够启动"由启动强校验判定 —— 只有它同时掌握
+	// "有没有锚"与"能不能从证书链自举"两件事（要 stat 证书文件），放在两处判必然各说一套。
 	for _, p := range c.Security.CACertPaths {
 		if _, err := os.Stat(p); err != nil {
-			return fmt.Errorf("security.ca_cert_paths: %s: %w（信任锚必须存在；给目录时会扫其中的 *.crt/*.pem）", p, err)
+			return fmt.Errorf("security.ca_cert_paths: %s: %w（信任锚必须存在：给文件就放父的 CA 证书链；给目录时会扫其中的 *.crt/*.pem）", p, err)
 		}
 	}
 	if c.Security.IdentityKeyPath == "" || c.Security.IdentityPubKeyPath == "" {
@@ -911,18 +1110,18 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("security.enrollment.token_path: %w", err)
 		}
 	}
-	// 注意：**不在这里**因为"证书不存在 + 没配 token"就拒绝启动 ——
-	// 父端可能只配了 allow_ids 白名单（那种模式不需要 token），子端无从得知。
-	// 于是它会先以"待入网"状态起来，运行期再由父端明确拒绝（ERR_ENROLL_*）。
+	// 注意：**不在这里**因为"证书不存在 + 没配凭据"就拒绝启动 ——
+	// 配置层看不到"证书文件在不在"，而无证书时到底算不算错由启动强校验判定
+	// （它会给出"待入网但没有任何信任锚"或"没有入网许可"这类可操作的结论）。
+	// 这里只负责"配了路径就必须存在"。
 	return nil
 }
 
 // ConfigHash 计算配置指纹，只覆盖影响拓扑 / 会话 / 证书 / 父列表 / 监听地址的关键字段（6.1 白名单）。
 // 明确不进 hash：security.viewers.*、query.query_viewers、command.*、health.*、persist.*、version。
 //
-// 接收者 c 是完整配置。做法是把白名单字段按固定顺序拼成一段文本再取 SHA-256；
-// allow_ids 会先排序，保证同一份配置每次算出的哈希一致。
-// 入网策略只把"开关 + allow_ids 列表"写进去，凭据 token 不进 —— 换 token 不该触发全量重注册。
+// 接收者 c 是完整配置。做法是把白名单字段按固定顺序拼成一段文本再取 SHA-256。
+// 入网策略只把"开关"写进去，**凭据（token/token_path）不进** —— 换许可不该触发全量重注册。
 //
 // 返回：
 //
@@ -940,11 +1139,13 @@ func (c *Config) ConfigHash() string {
 	sb.WriteString("security.ca_cert_paths=" + strings.Join(c.Security.CACertPaths, ",") + "\n")
 	sb.WriteString("security.ca_key_path=" + c.Security.CAKeyPath + "\n")
 	sb.WriteString("security.ca_cert_path=" + c.Security.CACertPath + "\n")
-	// 入网策略：允许列表进 hash（改了要重注册），但**凭据（token）不进** —— 换 token 不该触发全量重注册
+	// 入网策略：只有"开/关"进 hash。
+	//
+	// ⚠️ 这一行**曾经**还会拼上 allow_ids 列表；该字段已随"入网认证只留许可一个口径"删除
+	// ⇒ config_hash 变了一次：升级后**首次启动会触发一次全量重注册**（一次性、可预期，
+	// 与当年删掉 node.labels / node.capabilities 时同一类副作用）。
 	if c.Security.EnrollmentEnabled() {
-		allow := append([]string(nil), c.Security.Enrollment.AllowIDs...)
-		sortStrings(allow)
-		sb.WriteString("security.enrollment=on:" + strings.Join(allow, ",") + "\n")
+		sb.WriteString("security.enrollment=on\n")
 	} else {
 		sb.WriteString("security.enrollment=off\n")
 	}
@@ -972,20 +1173,4 @@ func (c *Config) DeadlineForType(t string) time.Duration {
 		}
 	}
 	return c.Command.UnknownTypeDeadline
-}
-
-// sortStrings 就地按字典序升序排列字符串切片（插入排序）。
-//
-// 这里用它是为了让 allow_ids 的拼接顺序稳定：`enrollment.allow_ids` 是个字符串列表，
-// 用户手写顺序不该影响 ConfigHash。待排序的都是几十个元素的小切片，所以用最朴素的插入排序即可。
-//
-// 参数：
-//
-//	s — 待排序的切片；直接原地修改，不返回新切片
-func sortStrings(s []string) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j] < s[j-1]; j-- {
-			s[j], s[j-1] = s[j-1], s[j]
-		}
-	}
 }

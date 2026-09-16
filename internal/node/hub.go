@@ -657,10 +657,14 @@ func (h *Hub) serveConn(stream pb.NodeService_ConnectServer, peerID string, pub 
 		ListenAddr: reg.ListenAddr, Confirmed: true, RegisteredAt: time.Now(), LastEpoch: reg.Epoch,
 		// 子上报的是"它自己那份镜像"：父端拿它和 h.n.Build().Hash 一比就知道谁没跟上
 		BuildHash: reg.GetBinaryHash(),
+		// 子的 CA 证书剩余天数（0 = 它不是中继 / 没有 CA 证书）：父端在 /v1/tree 里展示，
+		// 用来提前发现"某个中继的 CA 证书快到期了"——那会让它下次启动起不来。
+		CADays: reg.GetCaNotAfterDays(),
 	}
 	h.n.Reg.Upsert(child)
 	h.n.Log.Info("child registered", "child", shortID(peerID), "path", path, "epoch", reg.Epoch,
-		"start_seq", fetched, "resume", resume, "name", reg.NodeName, "build", shortHash(reg.GetBinaryHash()))
+		"start_seq", fetched, "resume", resume, "name", reg.NodeName,
+		"build", shortHash(reg.GetBinaryHash()), "ca_days", reg.GetCaNotAfterDays())
 
 	// 注册后顺带：推 CRL（版本更高才发）+ 检查子证书是否进入续签窗口（父即时换发）
 	h.n.pushCRL(peerID)
@@ -716,6 +720,11 @@ func (h *Hub) dispatch(cc *childConn, f *pb.UpFrame) error {
 		//（读循环一停，心跳与拉取都会跟着停）。
 		go h.serveBinary(cc, body.BinaryReq)
 		return nil
+	case *pb.UpFrame_BinaryManifestReq:
+		// 子先要"这份镜像由哪些片组成、每片 sha256 是多少"：同样起独立协程
+		//（本节点没继承到清单时要从自己的镜像现算，那是几十 MB 的哈希，绝不能压在读循环上）。
+		go h.serveManifest(cc, body.BinaryManifestReq)
+		return nil
 	case *pb.UpFrame_HealthResp:
 		cc.mu.Lock()
 		ch, ok := cc.healthCh[body.HealthResp.ReqId]
@@ -738,7 +747,10 @@ func (h *Hub) dispatch(cc *childConn, f *pb.UpFrame) error {
 		h.n.pushCRL(cc.nodeID)
 		return nil
 	case *pb.UpFrame_CertRenewReq:
-		h.n.maybeOfferRenew(cc, cc.leaf)
+		// 子显式请求续签：身份证书按窗口判、CA 证书按 want_ca 判（见 handleCertRenewReq）。
+		// 注意这里**不再走 maybeOfferRenew** —— 那个函数只看叶子证书，
+		// 会导致"子只想换 CA 证书、但身份证书还很新"的请求被静默丢弃。
+		h.n.handleCertRenewReq(cc, body.CertRenewReq)
 		return nil
 	case *pb.UpFrame_Reconcile:
 		return h.n.handleReconcile(cc.nodeID, body.Reconcile)
@@ -817,7 +829,18 @@ func (h *Hub) handleHeartbeat(cc *childConn, hb *pb.Heartbeat) error {
 	return cc.send(&pb.DownFrame{ProtoVersion: protoVersion, Frame: &pb.DownFrame_HeartbeatAck{HeartbeatAck: ack}})
 }
 
-// handleLocalBusy 处理子节点的"本机繁忙"：把分派退回 PENDING 并设置短退避（不推进 attempt）。
+// handleLocalBusy 处理子节点的"本机繁忙"：把分派退回 PENDING 并设置退避（**不推进 attempt**）。
+//
+// 退避是**指数**的：连续被同一个子退回第 n 次，就等 min(local_busy_backoff << (n-1), 封顶) 再投。
+//
+// 为什么必须指数：子说"忙"是**子侧全局**的（它的本地并发闸门满了，见 handle.acquireLocal），
+// 于是一批同时下发的指令会**被同时退回来**。固定 3s 的话它们会在 3s 后齐刷刷重投，把刚要
+// 缓过来的子再打一遍（同步风暴）；指数退避让它们的重投时刻自然错开，子缓过来的那一刻
+// 只需要应付其中最早到期的那一条。这也是 taktuk 的 work-stealing 想达到的效果在 treecmd
+// 里唯一合法的形式 —— 任务本身不可再分配（整棵子树人人各执行一次），能调的只有节奏。
+//
+// **语义不变的部分**：仍然不推进 attempt（退避只决定"什么时候再投"，不决定"这是第几次尝试"），
+// 所以失败重试计数、Deadline 派生、幂等判定全都不受影响。
 //
 // 接收者 h 是下行侧（服务端）的连接管理器。
 //
@@ -830,7 +853,10 @@ func (h *Hub) handleHeartbeat(cc *childConn, hb *pb.Heartbeat) error {
 //
 //	error — 更新存储失败时返回
 func (h *Hub) handleLocalBusy(cc *childConn, lb *pb.LocalBusy) error {
-	// LocalBusy 不推进 attempt：释放回 PENDING + 短退避
+	// LocalBusy 不推进 attempt：释放回 PENDING + 指数退避
+	cmd := h.n.C().Command
+	base, capDur := cmd.LocalBusyBackoff, cmd.LocalBusyBackoffCap()
+	h.n.Metrics.Inc("local_busy_total")
 	return h.n.Store.Update(func(tx *store.Tx) error {
 		a, ok := tx.GetAssignment(lb.CommandId, cc.nodeID)
 		if !ok || isTerminalAssign(a.Status) {
@@ -838,10 +864,52 @@ func (h *Hub) handleLocalBusy(cc *childConn, lb *pb.LocalBusy) error {
 		}
 		a.Status = pb.AssignStatus_ASSIGN_STATUS_PENDING
 		a.NextAttempt = a.DeliveredAttempt // 不推进
-		a.BackoffUntil = canon.TS(tx.Now.Add(h.n.C().Command.LocalBusyBackoff))
+		a.LocalBusyStreak++
+		// streak 本身没有上限地涨没有意义（退避早就封顶了），夹一下免得它变成天文数字；
+		// 归零只发生在两处：收到 InflightHint（子报告正在跑）与租约回收（状态不可知）。
+		if a.LocalBusyStreak > localBusyStreakMax {
+			a.LocalBusyStreak = localBusyStreakMax
+		}
+		a.BackoffUntil = canon.TS(tx.Now.Add(localBusyBackoff(base, capDur, a.LocalBusyStreak)))
 		a.UpdatedAt = canon.TS(tx.Now)
 		return tx.PutAssignment(a)
 	})
+}
+
+// localBusyStreakMax 连续退避次数的计数上限。
+//
+// 它不是"最多退避几次"（退避本身由 local_busy_backoff_max 封顶，早就不会再涨了），
+// 只是为了让这个计数字段别无限增长。
+const localBusyStreakMax = 32
+
+// localBusyBackoff 算"连续被退回了 streak 次"之后这次该等多久。
+//
+// 参数：
+//
+//	base   — 退避基数（local_busy_backoff，默认 3s）
+//	capDur — 封顶（local_busy_backoff_max，默认 60s）
+//	streak — 连续被退回的次数，从 1 开始（<=1 都按 1 处理，也就是等一个基数）
+//
+// 返回：
+//
+//	time.Duration — min(base << (streak-1), capDur)。用循环翻倍而不是左移：
+//	                左移在基数配得很大时（比如 1h）会撞 int64 溢出，翻倍法在 d 一够到封顶就停，
+//	                最多只会短暂超过封顶一次（2×封顶），永远不会溢出。
+func localBusyBackoff(base, capDur time.Duration, streak int32) time.Duration {
+	if base <= 0 {
+		base = 3 * time.Second
+	}
+	if capDur < base {
+		capDur = base
+	}
+	d := base
+	for i := int32(1); i < streak && d < capDur; i++ {
+		d *= 2
+	}
+	if d > capDur {
+		return capDur
+	}
+	return d
 }
 
 // handleInflightHint 处理子节点的"我还在跑"提示：把 attempt 回滚到子节点实际在跑的 attempt。
@@ -866,6 +934,10 @@ func (h *Hub) handleInflightHint(cc *childConn, ih *pb.InflightHint) error {
 		a.NextAttempt = ih.Attempt
 		a.DeliveredAttempt = ih.Attempt
 		a.InflightHintSeen = true
+		// 子明确报告"我正在跑 attempt N" —— 这是**唯一**一个"它真的动起来了"的正向证据，
+		// 所以把连续被退回的次数归零：这一刻起，"它忙不过来"这件事已经被推翻，
+		// 再让退避停在封顶值（比如 60s）只会白白拖慢一条本来能跑的指令。
+		a.LocalBusyStreak = 0
 		a.UpdatedAt = canon.TS(tx.Now)
 		return tx.PutAssignment(a)
 	})

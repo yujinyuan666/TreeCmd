@@ -15,6 +15,7 @@ package node
 //     "想升级"把在跑的节点弄挂。唯一的例外是"替换成功"这一条路径 —— 它必然重启。
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -321,10 +322,99 @@ func (n *Node) syncAndRestart(u *Upstream, frames <-chan recvResult, wantHash st
 	}
 }
 
+// fetchManifest 向父申请"这份镜像由哪些片组成、每片 sha256 是多少"，拿不到就返回 nil。
+//
+// 返回 nil 是**正常情况**，不是错误：父可能是旧版本（不认识 BinaryManifestReq 帧），
+// 也可能显式关掉了片存。此时调用方回退到老流程（只靠 crc32 + 整份 sha256），
+// 行为与加片存之前逐字节一致 —— "拿不到清单就不工作"是绝对不行的。
+//
+// 超时是**独立预算**（整份同步预算的 1/3，至少 5s）：不能让"等一份永远不会来的清单"
+// 把整次同步耗光。
+//
+// 接收者 n 是本节点（子）。等待期间非清单帧照常分发给 dispatch，所以心跳回应、
+// 终态通知都不会被丢掉。
+//
+// 参数：
+//
+//	u        — 上行侧（清单请求从它发）
+//	ctx      — 本次同步的上下文
+//	frames   — 本次会话的帧通道
+//	wantHash — 目标哈希
+//
+// 返回：
+//
+//	*pb.BinaryManifest — 可用的清单（已存进片存）；拿不到或不可用时返回 nil
+func (n *Node) fetchManifest(u *Upstream, ctx context.Context,
+	frames <-chan recvResult, wantHash string) *pb.BinaryManifest {
+	if n.pieces == nil {
+		return nil // 本节点没启用片存：问了也没地方放，直接走老流程
+	}
+	if err := u.send(&pb.UpFrame{ProtoVersion: protoVersion, NodeId: n.C().Node.ID,
+		Frame: &pb.UpFrame_BinaryManifestReq{BinaryManifestReq: &pb.BinaryManifestReq{
+			WantHash: wantHash,
+		}}}); err != nil {
+		n.Log.Warn("申请镜像清单失败，回退到旧流程", "err", err)
+		return nil
+	}
+	budget := n.C().SelfUpdate.Timeout() / 3
+	if budget < 5*time.Second {
+		budget = 5 * time.Second
+	}
+	mctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	for {
+		select {
+		case <-mctx.Done():
+			n.Log.Info("父未回镜像清单（旧版本父？），回退到 crc32 + 整份 sha256 的旧流程",
+				"budget", budget.String())
+			return nil
+		case r := <-frames:
+			if r.err != nil {
+				return nil
+			}
+			m := r.f.GetBinaryManifest()
+			if m == nil {
+				// 不是清单帧：照常处理（心跳回应 / 终态 / 配置下发…），别把它们丢了
+				if err := u.dispatch(r.f); err != nil {
+					n.Log.Warn("等清单期间处理下行帧失败", "err", err)
+				}
+				continue
+			}
+			if m.GetReason() != "" {
+				n.Log.Info("父不提供镜像清单，回退旧流程", "reason", m.GetReason())
+				return nil
+			}
+			// 清单本身必须自洽：哈希要对得上、片数非空、片大小为正
+			if m.GetHash() != wantHash || len(m.GetPieceSha256()) == 0 || m.GetChunkSize() <= 0 {
+				n.Log.Warn("父给的清单不可用，回退旧流程",
+					"hash_match", m.GetHash() == wantHash,
+					"pieces", len(m.GetPieceSha256()), "chunk", m.GetChunkSize())
+				return nil
+			}
+			if err := n.pieces.PutManifest(wantHash, m); err != nil {
+				n.Log.Warn("清单落盘失败（不影响本次同步）", "err", err)
+			}
+			n.Log.Info("已拿到镜像清单（片级 sha256）",
+				"pieces", len(m.GetPieceSha256()), "chunk", m.GetChunkSize())
+			return m
+		}
+	}
+}
+
 // pullBinary 就地向父申请它的可执行文件，边收边写暂存文件，收完做整份校验。
 //
-// 收帧循环与正常阶段共用同一个读协程（frames）：非分片帧照常分发给 dispatch，
-// 所以拉取期间心跳回应、终态通知都不会被丢掉。超时、拒绝、校验失败都返回错误。
+// 两条路径，取决于能不能拿到片清单：
+//
+//	**清单路径**（父支持且本节点启用了片存）—— 每片先过 sha256 再落片存，最后统一拼装。
+//	  好处有三：① 片级校验从 crc32 升级为 sha256，"这一片确实属于那份镜像"可证；
+//	  ② 已经验证过的片可以立刻转发给本节点的直接子（边收边转发，见 pieces.go）；
+//	  ③ 断点续传 —— 续传时前半段只存在于片存里，所以**最后统一拼装**（往里追加会错位）。
+//
+//	**旧路径**（拿不到清单）—— 与加片存之前逐字节一致：按 crc32 校验、直接追加进暂存文件、
+//	  只有整份 sha256 兜底，不落片存、不支持续传。
+//
+// 收帧循环与正常阶段共用同一个读协程（frames）：非分片帧照常分发给 dispatch。
+// 超时、拒绝、校验失败都返回错误。
 //
 // 接收者 n 是本节点（子）。
 //
@@ -354,6 +444,7 @@ func (n *Node) pullBinary(u *Upstream, ctx context.Context,
 	}
 	target := info.Path
 	tmp := filepath.Join(dir, "."+filepath.Base(target)+stagingSuffix)
+	_ = os.Remove(tmp) // 清掉上一次失败的残留（下面用 O_TRUNC 建新文件）
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o700)
 	if err != nil {
 		return nil, fmt.Errorf("开暂存文件 %s: %w", tmp, err)
@@ -367,17 +458,48 @@ func (n *Node) pullBinary(u *Upstream, ctx context.Context,
 		}
 	}()
 
+	// ① 先要清单（片级 sha256）。拿不到就退回旧路径。
+	manifest := n.fetchManifest(u, ctx, frames, wantHash)
+	pieceHashes := manifest.GetPieceSha256()
+	useStore := len(pieceHashes) > 0 && n.pieces != nil
+
+	// ② 断点续传：片存里"从第 0 片起连续存在"的片数就是本次的起点。
+	// 只有拿到清单才敢续 —— 没有清单时既不知道父的片大小、也无法校验已有片。
+	fromIndex := int64(0)
+	if useStore {
+		fromIndex = int64(n.pieces.Prefix(wantHash))
+		if fromIndex > int64(len(pieceHashes)) {
+			fromIndex = 0 // 片存与清单对不上（父换了 chunk_size？）→ 老老实实从头来
+		}
+	}
+
+	// ③ 片已经集齐（上一次同步在"拼装 / 替换"之前中断了）：一片都不用再要，直接拼装。
+	// 这一支必须显式处理 —— 否则会带着 from_index = 总片数 去申请，父端把它当成越界 clamp 回 0
+	// 从头重发，子端立刻报"分片顺序不对"。这是端到端测试抓出来的第二种故障。
+	if useStore && fromIndex >= int64(len(pieceHashes)) {
+		n.Log.Info("片存已集齐，直接拼装（不必再向父申请）",
+			"hash", shortHash(wantHash), "pieces", len(pieceHashes))
+		st, err := n.assembleFromStore(f, tmp, target, wantHash, wantSize, pieceHashes)
+		if err != nil {
+			return nil, err
+		}
+		keep = true
+		return st, nil
+	}
+
 	if err := u.send(&pb.UpFrame{ProtoVersion: protoVersion, NodeId: n.C().Node.ID,
 		Frame: &pb.UpFrame_BinaryReq{BinaryReq: &pb.BinaryReq{
-			WantHash: wantHash, MaxBytes: cfg.MaxTransferBytes(),
+			WantHash: wantHash, MaxBytes: cfg.MaxTransferBytes(), FromIndex: fromIndex,
 		}}}); err != nil {
 		return nil, fmt.Errorf("发申请帧: %w", err)
 	}
-	n.Log.Info("已向父申请它的可执行文件", "want", shortHash(wantHash), "staging", tmp)
+	n.Log.Info("已向父申请它的可执行文件", "want", shortHash(wantHash), "staging", tmp,
+		"manifest", useStore, "from_piece", fromIndex)
 
 	h := sha256.New()
-	var written int64
-	nextIndex := int32(0)
+	// 续传时"已收字节数"从片边界起算：它同时是下一片必须落到的 offset
+	written := fromIndex * manifest.GetChunkSize()
+	nextIndex := int32(fromIndex)
 	for {
 		select {
 		case <-ctx.Done():
@@ -414,10 +536,27 @@ func (n *Node) pullBinary(u *Upstream, ctx context.Context,
 			if int64(len(payload)) > cfg.MaxTransferBytes() {
 				return nil, errors.New("单片超过配置的字节上限")
 			}
-			if _, err := f.Write(payload); err != nil {
-				return nil, fmt.Errorf("写暂存文件: %w", err)
+			if useStore {
+				// 片级 sha256：这是"片可以对外转发"的唯一依据（crc32 只查传输损坏）
+				idx := int(chunk.GetIndex())
+				if idx < 0 || idx >= len(pieceHashes) {
+					return nil, fmt.Errorf("父给了清单外的片号 %d（清单共 %d 片）", idx, len(pieceHashes))
+				}
+				if !bytes.Equal(pieceDigest(payload), pieceHashes[idx]) {
+					n.Metrics.Inc("selfupdate_pieces_received_total", "result", "rejected")
+					return nil, fmt.Errorf("第 %d 片 sha256 校验不过（内容非本镜像的一片）", idx)
+				}
+				if err := n.pieces.Put(wantHash, chunk.GetIndex(), payload); err != nil {
+					n.Metrics.Inc("selfupdate_pieces_received_total", "result", "rejected")
+					return nil, fmt.Errorf("写片存: %w", err)
+				}
+				n.Metrics.Inc("selfupdate_pieces_received_total", "result", "ok")
+			} else {
+				if _, err := f.Write(payload); err != nil {
+					return nil, fmt.Errorf("写暂存文件: %w", err)
+				}
+				h.Write(payload)
 			}
-			h.Write(payload)
 			written += int64(len(payload))
 			if written > cfg.MaxTransferBytes() {
 				return nil, fmt.Errorf("收到的字节数超过 selfupdate.max_bytes(%d)", cfg.MaxTransferBytes())
@@ -427,6 +566,18 @@ func (n *Node) pullBinary(u *Upstream, ctx context.Context,
 				continue
 			}
 			// ---- 最后一片：整份校验 ----
+			if useStore {
+				// 统一拼装（见 assembleFromStore 的注释：续传时前半段只存在于片存里）
+				st, err := n.assembleFromStore(f, tmp, target, wantHash, wantSize, pieceHashes)
+				if err != nil {
+					return nil, err
+				}
+				keep = true
+				if rm := n.pieces.Evict(); rm > 0 {
+					n.Log.Info("片存已按上限清理", "removed", rm)
+				}
+				return st, nil
+			}
 			got := buildinfo.HashPrefix + hex.EncodeToString(h.Sum(nil))
 			if got != wantHash {
 				return nil, fmt.Errorf("整份哈希对不上：实收 %s，期望 %s", shortHash(got), shortHash(wantHash))
@@ -442,10 +593,71 @@ func (n *Node) pullBinary(u *Upstream, ctx context.Context,
 			}
 			keep = true
 			n.Log.Info("父的可执行文件已收齐并校验通过",
-				"bytes", written, "chunks", nextIndex, "hash", shortHash(got))
+				"bytes", written, "chunks", nextIndex, "hash", shortHash(got),
+				"piece_store", useStore, "resumed_from", fromIndex)
+			if n.pieces != nil {
+				if rm := n.pieces.Evict(); rm > 0 {
+					n.Log.Info("片存已按上限清理", "removed", rm)
+				}
+			}
 			return &stagedBinary{tmp: tmp, target: target, mode: n.execMode(), size: written, hash: got}, nil
 		}
 	}
+}
+
+// assembleFromStore 把片存里已集齐的片拼装进暂存文件、做整份校验，返回可替换的暂存镜像。
+//
+// 两个调用点共用它（这也是它被抽出来的原因）：
+//
+//  1. 正常收完最后一片之后；
+//  2. 启动时发现片已经齐了 —— 上一次同步在"拼装 / 替换"之前中断了。
+//
+// **为什么要"统一拼装"而不是"边收边追加"**：断点续传时前半段只存在于片存里、暂存文件里没有，
+// 往暂存文件追加会得到一个内容错位的文件。统一拼装让两条路径走同一段代码，
+// 也就不会有"续传之后文件不对"这种最难查的问题。
+//
+// 接收者 n 是本节点（子）。返回后 **f 已被关闭**，调用方不要再碰它。
+//
+// 参数：
+//
+//	f           — 已打开的暂存文件（写满即用）
+//	tmp         — 暂存文件路径
+//	target      — 目标位置（本进程正在跑的那个文件）
+//	wantHash    — 期望的整份哈希
+//	wantSize    — 期望的字节数（0 = 未知）
+//	pieceHashes — 清单里的片级 sha256（它的长度就是总片数）
+//
+// 返回：
+//
+//	*stagedBinary — 已校验通过、可替换的暂存镜像
+//	error — 片不齐 / 哈希不符 / 字节数不符 / 刷盘失败时返回
+func (n *Node) assembleFromStore(f *os.File, tmp, target, wantHash string,
+	wantSize int64, pieceHashes [][]byte) (*stagedBinary, error) {
+	total := int32(len(pieceHashes))
+	if !n.pieces.Have(wantHash, total) {
+		return nil, errors.New("片存不齐，无法拼装（父少发了片？）")
+	}
+	h := sha256.New()
+	written, err := n.pieces.Assemble(wantHash, total, f, h)
+	if err != nil {
+		return nil, err
+	}
+	got := buildinfo.HashPrefix + hex.EncodeToString(h.Sum(nil))
+	if got != wantHash {
+		return nil, fmt.Errorf("整份哈希对不上：实收 %s，期望 %s", shortHash(got), shortHash(wantHash))
+	}
+	if wantSize > 0 && written != wantSize {
+		return nil, fmt.Errorf("整份字节数对不上：实收 %d，期望 %d", written, wantSize)
+	}
+	if err := f.Sync(); err != nil {
+		return nil, fmt.Errorf("刷盘: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("关闭暂存文件: %w", err)
+	}
+	n.Log.Info("已从片存拼装出完整镜像并校验通过",
+		"bytes", written, "chunks", total, "hash", shortHash(got))
+	return &stagedBinary{tmp: tmp, target: target, mode: n.execMode(), size: written, hash: got}, nil
 }
 
 // stagedBinary 一份已经收齐、校验通过、尚未替换到位的镜像。
@@ -561,13 +773,152 @@ func (n *Node) canServeBinary(cc *childConn) error {
 	return nil
 }
 
-// serveBinary 响应一个子的 BinaryReq：校验申请、复验本地镜像、然后分片推过去。
+// manifestFor 取某份镜像的片清单：**优先**用片存里那份（继承自父、或上次下载时留下的），
+// 没有就从本节点自己的可执行文件现算。
 //
-// 三处安全检查：
-//  1. 申请里的 want_hash 必须与**本节点现在的**镜像哈希逐字节相同（避免"申请到一份已经变了的镜像"）；
-//  2. 发之前用 buildinfo.SameAsDisk 复验磁盘文件仍是启动时那一份 —— 哈希是启动时算的，
-//     中途被人换掉的话，发出去的就是"内容与承诺不符"的东西，宁可不发；
-//  3. 大小上限取 min(申请方给的, 本节点 selfupdate.max_bytes)。
+// 为什么需要"现算"这条兜底：本节点跑的可能不是从父那儿下载来的那份镜像（根节点就是最典型的例子
+// —— 它没有父），此时它手上没有任何外部清单，但它**就是标准答案**，有资格自己算一份给下级用。
+//
+// 接收者 h 是下行侧（服务端）的连接管理器（`h.n` 是父）。
+//
+// 参数：
+//
+//	hash — 目标镜像的整份哈希
+//
+// 返回：
+//
+//	*pb.BinaryManifest — 可用的清单；没有片存且又算不出来（读不到文件 / 磁盘文件已被换掉）时返回 nil
+func (h *Hub) manifestFor(hash string) *pb.BinaryManifest {
+	n := h.n
+	if n.pieces != nil {
+		if m := n.pieces.Manifest(hash); m != nil {
+			return m
+		}
+	}
+	info := n.Build()
+	if !info.Known() || info.Hash != hash {
+		return nil // 申请的不是"我跑的那份"，我没有它的清单
+	}
+	// 现算之前必须确认磁盘文件仍是启动时那一份：否则算出来的片级哈希对应的是另一份内容，
+	// 子每片都能"校验通过"、最后整份对不上，会得到一条很难懂的错误。
+	if ok, err := buildinfo.SameAsDisk(info); err != nil || !ok {
+		n.Log.Error("本地可执行文件已被替换 / 读不到，无法为它生成镜像清单",
+			"path", info.Path, "err", err)
+		return nil
+	}
+	chunkSize := int64(n.C().SelfUpdate.ChunkBytes())
+	if chunkSize <= 0 {
+		return nil
+	}
+	m, err := buildManifest(info, chunkSize)
+	if err != nil {
+		n.Log.Warn("生成本节点镜像清单失败", "err", err)
+		return nil
+	}
+	if n.pieces != nil {
+		if err := n.pieces.PutManifest(hash, m); err != nil {
+			n.Log.Warn("清单落盘失败（不影响本次供片）", "err", err)
+		}
+	}
+	n.Log.Info("已为本节点镜像生成片清单", "hash", info.Short(), "pieces", len(m.PieceSha256), "chunk", chunkSize)
+	return m
+}
+
+// buildManifest 读一份镜像文件、按 chunkSize 切片并算出片级 sha256 清单。
+//
+// 参数：
+//
+//	info      — 镜像身份快照（提供路径、哈希、字节数）
+//	chunkSize — 片大小（必须与推片时用的一致）
+//
+// 返回：
+//
+//	*pb.BinaryManifest — 清单（piece_sha256 的顺序与片号一致）
+//	error — 打开文件失败 / 读失败时返回
+func buildManifest(info buildinfo.Info, chunkSize int64) (*pb.BinaryManifest, error) {
+	if chunkSize <= 0 {
+		return nil, errors.New("chunk size 必须为正")
+	}
+	f, err := os.Open(info.Path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	m := &pb.BinaryManifest{Hash: info.Hash, Size: info.Size, ChunkSize: chunkSize}
+	buf := make([]byte, chunkSize)
+	for {
+		n, err := io.ReadFull(f, buf)
+		if n > 0 {
+			m.PieceSha256 = append(m.PieceSha256, pieceDigest(buf[:n]))
+		}
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return m, nil
+}
+
+// serveManifest 响应一个子的 BinaryManifestReq：把清单发过去（子据此做片级 sha256 校验）。
+//
+// 接收者 h 是下行侧（服务端）的连接管理器。本函数由 dispatch 起在独立协程里跑
+// （本节点没继承到清单时要从自己的镜像现算，那是几十 MB 的哈希，绝不能压在读循环上）。
+//
+// 参数：
+//
+//	cc  — 发起申请的子连接
+//	req — 申请内容（want_hash）
+func (h *Hub) serveManifest(cc *childConn, req *pb.BinaryManifestReq) {
+	n := h.n
+	send := func(reason string) {
+		_ = cc.send(&pb.DownFrame{ProtoVersion: protoVersion, Frame: &pb.DownFrame_BinaryManifest{
+			BinaryManifest: &pb.BinaryManifest{Reason: reason}}})
+	}
+	if err := n.canServeBinary(cc); err != nil {
+		n.Log.Warn("拒绝子的镜像清单申请", "child", shortID(cc.nodeID), "err", err)
+		n.Metrics.Inc("selfupdate_serve_total", "result", "rejected")
+		send(err.Error())
+		return
+	}
+	if req.GetWantHash() == "" {
+		send("ERR_BINARY_MANIFEST_NO_HASH")
+		return
+	}
+	m := h.manifestFor(req.GetWantHash())
+	if m == nil {
+		// 子会据此回退到"crc32 + 整份 sha256"的旧流程，所以这不是错误，只是一条 info
+		n.Log.Info("没有该镜像的清单，子将走旧流程", "child", shortID(cc.nodeID),
+			"want", shortHash(req.GetWantHash()))
+		send("ERR_BINARY_NO_MANIFEST")
+		return
+	}
+	if m.GetHash() != req.GetWantHash() {
+		send("ERR_BINARY_HASH_MISMATCH")
+		return
+	}
+	_ = cc.send(&pb.DownFrame{ProtoVersion: protoVersion,
+		Frame: &pb.DownFrame_BinaryManifest{BinaryManifest: m}})
+	n.Log.Info("已下发镜像清单", "child", shortID(cc.nodeID),
+		"hash", shortHash(m.GetHash()), "pieces", len(m.GetPieceSha256()))
+}
+
+// serveBinary 响应一个子的 BinaryReq：校验申请、复验本地镜像（或从片存取片），然后分片推过去。
+//
+// **供片来源二选一**（这是"边收边转发"的落点）：
+//
+//   - **片存**：里面每一片都有 sha256 背书，所以**不需要**"磁盘文件仍是启动时那份"这个前提。
+//     于是中继还没收完、还没重启，就已经能把已收到的片转发给它的直接子 —— 收敛从
+//     "逐层串行"变成"流水线"。
+//   - **本节点自己的可执行文件**（老路径）：发之前必须用 buildinfo.SameAsDisk 复验
+//     磁盘文件仍是启动时那一份 —— 哈希是启动时算的，中途被人换掉的话，发出去的就是
+//     "内容与承诺不符"的东西，宁可不发。
+//
+// 三处安全检查（与前两条并列的第三条）：
+//
+//  3. 申请里的 want_hash 必须与**本节点现在的**镜像哈希逐字节相同（避免"申请到一份已经变了的镜像"）；
+//     大小上限取 min(申请方给的, 本节点 selfupdate.max_bytes)。
 //
 // 推分片用 cc.sendThrottled：先等发送缓冲回落到一半以下再压下一片，给同一时刻的心跳、
 // 终态这类必经帧留出位置（否则几十 MB 的分片会把缓冲占满，把续租响应挤掉）。
@@ -577,7 +928,7 @@ func (n *Node) canServeBinary(cc *childConn) error {
 // 参数：
 //
 //	cc  — 发起申请的子连接
-//	req — 申请内容（want_hash / max_bytes）
+//	req — 申请内容（want_hash / max_bytes / from_index）
 func (h *Hub) serveBinary(cc *childConn, req *pb.BinaryReq) {
 	n := h.n
 	if err := n.canServeBinary(cc); err != nil {
@@ -599,15 +950,6 @@ func (h *Hub) serveBinary(cc *childConn, req *pb.BinaryReq) {
 			Final: true, Reason: "ERR_BINARY_HASH_MISMATCH"})
 		return
 	}
-	ok, err := buildinfo.SameAsDisk(info)
-	if err != nil || !ok {
-		n.Log.Error("本地可执行文件已被替换 / 读不到，拒绝外发（重启本节点后才会重新对外提供）",
-			"path", info.Path, "err", err)
-		n.Metrics.Inc("selfupdate_serve_total", "result", "rejected")
-		h.sendBinaryChunk(cc, &pb.BinaryChunk{Hash: info.Hash, Size: info.Size,
-			Final: true, Reason: "ERR_BINARY_LOCAL_CHANGED"})
-		return
-	}
 	maxBytes := n.C().SelfUpdate.MaxTransferBytes()
 	if req.GetMaxBytes() > 0 && req.GetMaxBytes() < maxBytes {
 		maxBytes = req.GetMaxBytes()
@@ -618,37 +960,97 @@ func (h *Hub) serveBinary(cc *childConn, req *pb.BinaryReq) {
 		return
 	}
 
-	f, err := os.Open(info.Path)
-	if err != nil {
-		h.sendBinaryErr(cc, "ERR_BINARY_OPEN_FAILED")
+	// 片大小以**清单**为准（子存的那些片是按清单的片边界切出来的）；没有清单就用本地配置。
+	// 两者不一致会导致"片号/偏移对不上"或"拼装出来字节错位"，所以这里必须统一口径。
+	chunkSize := int64(n.C().SelfUpdate.ChunkBytes())
+	if m := h.manifestFor(info.Hash); m != nil && m.GetChunkSize() > 0 {
+		chunkSize = m.GetChunkSize()
+	}
+	if chunkSize <= 0 {
+		h.sendBinaryErr(cc, "ERR_BINARY_BAD_CHUNK_SIZE")
 		return
 	}
-	defer f.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), n.C().SelfUpdate.Timeout())
-	defer cancel()
-
-	chunkSize := n.C().SelfUpdate.ChunkBytes()
-	total := int32((info.Size + int64(chunkSize) - 1) / int64(chunkSize))
+	total := int32((info.Size + chunkSize - 1) / chunkSize)
 	if total == 0 {
 		total = 1 // 空文件也给一片（子端据此判定收齐）
 	}
-	n.Log.Info("开始向子推送本节点的可执行文件", "child", shortID(cc.nodeID),
-		"hash", info.Short(), "bytes", info.Size, "chunks", total)
-	buf := make([]byte, chunkSize)
-	var off int64
-	for i := int32(0); i < total; i++ {
-		want := int64(chunkSize)
-		if rest := info.Size - off; rest < want {
-			want = rest
+	fromIndex := int32(req.GetFromIndex())
+	if fromIndex < 0 || fromIndex >= total {
+		fromIndex = 0
+	}
+
+	// 供片并发闸门：中继可能一边向父拉、一边给多个孙推，不限并发会把它自己的带宽吃光。
+	// 这里用"等一会儿再放弃"而不是"立刻拒绝"——子端一次失败就要等下一轮重连才重试，
+	// 太容易把收敛拖慢。等到超时再拒，至少给了它一个排队的机会。
+	ctx, cancel := context.WithTimeout(context.Background(), n.C().SelfUpdate.Timeout())
+	defer cancel()
+	if n.serveSem != nil {
+		select {
+		case n.serveSem <- struct{}{}:
+			defer func() { <-n.serveSem }()
+		case <-ctx.Done():
+			n.Log.Warn("供片并发已满，拒绝本次申请", "child", shortID(cc.nodeID))
+			n.Metrics.Inc("selfupdate_serve_total", "result", "busy")
+			h.sendBinaryChunk(cc, &pb.BinaryChunk{Hash: info.Hash, Size: info.Size,
+				Final: true, Reason: "ERR_BINARY_BUSY"})
+			return
 		}
-		payload := buf[:want]
-		if want > 0 {
-			if _, err := io.ReadFull(f, payload); err != nil {
-				n.Log.Error("读本节点可执行文件失败，中断推送", "err", err, "offset", off)
-				h.sendBinaryChunk(cc, &pb.BinaryChunk{Final: true, Reason: "ERR_BINARY_READ_FAILED"})
+	}
+
+	useStore := n.pieces != nil && n.pieces.Have(info.Hash, total)
+	var f *os.File
+	if !useStore {
+		ok, err := buildinfo.SameAsDisk(info)
+		if err != nil || !ok {
+			n.Log.Error("本地可执行文件已被替换 / 读不到，拒绝外发（重启本节点后才会重新对外提供）",
+				"path", info.Path, "err", err)
+			n.Metrics.Inc("selfupdate_serve_total", "result", "rejected")
+			h.sendBinaryChunk(cc, &pb.BinaryChunk{Hash: info.Hash, Size: info.Size,
+				Final: true, Reason: "ERR_BINARY_LOCAL_CHANGED"})
+			return
+		}
+		var oerr error
+		f, oerr = os.Open(info.Path)
+		if oerr != nil {
+			h.sendBinaryErr(cc, "ERR_BINARY_OPEN_FAILED")
+			return
+		}
+		defer f.Close()
+	}
+
+	n.Log.Info("开始向子推送本节点的可执行文件", "child", shortID(cc.nodeID),
+		"hash", info.Short(), "bytes", info.Size, "chunks", total,
+		"from", fromIndex, "source", map[bool]string{true: "piece-store", false: "disk"}[useStore])
+	buf := make([]byte, chunkSize)
+	off := int64(fromIndex) * chunkSize
+	for i := fromIndex; i < total; i++ {
+		var payload []byte
+		if useStore {
+			piece, ok := n.pieces.Get(info.Hash, i)
+			if !ok {
+				// 片存不齐（清理 / 单文件损坏）：明确报错，让子下一轮重来
+				n.Log.Warn("片存缺片，中断推送", "index", i, "child", shortID(cc.nodeID))
+				h.sendBinaryChunk(cc, &pb.BinaryChunk{Final: true, Reason: "ERR_BINARY_PIECE_MISSING"})
 				n.Metrics.Inc("selfupdate_serve_total", "result", "error")
 				return
+			}
+			payload = piece
+		} else {
+			want := chunkSize
+			if rest := info.Size - off; rest < want {
+				want = rest
+			}
+			if want < 0 {
+				want = 0
+			}
+			payload = buf[:want]
+			if want > 0 {
+				if _, err := io.ReadFull(f, payload); err != nil {
+					n.Log.Error("读本节点可执行文件失败，中断推送", "err", err, "offset", off)
+					h.sendBinaryChunk(cc, &pb.BinaryChunk{Final: true, Reason: "ERR_BINARY_READ_FAILED"})
+					n.Metrics.Inc("selfupdate_serve_total", "result", "error")
+					return
+				}
 			}
 		}
 		chunk := &pb.BinaryChunk{
@@ -662,9 +1064,12 @@ func (h *Hub) serveBinary(cc *childConn, req *pb.BinaryReq) {
 			n.Metrics.Inc("selfupdate_serve_total", "result", "error")
 			return
 		}
+		n.Metrics.Inc("selfupdate_serve_pieces_total", "source",
+			map[bool]string{true: "piece-store", false: "disk"}[useStore])
 		off += int64(len(payload))
 	}
-	n.Log.Info("可执行文件推送完成", "child", shortID(cc.nodeID), "hash", info.Short(), "bytes", off)
+	n.Log.Info("可执行文件推送完成", "child", shortID(cc.nodeID), "hash", info.Short(),
+		"bytes", off, "from", fromIndex, "source", map[bool]string{true: "piece-store", false: "disk"}[useStore])
 	n.Metrics.Inc("selfupdate_serve_total", "result", "sent")
 }
 

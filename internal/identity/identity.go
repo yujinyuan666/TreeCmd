@@ -466,10 +466,13 @@ func GenerateRoot(nodeID string) (*Identity, error) {
 	}
 	now := time.Now().Add(-time.Minute)
 	caTmpl := &x509.Certificate{
-		SerialNumber:          sn,
-		Subject:               pkix.Name{CommonName: nodeID + "-root-ca", Organization: []string{"treecmd"}},
-		NotBefore:             now,
-		NotAfter:              now.AddDate(10, 0, 0),
+		SerialNumber: sn,
+		Subject:      pkix.Name{CommonName: nodeID + "-root-ca", Organization: []string{"treecmd"}},
+		NotBefore:    now,
+		// 根的 CA 证书同样走包级 lifetime（security.ca_cert_days，默认 3650 = 10 年）。
+		// 它不再"只能一次性生成"：根自己可以在运行期把这张证书换掉（只换证书、不换密钥），
+		// 见 ReissueCAFor 与 node.renewSelfCert。
+		NotAfter:              now.AddDate(0, 0, lifetime.CADays),
 		IsCA:                  true,
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature | x509.KeyUsageCRLSign,
@@ -548,10 +551,53 @@ func (id *Identity) IssueChild(childNodeID string, withCA bool) (*Identity, erro
 	return out, nil
 }
 
+// CertLifetime 证书生命期（天）。默认值就是本项目的**历史行为**，改它属于运维调参。
+//
+// 两个口径为什么差这么多（见 7.7 与 README「证书生命周期」）：
+//   - 身份证书短：换证只影响自己，代价小，所以走"父给子重签 / 根自签重签"，30 天 + 2/3 处换发；
+//   - CA 证书长：它是**全树信任锚链的一环**，换它会让所有下级都要重新分发 trust/。
+//     所以默认给 10 年 —— 但**不代表不能换**：CA 证书可以"只换证书、不换密钥"地在线轮换
+//     （公钥不变 ⇒ 下级手里的旧 CA 证书仍有效、根锚完全不用动），见 ReissueCAFor。
+type CertLifetime struct {
+	IdentityDays int // 身份证书，默认 30
+	CADays       int // CA 证书，默认 3650（10 年）
+}
+
+// defaultLifetime 是"没配过"时的取值，与本项目历史行为逐字节一致。
+var defaultLifetime = CertLifetime{IdentityDays: 30, CADays: 3650}
+
+// lifetime 是当前生效的生命期。只在进程启动时被 SetCertLifetime 改一次，
+// 之后全程只读 —— 所以不需要加锁（Go 的内存模型下，启动期写入对之后所有 goroutine 可见）。
+var lifetime = defaultLifetime
+
+// SetCertLifetime 设置签发时使用的证书生命期（进程启动时调用一次）。
+//
+// 非正数的字段**逐项**回退到默认值：这样"只配了 ca_cert_days"不会把身份证书也变成 0 天。
+//
+// 参数：
+//
+//	l — 期望的生命期（天）；IdentityDays / CADays 非正时各自取默认
+func SetCertLifetime(l CertLifetime) {
+	if l.IdentityDays <= 0 {
+		l.IdentityDays = defaultLifetime.IdentityDays
+	}
+	if l.CADays <= 0 {
+		l.CADays = defaultLifetime.CADays
+	}
+	lifetime = l
+}
+
+// CertLifetimeNow 返回当前生效的证书生命期（供日志与展示）。
+//
+// 返回：
+//
+//	CertLifetime — 当前值（未被 SetCertLifetime 改过时就是默认值）
+func CertLifetimeNow() CertLifetime { return lifetime }
+
 // issueCert 用父证书与父私钥签发一张证书，是本包里唯一的底层签发原语。
 //
 // isCA 为 true 时签出 CA 证书（IsCA + keyUsage certSign），否则签普通身份证书；
-// 两种证书都写入 SAN "spiffe://treecmd/node/<cn>"，有效期 30 天（见 7.7）。
+// 两种证书都写入 SAN "spiffe://treecmd/node/<cn>"，有效期由包级 lifetime 决定（见 7.7）。
 // NotBefore 取 now，调用方传入的 now 通常已往前放宽 1 分钟以吸收机器间时钟偏差。
 //
 // 参数：
@@ -561,32 +607,59 @@ func (id *Identity) IssueChild(childNodeID string, withCA bool) (*Identity, erro
 //	parent — 签发者（父）的证书
 //	parentKey — 签发者（父）的私钥，用于给新证书签名
 //	isCA — 是否签成 CA 证书
-//	now — 生效时间基准；NotAfter 固定为 now 之后 30 天
+//	now — 生效时间基准；NotAfter = now + 包级 lifetime 里对应的天数
 //
 // 返回：
 //
 //	*x509.Certificate — 签发好的证书
 //	error — 序列号生成 / 证书创建失败 / 结果解析失败时返回
 func issueCert(cn string, pub ed25519.PublicKey, parent *x509.Certificate, parentKey ed25519.PrivateKey, isCA bool, now time.Time) (*x509.Certificate, error) {
+	return issueCertWithSubject(cn, nil, pub, parent, parentKey, isCA, now)
+}
+
+// issueCertWithSubject 与 issueCert 相同，但可以**逐字节指定 Subject 的 DER**。
+//
+// 为什么需要它（这是"CA 证书在线轮换"能不能成立的关键，实测踩过）：
+// x509 里"同名"是按 **RawSubject 的字节**判的，而不是按人眼看到的 CN/O。而**同一个逻辑名字
+// 由不同工具生成的 DER 并不相同** —— 例如 openssl 与 Go 的 RDN 顺序就不一样
+// （`openssl x509 -subject` 会把顺序归一化后打印，所以肉眼看不出差别，但字节确实不同）。
+// 重签如果只是"用同样的 CN/O 重建一个 pkix.Name"，就会得到一张**核验方认不出是这个 subject**
+// 的证书：既有的对端拿手里的旧证书当锚，再也链不上 —— 表现为
+// `x509: certificate signed by unknown authority`，而所有证书的公钥还都是同一把。
+//
+// 所以重签路径（reissueWith）必须把旧证书的 RawSubject 原样传进来。
+//
+// 参数：
+//
+//	cn — Subject.CommonName；subjectDER 为空时用它 + Organization=treecmd 现造一个 Subject
+//	subjectDER — 非空则**逐字节沿用**它作为证书的 Subject（并忽略 cn 对 Subject 的影响，
+//	             cn 仍用于 SAN 与日志）
+//	pub / parent / parentKey / isCA / now — 同 issueCert
+//
+// 返回：
+//
+//	*x509.Certificate — 签发好的证书
+//	error — 序列号生成 / 证书创建失败 / 结果解析失败时返回
+func issueCertWithSubject(cn string, subjectDER []byte, pub ed25519.PublicKey,
+	parent *x509.Certificate, parentKey ed25519.PrivateKey, isCA bool, now time.Time) (*x509.Certificate, error) {
 	sn, err := serial()
 	if err != nil {
 		return nil, err
 	}
 	sanURI, _ := url.Parse("spiffe://treecmd/node/" + cn)
-	// 有效期：身份证书短、CA 证书长。
+	// 有效期取包级 lifetime（默认 身份证书 30 天 / CA 证书 10 年，可用
+	// security.identity_cert_days 与 security.ca_cert_days 覆盖）。
 	//
-	// 身份证书走"运行期续签"（父给子重签 / 根自签重签），30 天 + 生命期 2/3 处换发，
-	// 换证只影响自己，代价小。
-	// CA 证书则是**全树信任锚链的一环**：换 CA 意味着所有下级节点都要重新分发 trust/，
-	// 所以给它长有效期（10 年），让它稳定；否则有下级的节点（中继）会陷入
-	// "CA 证书 30 天到期、而续签只换身份证书链"的死角（启动强校验会因 CA 过期拒绝启动）。
-	notAfter := now.AddDate(0, 0, 30)
+	// 30 天的身份证书配"运行期续签"（父给子重签 / 根自签重签）：换证只影响自己，代价小。
+	// CA 证书则长得多 —— 它是**全树信任锚链的一环**，换它历史上意味着所有下级重新分发 trust/；
+	// 现在有了 ReissueCAFor（只换证书、不换密钥），CA 证书也能在线轮换，但默认值不变。
+	days := lifetime.IdentityDays
 	if isCA {
-		notAfter = now.AddDate(10, 0, 0)
+		days = lifetime.CADays
 	}
+	notAfter := now.AddDate(0, 0, days)
 	tmpl := &x509.Certificate{
 		SerialNumber:          sn,
-		Subject:               pkix.Name{CommonName: cn, Organization: []string{"treecmd"}},
 		NotBefore:             now,
 		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageDigitalSignature,
@@ -594,10 +667,17 @@ func issueCert(cn string, pub ed25519.PublicKey, parent *x509.Certificate, paren
 		BasicConstraintsValid: true,
 		URIs:                  []*url.URL{sanURI},
 	}
+	if len(subjectDER) > 0 {
+		// 逐字节沿用：Go 的 CreateCertificate 见到 RawSubject 非空就**不再用 Subject 重编码**
+		tmpl.RawSubject = subjectDER
+	} else {
+		tmpl.Subject = pkix.Name{CommonName: cn, Organization: []string{"treecmd"}}
+	}
 	if isCA {
 		tmpl.IsCA = true
-		tmpl.KeyUsage = x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature
-		tmpl.Subject.CommonName = cn
+		// CRLSign 与 GenerateRoot 生成的根 CA 证书保持一致：CA 轮换（ReissueCAFor）如果丢了它，
+		// 就会出现"轮换后的 CA 证书比原来少一项权限"这种难解释的差异。
+		tmpl.KeyUsage = x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature | x509.KeyUsageCRLSign
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, pub, parentKey)
 	if err != nil {
@@ -622,24 +702,99 @@ func issueCert(cn string, pub ed25519.PublicKey, parent *x509.Certificate, paren
 //	[]byte — 新证书 + owner.CAChain 拼接成的 PEM 字节
 //	error — owner 无 CA 材料 / 旧证书不是 Ed25519 / 签发失败时返回
 func ReissueFor(existing *x509.Certificate, owner *Identity) ([]byte, error) {
+	_, pemBytes, err := reissueWith(existing, owner, false)
+	return pemBytes, err
+}
+
+// ReissueCAFor 用本节点的 CA 材料为"**同一把 CA 密钥**"重签一张新的 CA 证书。
+//
+// 这是"CA 证书在线轮换"的底层原语。与 ReissueFor 的唯一区别是签出来的是 CA 证书
+// （IsCA + keyUsage certSign），而**公钥与 CN 完全沿用旧证书** —— 这条不变式就是
+// "换了 CA 证书却不用重分发 trust/"的全部依据：
+//
+//   - 下级手里的链里含**旧** CA 证书，旧证书在自己有效期内依然有效 ⇒ 链照样验得通；
+//   - 新入网的下级拿到**新** CA 证书 ⇒ 也验得通（签发者公钥没变）；
+//   - 下级用 trust/ 里的**根**当锚去验新证书 ⇒ 验签结果与验旧证书**逐位相同**。
+//
+// **它不解决 CA 密钥轮换**。若 existing 的公钥与 owner 想换的新密钥不同，本函数做不到
+// ——那是另一件事（真换 CA，需要全树重新分发 trust/）。所以调用方必须保证"要续的是同一把密钥"：
+// 父端由 handleCertRenewReq 校验子提交的旧证书派生出的公钥与将要签发的一致。
+//
+// 参数：
+//
+//	existing — 子节点（或根自己）当前那张 CA 证书；只从它取公钥与 CN（形如 "<nodeID>-ca"）
+//	owner — 持有 CA 私钥与 CA 证书的签发方（父 / 根自己）身份包
+//
+// 返回：
+//
+//	*x509.Certificate — 新签出的 CA 证书
+//	[]byte — 新 CA 证书 + owner.CAChain 串接成的 PEM（可直接作为 CA 证书链下发）
+//	error — owner 无 CA 材料 / existing 为空或不是 Ed25519 / 签发失败时返回
+func ReissueCAFor(existing *x509.Certificate, owner *Identity) (*x509.Certificate, []byte, error) {
+	if existing == nil {
+		return nil, nil, errors.New("existing ca certificate missing")
+	}
+	if !existing.IsCA {
+		return nil, nil, errors.New("existing certificate is not a CA certificate")
+	}
+	cert, pemBytes, err := reissueWith(existing, owner, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	// 新 CA 证书的 CN 必须与旧的一致：启动强校验会要求它含本节点 ID（见 ValidateStartup），
+	// 一旦这里漂了，持有它的节点下次启动就会直接 REFUSE TO START。
+	if cert.Subject.CommonName != existing.Subject.CommonName {
+		return nil, nil, fmt.Errorf("CA 证书 CN 在轮换中发生了变化: %q -> %q",
+			existing.Subject.CommonName, cert.Subject.CommonName)
+	}
+	return cert, pemBytes, nil
+}
+
+// reissueWith 底层重签原语：为"同一身份（同一 CN、同一公钥）"用 owner 的 CA 材料重签一张证书。
+//
+// **关键不变式：只换证书、不换密钥** —— 沿用 existing 里的公钥与 CN，所以已有的背书链、
+// origin 验签、CRL 条目、以及下级手里的旧 CA 证书全部照旧。
+//
+// 参数：
+//
+//	existing — 待重签的旧证书；只从它取公钥与 CN（CN 为空时退回 SAN URI 的最后一段）
+//	owner — 持有 CA 私钥与 CA 证书的签发方身份包
+//	isCA — true 签 CA 证书（CA 轮换），false 签身份证书（普通续签）
+//
+// 返回：
+//
+//	*x509.Certificate — 新证书
+//	[]byte — 新证书 + owner.CAChain 串接成的 PEM
+//	error — owner 无 CA 材料 / existing 为空或不是 Ed25519 / 签发失败时返回
+func reissueWith(existing *x509.Certificate, owner *Identity, isCA bool) (*x509.Certificate, []byte, error) {
 	if owner == nil || owner.CAKey == nil || owner.CACert == nil {
-		return nil, errors.New("this node has no CA material to sign with")
+		return nil, nil, errors.New("this node has no CA material to sign with")
+	}
+	if existing == nil {
+		return nil, nil, errors.New("existing certificate missing")
 	}
 	pub, ok := existing.PublicKey.(ed25519.PublicKey)
 	if !ok {
-		return nil, errors.New("existing certificate is not ed25519")
+		return nil, nil, errors.New("existing certificate is not ed25519")
 	}
 	now := time.Now().Add(-time.Minute)
-	cert, err := issueCert(NodeIDFromCert(existing), pub, owner.CACert, owner.CAKey, false, now)
+	// CN 取旧证书的 CN 原文：身份证书是 "<nodeID>"、CA 证书是 "<nodeID>-ca"，
+	// 两种都**原样沿用**，绝不会出现 "-ca-ca" 这种叠加。
+	//
+	// **并且把旧证书的 RawSubject 逐字节传进去** —— 这是整个机制成立的关键：x509 认"同名"认的是
+	// 这串字节，而同一个 CN/O 由 openssl 与 Go 生成出来的 DER 并不相同（RDN 顺序不同）。
+	// 不沿用的话，重签出来的证书会被既有对端判成"另一个 subject"，表现为
+	// `x509: certificate signed by unknown authority`，而公钥明明没变（实测踩过）。
+	cert, err := issueCertWithSubject(NodeIDFromCert(existing), existing.RawSubject,
+		pub, owner.CACert, owner.CAKey, isCA, now)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var out []byte
-	out = append(out, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})...)
+	out := appendPEM(nil, cert)
 	for _, c := range owner.CAChain {
-		out = append(out, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: c.Raw})...)
+		out = appendPEM(out, c)
 	}
-	return out, nil
+	return cert, out, nil
 }
 
 // ParseChainPEM 把 PEM 串接的证书内容解析成证书链，跳过不是 CERTIFICATE 的块。
@@ -802,11 +957,9 @@ func ValidateStartup(id *Identity, caCerts []*x509.Certificate, pubFromFile ed25
 	for _, c := range caCerts {
 		pool.AddCert(c)
 	}
-	inters := x509.NewCertPool()
-	for _, c := range id.Chain[1:] {
-		inters.AddCert(c)
-	}
-	if _, err := id.Cert.Verify(x509.VerifyOptions{Roots: pool, Intermediates: inters, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err != nil {
+	// 链要能接到某个信任锚。走统一的 ChainToAnchor：它会额外认下"CA 证书已在线轮换"
+	// （同密钥、不同证书）这一形态 —— 否则每次轮换完，持有旧 trust/ 的节点都会启动失败。
+	if err := ChainToAnchor(id.Chain, caCerts, renewalGrace); err != nil {
 		return fmt.Errorf("certificate chain does not verify to any trust anchor: %w", err)
 	}
 	pub := PublicKeyOf(id.Key)
@@ -839,13 +992,8 @@ func ValidateStartup(id *Identity, caCerts []*x509.Certificate, pubFromFile ed25
 		if !strings.Contains(id.CACert.Subject.CommonName, id.NodeID) {
 			return fmt.Errorf("CA certificate CN %q does not contain node id", id.CACert.Subject.CommonName)
 		}
-		caInter := x509.NewCertPool()
-		for _, c := range id.CAChain[1:] {
-			caInter.AddCert(c)
-		}
-		if _, err := id.CACert.Verify(x509.VerifyOptions{
-			Roots: pool, Intermediates: caInter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
-		}); err != nil {
+		// CA 证书链同样走 ChainToAnchor：CA 证书轮换后，链里带的是新证书、而信任锚可能还是旧那张。
+		if err := ChainToAnchor(id.CAChain, caCerts, renewalGrace); err != nil {
 			return fmt.Errorf("CA certificate chain does not verify to any trust anchor: %w", err)
 		}
 	}
@@ -970,21 +1118,18 @@ func ChainVerifier(roots *x509.CertPool, expectNodeID string, grace time.Duratio
 		if err != nil {
 			return err
 		}
-		inters := x509.NewCertPool()
+		// 整条链都解析出来：链到锚的判定要逐跳验签，不能只看叶子
+		parsedChain := make([]*x509.Certificate, 0, len(rawCerts))
+		parsedChain = append(parsedChain, leaf)
 		for _, rc := range rawCerts[1:] {
 			if c, err := x509.ParseCertificate(rc); err == nil {
-				inters.AddCert(c)
+				parsedChain = append(parsedChain, c)
 			}
 		}
-		if _, err := leaf.Verify(x509.VerifyOptions{
-			Roots: roots, Intermediates: inters, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
-		}); err != nil {
-			// 续签宽限窗口：证书"刚好过期"时仍允许握手（只有 TLS 层放行，应用层才可能换发新证）
-			if grace > 0 && time.Now().Before(leaf.NotAfter.Add(grace)) && chainTrusts(roots, inters, leaf) {
-				// 通过（renewal-only 的判定在应用层拦截器里做）
-			} else {
-				return fmt.Errorf("peer chain untrusted: %w", err)
-			}
+		// 走统一的 ChainToAnchor：它涵盖正常校验、CA 证书在线轮换（同密钥不同证书）、
+		// 以及 grace>0 时的续签宽限（只认签名不看时间；renewal-only 的拦截在应用层做）。
+		if err := ChainToAnchor(parsedChain, poolSubjects(roots), grace); err != nil {
+			return fmt.Errorf("peer chain untrusted: %w", err)
 		}
 		if expectNodeID != "" {
 			if got := NodeIDFromCert(leaf); got != expectNodeID {
@@ -993,6 +1138,136 @@ func ChainVerifier(roots *x509.CertPool, expectNodeID string, grace time.Duratio
 		}
 		return nil
 	}
+}
+
+// ChainToAnchor 判断一条证书链能否接到给定的信任锚 —— **本包对外只应该有这一个判定入口**。
+//
+// 与直接用 `x509.Verify` 的差别只有一条，但很关键：**允许链末端的自签证书与某个信任锚
+// "同一把密钥、不同一张证书"**（同 subject、同公钥，只有 serial / 有效期不同）。
+// 这正是 CA 证书**在线轮换**之后的形态（见 ReissueCAFor）：下级手里的 trust/ 还是旧那张，
+// 上游出示的链里带的却是新那张。Go 的 Verify 对"自签证书不在 roots 池里（按字节不比）"
+// 一律判 unknown authority，所以必须有一个集中的地方把这种情况认下来。
+//
+// 为什么必须"集中"：分散在 ValidateStartup / ChainVerifier / 各 apply* 里各写一遍的话，
+// 必然出现"改了一处、漏了另一处" —— 实测踩过：先修了 TLS 对端路径，结果根的自签续期
+// 在 `ValidateStartup` 里被同一类判定挡住，日志只留一句"自签重签后的证书未通过强校验"。
+//
+// 判定顺序（前一个不成立才试下一个，越往后越宽松）：
+//
+//  1. `x509.Verify` —— 正常路径，含有效期与基本约束的完整校验；
+//  2. `chainTrustsSameKey` —— 同密钥锚（CA 证书轮换的正常形态），**仍要求链上证书未过期**；
+//  3. `chainTrusts` —— 只认签名不看时间，用于续签宽限窗口；**grace=0 时不做这一步**。
+//
+// 参数：
+//
+//	chain   — 完整证书链；chain[0] 是叶（对端身份证书 / 本节点 CA 证书），最后一张是自签的根
+//	anchors — 信任锚原始证书列表（允许为空：那就只剩 Verify 会失败）
+//	grace   — 有效期宽限；续签宽限窗口用 renewalGrace，握手路径用调用方给的 grace，
+//	          想"完全不放行过期证书"就传 0
+//
+// 返回：
+//
+//	error — 三种判定都不通过时，返回 `x509.Verify` 的原始错误（最保守、信息最全的那种）
+func ChainToAnchor(chain []*x509.Certificate, anchors []*x509.Certificate, grace time.Duration) error {
+	if len(chain) == 0 {
+		return errors.New("empty certificate chain")
+	}
+	roots := NewPool(anchors...)
+	// intermediates 也用 NewPool 建：chainTrusts 的兜底分支靠池里的旁路索引取原始证书，
+	// 用裸 x509.NewCertPool() 会让那个分支变成永远走不到的死代码（这是本项目原有的一个坑）。
+	inters := NewPool(chain[1:]...)
+	_, err := chain[0].Verify(x509.VerifyOptions{
+		Roots: roots, Intermediates: inters, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+	})
+	if err == nil {
+		return nil
+	}
+	if chainTrustsSameKey(roots, chain, grace) {
+		return nil
+	}
+	if grace > 0 && chainTrusts(roots, inters, chain[0]) {
+		return nil
+	}
+	return err
+}
+
+// chainTrustsSameKey 处理"链末端那张自签证书与本地某个信任锚**同一把密钥、但不是同一张证书**"的情形。
+//
+// 为什么这种情形必须认下：CA 证书可以**在线轮换** —— 只换证书、不换密钥（见 ReissueCAFor）。
+// 下级手里的 `trust/` 还是**旧**那张根证书，而上游出示的链里带的是**新**那张：两者 subject 与
+// 公钥逐字节相同，只有 serial / 有效期不同。Go 的 `x509.Verify` 对"自签证书不在 roots 池里
+// （按字节比不相等）"会判 `unknown authority`，于是**上层没换 trust/ 就再也连不上了** ——
+// 那正是"轮换不需要重新分发 trust/"这条承诺的反面。
+//
+// 判定刻意收得很窄，四条全中才放行（任何一条不满足都回落给调用方原来的错误）：
+//
+//  1. 链里**每一张**证书都还在有效期内（允许 grace 宽限）—— 不因为"要支持轮换"就放行过期证书；
+//  2. 链末端那张证书**自签**（issuer == subject）；
+//  3. 链内**相邻两跳都能验签**，且 issuer/subject 对得上 —— 不能只验末端，否则可以拼一条假链；
+//  4. 末端那张与某个信任锚 **subject 相同 且 公钥逐字节相同**。
+//
+// 注意第 4 条是"同密钥"，不是"同一个 subject"就够 —— 光看 subject 会让任何一张自称同名的
+// 自签证书（攻击者可以随便造一张同名不同密钥的）通过。
+//
+// 参数：
+//
+//	roots — 信任锚池；必须是 identity.NewPool 建的（本函数靠它的旁路索引取原始证书）
+//	chain — 对端发来的完整证书链，chain[0] 是叶子、chain[len-1] 是自签的那张
+//	grace — 有效期宽限（与 ChainVerifier 的 grace 同义）
+//
+// 返回：
+//
+//	bool — 满足上述四条时为 true
+func chainTrustsSameKey(roots *x509.CertPool, chain []*x509.Certificate, grace time.Duration) bool {
+	if len(chain) < 2 {
+		// 只有叶子：那它自己就得是"与锚同密钥的自签证书"，交给下面的第 2/4 条判；
+		// 但至少要有锚可对，所以不在这里提前返回
+		if len(chain) == 0 {
+			return false
+		}
+	}
+	now := time.Now()
+	for _, c := range chain {
+		if now.After(c.NotAfter.Add(grace)) {
+			return false // ① 不因为"要支持轮换"就放行过期证书
+		}
+	}
+	top := chain[len(chain)-1]
+	if !bytesEqual(top.RawIssuer, top.RawSubject) {
+		return false // ② 末端必须自签
+	}
+	for i := 0; i+1 < len(chain); i++ { // ③ 逐跳验签
+		if !bytesEqual(chain[i].RawIssuer, chain[i+1].RawSubject) || chain[i].CheckSignatureFrom(chain[i+1]) != nil {
+			return false
+		}
+	}
+	for _, r := range poolSubjects(roots) { // ④ 同 subject 且同公钥
+		if bytesEqual(r.RawSubject, top.RawSubject) && pubKeyEqual(r, top) {
+			return true
+		}
+	}
+	return false
+}
+
+// pubKeyEqual 报告两张证书的公钥是否逐字节相同（同一把密钥的判据）。
+//
+// 参数：
+//
+//	a, b — 待比较的证书
+//
+// 返回：
+//
+//	bool — 公钥的 PKIX 编码逐字节相同时为 true；任一张编不出来时为 false
+func pubKeyEqual(a, b *x509.Certificate) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	ab, err1 := x509.MarshalPKIXPublicKey(a.PublicKey)
+	bb, err2 := x509.MarshalPKIXPublicKey(b.PublicKey)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return string(ab) == string(bb)
 }
 
 // chainTrusts 忽略有效期、只验证书签名链是否可信（续签宽限窗口专用）。

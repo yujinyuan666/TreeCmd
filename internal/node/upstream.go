@@ -380,6 +380,9 @@ func (u *Upstream) buildRegister() *pb.RegisterRequest {
 		// 本节点跑的是哪份镜像：父端只用它展示（/v1/tree），判定方向是反过来的
 		// ——"子跟父的比"，所以这里上行的是"我自己的哈希"，不是"我希望的哈希"。
 		BinaryHash: u.n.Build().Hash, BinarySize: u.n.Build().Size,
+		// 自己的 CA 证书还剩几天：父手上只有子的身份证书，看不到它的 CA 证书，
+		// 而 CA 证书过期会让本节点下次启动直接起不来 —— 所以由自己上报，父在 /v1/tree 里展示。
+		CaNotAfterDays: caNotAfterDays(u.n.Id()),
 	}
 }
 
@@ -470,7 +473,36 @@ func (u *Upstream) handleHeartbeatAck(ack *pb.HeartbeatAck) {
 
 // ---------- 心跳 ----------
 
+// renewAtStep 周期循环的"小步长"。
+//
+// 心跳与拉取都按 `command.renew_at` 节拍跑，但**不能用 time.NewTicker**：Ticker 的周期在
+// 创建那一刻就固定住了，而 renew_at 是**可热更的运行参数**（`command.` 段，文档承诺 SIGHUP 即生效）。
+// 用 Ticker 的话，热更之后要等**旧周期**走完才生效 —— 实测就是这样：把 renew_at 从 30s 热更到 2s，
+// 子节点仍然按 30s 的旧节奏拉取（验收脚本为此白等了一分钟）。
+//
+// 所以改成"按小步长醒来看一眼，到点了才干活"。步长决定判定误差上限（≤ 1s），
+// 而每秒醒一次对一条网络循环的开销可以忽略；默认 30s 周期下的行为与 Ticker 完全一致。
+const renewAtStep = time.Second
+
+// renewAt 取当前生效的续租 / 拉取周期。
+//
+// 接收者 u 是上行侧（客户端角色）的连接管理器。**每次都现读配置**，所以 SIGHUP 改了
+// `command.renew_at` 之后，下一小步就会按新周期走，不必等旧周期走完、也不必重连。
+//
+// 返回：
+//
+//	time.Duration — command.renew_at 的值；配成非正数时退回 30s 默认值
+func (u *Upstream) renewAt() time.Duration {
+	d := u.n.C().Command.RenewAt
+	if d <= 0 {
+		return 30 * time.Second
+	}
+	return d
+}
+
 // heartbeatLoop 按 RenewAt 周期发送心跳，并把在跑指令作为续租项带上。
+//
+// 周期判定走 renewAtStep + renewAt()（而不是 Ticker），这样 renew_at 热更立刻生效。
 //
 // 接收者 u 是上行侧（客户端角色）的连接管理器。
 //
@@ -479,8 +511,6 @@ func (u *Upstream) handleHeartbeatAck(ack *pb.HeartbeatAck) {
 //	ctx    — 会话上下文，取消后退出循环
 //	stream — 当前 Connect 流
 func (u *Upstream) heartbeatLoop(ctx context.Context, stream pb.NodeService_ConnectClient) {
-	t := time.NewTicker(u.n.C().Command.RenewAt)
-	defer t.Stop()
 	send := func() {
 		u.n.inflight.mu.Lock()
 		ids := make([]string, 0, len(u.n.inflight.m))
@@ -497,11 +527,16 @@ func (u *Upstream) heartbeatLoop(ctx context.Context, stream pb.NodeService_Conn
 		}})
 	}
 	send()
+	last := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-time.After(renewAtStep):
+			if time.Since(last) < u.renewAt() {
+				continue
+			}
+			last = time.Now()
 			send()
 		}
 	}
@@ -511,23 +546,30 @@ func (u *Upstream) heartbeatLoop(ctx context.Context, stream pb.NodeService_Conn
 
 // fetchLoop 按 RenewAt 周期或收到拉取信号时拉取指令队列。
 //
+// 周期判定走 renewAtStep + renewAt()（而不是 Ticker），这样 renew_at 热更立刻生效 ——
+// 这一点对下发背压尤其要紧：父只在**提交那一刻**通知一次，之后剩下的分派全靠子下一次轮询
+// 才拿得到，所以"轮次间隔"就等于 renew_at。用 Ticker 的话，热更被窗口限速时白等一整个旧周期。
+//
 // 接收者 u 是上行侧（客户端角色）的连接管理器。
 //
 // 参数：
 //
 //	ctx — 会话上下文，取消后退出循环
 func (u *Upstream) fetchLoop(ctx context.Context) {
-	t := time.NewTicker(u.n.C().Command.RenewAt)
-	defer t.Stop()
 	// 链路建立后立即触发一次有界重发（3.11 触发点 3）
 	go u.n.resendPending(ctx)
+	last := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-u.n.fetchNotify:
-		case <-t.C:
+		case <-time.After(renewAtStep):
+			if time.Since(last) < u.renewAt() {
+				continue
+			}
 		}
+		last = time.Now()
 		u.fetchOnce(ctx)
 	}
 }
@@ -748,16 +790,19 @@ func (u *Upstream) forceReconnect(reason string) {
 	u.n.Log.Info("force reconnect", "reason", reason)
 }
 
-// sendCertRenewReq 上行证书续签请求。
+// sendCertRenewReq 上行证书续签请求（身份证书，按需顺带 CA 证书）。
 //
 // 接收者 u 是上行侧（客户端角色）的连接管理器。
 //
 // 参数：
 //
-//	reason — 续签原因，随帧上行
-func (u *Upstream) sendCertRenewReq(reason string) {
+//	req — 续签请求；由 requestCertRenew 组装（含 want_ca 与当前 CA 证书）
+func (u *Upstream) sendCertRenewReq(req *pb.CertRenewReq) {
+	if req == nil {
+		return
+	}
 	_ = u.send(&pb.UpFrame{ProtoVersion: protoVersion, NodeId: u.n.C().Node.ID,
-		Frame: &pb.UpFrame_CertRenewReq{CertRenewReq: &pb.CertRenewReq{Reason: reason}}})
+		Frame: &pb.UpFrame_CertRenewReq{CertRenewReq: req}})
 }
 
 // sendCRLReq 上行吊销列表全量拉取请求。

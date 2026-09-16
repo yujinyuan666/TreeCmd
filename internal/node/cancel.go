@@ -172,6 +172,9 @@ func isTerminalCommand(s pb.CommandStatus) bool {
 // RetryNode 运维恢复：把某子的 Assignment 标回 PENDING，四件事必须原子（3.12 / ADR-049 第 8 条）。
 // 成功后还会通知该子重新投递。
 //
+// **重试预算用尽时不是"什么都不做"**：那会把运维唯一能表达的手段也堵死 —— 他会看到一个
+// 永远"等待中"的子，而指令只能一路耗到 deadline（见下面对 ErrRetryExhausted 的说明）。
+//
 // 接收者 n 是本节点实例。
 //
 // 参数：
@@ -181,8 +184,11 @@ func isTerminalCommand(s pb.CommandStatus) bool {
 //
 // 返回：
 //
-//	error — 指令不存在 / 指令非运行中或部分完成 / 无该子的 Assignment / 重试次数用尽 / 落盘失败
+//	error — 指令不存在 / 指令非运行中或部分完成 / 无该子的 Assignment / 落盘失败；
+//	        重试次数用尽时返回 ErrRetryExhausted（**此时该子已被父侧判定为 FAILED**，
+//	        调用方应当据此告诉运维"不是重试失败，是它被判失败了"，而不是报一个普通失败）
 func (n *Node) RetryNode(cmdID, childID string) error {
+	exhausted := false
 	err := n.Store.Update(func(tx *store.Tx) error {
 		rec, ok := tx.GetCommand(cmdID)
 		if !ok {
@@ -196,7 +202,24 @@ func (n *Node) RetryNode(cmdID, childID string) error {
 			return fmt.Errorf("NOT_FOUND: no assignment for child")
 		}
 		if a.RetryCount >= n.C().Command.MaxRetryNodeCount {
-			return ErrRetryExhausted
+			// 重试预算用尽 ⇒ **由父直接判定这个子失败**。
+			//
+			// 这是 `command.max_retry_node_count` 明确承诺过的语义（见 examples/node.yaml：
+			// "单个子节点失败后最多重派几次，超了由父直接判定失败"），而在此之前这半句
+			// 从来没被实现过 —— `ErrRetryExhausted` 只是把错误回给调用方就完事了。
+			// 后果很实在：那个子会一直挂在"等待中"，指令只能等到 deadline 才收尾，
+			// 而运维明明已经用完了全部手段（重派 3 次都不回来）。
+			//
+			// 置成 FAILED 之后，它在 waitChildren 的 partition 里落进 **adjudicated** 分支：
+			// 参与失败策略的 NotDone 统计，但**不进背书链** —— 它没有 Report.Sig，
+			// 硬塞进去就是伪造背书。
+			a.Status = pb.AssignStatus_ASSIGN_STATUS_FAILED
+			a.UpdatedAt = canon.TS(tx.Now)
+			if err := tx.PutAssignment(a); err != nil {
+				return err
+			}
+			exhausted = true
+			return nil
 		}
 		a.Status = pb.AssignStatus_ASSIGN_STATUS_PENDING
 		a.RetryCount++
@@ -214,6 +237,14 @@ func (n *Node) RetryNode(cmdID, childID string) error {
 	})
 	if err != nil {
 		return err
+	}
+	if exhausted {
+		// 唤醒 waitChildren：等待集合刚少了一个，可能现在就能收敛（不必等下一次巡检或死线）。
+		n.signal(cmdID)
+		n.Log.Warn("RetryNode 重试次数用尽：父侧判定该子失败（它不再阻塞本指令收敛）",
+			"cmd", shortID(cmdID), "child", shortID(childID),
+			"max_retry_node_count", n.C().Command.MaxRetryNodeCount)
+		return ErrRetryExhausted
 	}
 	if n.hub != nil {
 		var seq int64

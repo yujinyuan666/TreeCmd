@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -180,6 +181,18 @@ func (n *Node) handleCommandByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := n.RetryNode(id, child); err != nil {
+			// 重试预算用尽不是"重试失败"：那一步已经**由父把这个子判定为 FAILED** 了
+			// （见 RetryNode），所以这里要把"发生了什么"如实告诉调用方，
+			// 而不是把它混在一个普通的 409 里 —— 否则运维会以为什么都没发生，
+			// 而实际上指令已经可以收敛了。
+			if errors.Is(err, ErrRetryExhausted) {
+				writeJSON(w, 200, map[string]any{
+					"command_id": id, "child": child, "retried": false, "judged": "FAILED",
+					"note": "retry budget exhausted: the parent has judged this child FAILED " +
+						"(it will no longer block this command from converging)",
+				})
+				return
+			}
 			writeErr(w, 409, "RETRY_REJECTED", err.Error())
 			return
 		}
@@ -270,7 +283,8 @@ func (n *Node) handleCRL(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleForget 处理 /v1/forget：清理本节点名下失效的直接子节点（见 docs/失效节点清理与版本一致性设计.md）。
+// handleForget 处理 /v1/forget：清理本节点名下失效的直接子节点
+// （设计与取舍见 README 的「失效节点清理：`/v1/forget`」一节）。
 //
 // 接收者 n 是本节点实例。三个动作：
 //

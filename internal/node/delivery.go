@@ -322,11 +322,15 @@ func (n *Node) deriveDelivery(a *pb.AssignmentRecord, base *pb.Command, attempt 
 //
 // 返回：
 //
-//	*pb.FetchResponse — NewSeq（父侧权威的新水位）+ Deliveries（本批下发，受字节上限截断，可能为空）
+//	*pb.FetchResponse — NewSeq（父侧权威的新水位）+ Deliveries（本批下发，受字节上限与在途窗口截断，可能为空）
 //	error            — 账本事务失败时返回
 func (n *Node) buildFetchResponse(childID string, req *pb.FetchRequest) (*pb.FetchResponse, error) {
 	resp := &pb.FetchResponse{}
 	maxBytes := int64(n.C().Command.FetchResponseMaxBytes)
+	// 在途窗口（下发背压）。**放在事务外算**：自适应那一支要读在线子数，而在线子数是连接表的
+	// 实时状态，没必要也不该在账本事务里读。
+	perChildLimit := n.effectiveDispatchWindow()
+	totalLimit := int64(n.C().Command.DispatchWindowTotal())
 	err := n.Store.Update(func(tx *store.Tx) error {
 		wm, ok := tx.GetWatermark(childID)
 		if !ok {
@@ -357,8 +361,26 @@ func (n *Node) buildFetchResponse(childID string, req *pb.FetchRequest) (*pb.Fet
 		now := tx.Now
 		used := int64(0)
 		count := int32(0)
+		// 在途数：进循环前先数一遍，之后每放行一条 +1（本轮事务里只有"放行"会让它变大，
+		// 所以这样数出来的值与逐条重算等价）。窗口两个都关着时**不数** —— 不为没开的功能付费。
+		inflightChild, inflightTotal := int64(0), int64(0)
+		if perChildLimit > 0 || totalLimit > 0 {
+			inflightChild, inflightTotal = countInflight(tx, childID, now)
+		}
 		for _, cmdID := range tx.CommandIDsOfChild(childID) {
 			if req.MaxFetch > 0 && count >= req.MaxFetch {
+				break
+			}
+			// 在途窗口打满 → 直接收工。**用 break 而不是 continue 是安全的**：两个计数在
+			// 循环内只增不减，打满之后后面任何一条都不可能再被放行，继续扫描纯属白扫。
+			// （注意与下面那个按字节的 break 区分开：那里后面的"小"指令本来还塞得进去，
+			// 它 break 是出于带宽预算的取舍，不是因为"后面一定也不行"。）
+			if perChildLimit > 0 && inflightChild >= perChildLimit {
+				n.Metrics.Inc("dispatch_throttled_total", "reason", "child_window")
+				break
+			}
+			if totalLimit > 0 && inflightTotal >= totalLimit {
+				n.Metrics.Inc("dispatch_throttled_total", "reason", "total_window")
 				break
 			}
 			a, ok := tx.GetAssignment(cmdID, childID)
@@ -375,6 +397,9 @@ func (n *Node) buildFetchResponse(childID string, req *pb.FetchRequest) (*pb.Fet
 				}
 				a.Status = pb.AssignStatus_ASSIGN_STATUS_PENDING
 				a.ReclaimCount++
+				// 租约被回收 ⇒ 那个子的状态已经不可知（可能重启过、可能整个换了一批进程），
+				// 连续被退回的次数从这里重新开始数 —— 否则一次颠簸会让退避永久停在封顶值。
+				a.LocalBusyStreak = 0
 				a.LastReclaimAt = canon.TS(now)
 				a.NextAttempt = a.DeliveredAttempt + 1
 			}
@@ -400,6 +425,8 @@ func (n *Node) buildFetchResponse(childID string, req *pb.FetchRequest) (*pb.Fet
 				break
 			}
 			used += sz
+			inflightChild++
+			inflightTotal++
 			a.Status = pb.AssignStatus_ASSIGN_STATUS_LEASED
 			a.Lease = &pb.Lease{Owner: childID, ExpireAt: canon.TS(millisToTime(d.LeaseExpireUnixMs)), Attempt: attempt}
 			a.DeliveredAttempt = attempt
@@ -443,6 +470,105 @@ func (n *Node) touchChild(childID string) {
 	})
 }
 
+// countInflight 数一数"当前在途"的分派：指定子有几条、全节点共几条。
+//
+// 在途的判据只有一条：**状态是 LEASED，且租约仍在有效期内**。下面两种都**不算**，理由各不相同：
+//
+//   - PENDING（含被 LocalBusy 退回、正在退避的）：子还没拿到手，不该占窗口的名额。
+//   - LEASED 但租约已过期：这是"父已经忘了它"的僵尸租约（父重启、或长丢包），本轮循环里
+//     就会把它回收成 PENDING。**若把它也算进窗口，一次父重启就足以让窗口被一批永远
+//     不会回来的租约占满，节点会把自己彻底锁死** —— 这条是必须写下来的，它不是洁癖。
+//
+// 参数：
+//
+//	tx      — 账本事务
+//	childID — 要单独计数的子节点 ID
+//	now     — 判定租约是否有效的"现在"；用 tx.Now，与同一周期里的其它时间判定共用同一个时钟
+//
+// 返回：
+//
+//	child — 该子的在途条数
+//	total — 本节点所有直接子的在途条数（child 是它的子集）
+func countInflight(tx *store.Tx, childID string, now time.Time) (child, total int64) {
+	for _, a := range tx.ScanAssignments() {
+		if a.Status != pb.AssignStatus_ASSIGN_STATUS_LEASED {
+			continue
+		}
+		if a.Lease == nil || !canon.Time(a.Lease.ExpireAt).After(now) {
+			continue
+		}
+		total++
+		if a.ChildId == childID {
+			child++
+		}
+	}
+	return child, total
+}
+
+// inflightByChild 统计每个直接子的在途分派数（判据与 countInflight 完全一致，供指标用）。
+//
+// 接收者 n 是本节点实例。
+//
+// 返回：
+//
+//	map[string]float64 — 键是 `child="<完整 NodeID>"`，值是该子的在途条数；没有在途时返回空 map。
+//	                     聚合值不需要单独出一个指标：`sum(child_dispatch_inflight)` 就是它。
+//
+//	                     **键里用完整 NodeID 而不是前 8 位**：NodeID 是 UUIDv7（时间有序），
+//	                     前 8 位就是毫秒时间戳 —— 同一秒启动的两个子前缀会一模一样，
+//	                     拿前缀当标签会把两个子静默合并成一条曲线（这个坑本仓库已经踩过一次，
+//	                     见片存目录名那次）。
+func (n *Node) inflightByChild() map[string]float64 {
+	out := map[string]float64{}
+	now := time.Now()
+	_ = n.Store.View(func(tx *store.Tx) error {
+		for _, a := range tx.ScanAssignments() {
+			if a.Status != pb.AssignStatus_ASSIGN_STATUS_LEASED {
+				continue
+			}
+			if a.Lease == nil || !canon.Time(a.Lease.ExpireAt).After(now) {
+				continue
+			}
+			out[`child="`+a.ChildId+`"`]++
+		}
+		return nil
+	})
+	return out
+}
+
+// effectiveDispatchWindow 算出本次投递实际生效的"每个直接子的在途窗口"。
+//
+// 接收者 n 是本节点实例。
+//
+// 返回：
+//
+//	int64 — 生效窗口；**0 表示不限**。开了 dispatch_window_adaptive 时取
+//	         min(配置值, max(1, 全局窗口 / 在线子数))：子在线的多就收紧、子掉线就放宽。
+//	         刻意**只在自己那一档上收紧、不反过来把单子上限抬高** ——
+//	         max_dispatch_inflight_per_child 是硬上限，自适应只是"在全局预算里给每个子分多少"。
+func (n *Node) effectiveDispatchWindow() int64 {
+	per := int64(n.C().Command.DispatchWindowPerChild())
+	if per <= 0 || !n.C().Command.DispatchWindowAdaptive {
+		return per
+	}
+	total := int64(n.C().Command.DispatchWindowTotal())
+	if total <= 0 {
+		return per
+	}
+	kids := int64(n.childOnline())
+	if kids < 1 {
+		kids = 1
+	}
+	share := total / kids
+	if share < 1 {
+		share = 1
+	}
+	if share < per {
+		return share
+	}
+	return per
+}
+
 // reclaimExpiredLeases 租约过期扫描（节点级协程，LeaseTTL/3 周期）。
 // 判据只看 Lease.ExpireAt（父时钟），不与 LastSeenAt 比较；回收时不推进 attempt（下次投递时才 +1）。
 //
@@ -463,6 +589,9 @@ func (n *Node) reclaimExpiredLeases(_ context.Context) {
 			}
 			a.Status = pb.AssignStatus_ASSIGN_STATUS_PENDING
 			a.ReclaimCount++
+			// 与 buildFetchResponse 里的内联回收同一条理由：租约被回收说明那个子的状态
+			// 已经不可知（重启 / 网络颠簸），连续被退回的次数从这里重新数。
+			a.LocalBusyStreak = 0
 			a.LastReclaimAt = canon.TS(tx.Now)
 			a.NextAttempt = a.DeliveredAttempt + 1
 			if err := tx.PutAssignment(a); err != nil {

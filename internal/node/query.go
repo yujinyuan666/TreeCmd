@@ -863,6 +863,9 @@ func (n *Node) TreeSnapshot() map[string]any {
 				// 这个子跑的是哪份镜像 + 是不是还没跟上（父端一眼看出收敛进度）
 				"build_hash":     shortHash(c.BuildHash),
 				"build_mismatch": c.BuildHash != "" && mine.Known() && c.BuildHash != mine.Hash,
+				// 这个子**自己的 CA 证书**还剩几天（0 = 它不是中继、没有 CA 证书）。
+				// CA 证书过期会让它下次启动直接起不来，所以值得在拓扑里一眼看见。
+				"ca_not_after_days": c.CADays,
 			})
 		}
 	}
@@ -876,9 +879,16 @@ func (n *Node) TreeSnapshot() map[string]any {
 		"conn_children": n.childOnline(), "index_entries": n.index.len(),
 		"object_store": n.Obj.Dir(),
 		// 本节点自己那份镜像：与每个子上报的 build_hash 比一比，就知道谁还没收敛
-		"build_hash":          n.Build().Short(),
-		"build_version":       n.Build().Version,
+		"build_hash":    n.Build().Short(),
+		"build_version": n.Build().Version,
+		// 本节点自己的证书剩余天数：身份证书与 CA 证书分开给。
+		// 两个都是启动强校验的硬门槛（任一过期 → REFUSE TO START），所以要一起看得见。
+		"cert_not_after_days": certNotAfterDays(n.Id()),
+		"ca_not_after_days":   caNotAfterDays(n.Id()),
 		"lagging_children":    n.laggingChildren(),
+		// 镜像分片缓存的进度：本节点从父那里"收到并验证过"的片到哪了。
+		// 它>0 而 lagging_children 还没归零，就说明"边收边转发"的流水线正在跑。
+		"piece_store":         n.pieceProgress(),
 		"selfupdate_enabled":  n.C().SelfUpdate.SelfUpdateEnabled(),
 		"selfupdate_serve":    n.C().SelfUpdate.ServingChildren(),
 		"selfupdate_enforced": n.C().SelfUpdate.EnforceSync(),

@@ -80,6 +80,13 @@ type Node struct {
 	semLocal chan struct{}
 	inflight *InflightTable
 
+	// pieces 镜像分片缓存（<selfupdate 暂存目录>/pieces）。nil = 未启用 / 建不起来，
+	// 此时"边收边转发"与断点续传都不生效，行为完全回到旧版（见 pieces.go）。
+	pieces *pieceStore
+	// serveSem 供片并发闸门：同时向几个直接子推镜像分片（容量 = selfupdate.max_serve_concurrency）。
+	// 中继可能一边向父拉、一边给多个孙推，不限并发会把它自己的带宽与内存吃光。
+	serveSem chan struct{}
+
 	up  *Upstream
 	hub *Hub
 
@@ -180,6 +187,27 @@ func NewWithPath(cfg *config.Config, cfgPath string, logger *slog.Logger) (*Node
 	// 放在身份材料之前：它不依赖证书，而且"我是哪份镜像"越早出现在日志里越好。
 	n.initBuildInfo()
 
+	// 镜像分片缓存（"边收边转发"的地基，见 pieces.go）与供片并发闸门。
+	// 放在 initBuildInfo 之后：片存目录是相对可执行文件位置推导的（与 selfupdate.dir 同源）。
+	// **目录必须带本节点 ID**：可执行文件所在目录常被多个节点共用，只按哈希分目录会让
+	// 一个节点把另一个节点下载的片当成自己的（见 pieces.go 的文件头）。
+	// 建不起来**不算致命**：只降级为"没有片存"，即完全回到旧行为（整份收完 + 重启才对子供片）。
+	if cfg.SelfUpdate.PieceStoreEnabled() {
+		dir := pieceStoreDir(cfg.SelfUpdate.StagingDir(n.Build().Path), cfg.Node.ID)
+		ps, err := newPieceStore(dir, cfg.SelfUpdate.PieceStoreBytes())
+		if err != nil {
+			n.Log.Warn("片存不可用：本次运行不启用分片缓存与边收边转发", "dir", dir, "err", err)
+		} else {
+			n.pieces = ps
+			if rm := ps.Evict(); rm > 0 {
+				n.Log.Info("片存已按上限清理", "removed", rm, "dir", dir)
+			}
+		}
+	} else {
+		n.Log.Info("片存已关闭（selfupdate.piece_store=false）：收敛仍是逐层串行")
+	}
+	n.serveSem = make(chan struct{}, cfg.SelfUpdate.MaxServeConcurrencyN())
+
 	// 身份材料（selfRenew=true：这是真正的启动装配，允许根在启动时顺带自签续期并落盘）
 	st, err := loadIdentity(cfg, true)
 	if err != nil {
@@ -192,8 +220,31 @@ func NewWithPath(cfg *config.Config, cfgPath string, logger *slog.Logger) (*Node
 		n.Log.Info("证书已自签续期（根没有父，用自己的 CA 重签了一张）",
 			"cert_not_after", canonTime(st.id.Cert), "path", cfg.Security.IdentityCertPath)
 	}
+	// 启动路径顺带轮换了 CA 证书的话，也要留下与运行期一致的那条日志与指标
+	n.noteCARotated(st.caRotated)
 	n.idPtr.Store(st.id)
 	n.roots.Store(st.roots)
+	// 信任锚一个都没配、却靠别的来源拿到了锚 ⇒ 显式留一行说明**是哪来的**：
+	// 这是"子节点只依赖父"落地后的正常形态，但一旦排错（"我没配 ca_cert_paths，它凭什么连上了父"）
+	// 就靠它解释，所以不降级成 Debug。
+	if cfg.HasUpstream() && len(cfg.Security.CACertPaths) == 0 && len(st.cs) > 0 {
+		src := "入网引导凭据（内嵌的父 CA 链）与自身证书链自举"
+		switch {
+		case st.credAnchors == 0:
+			src = "自身证书链自举"
+		case st.selfAnchors == 0:
+			src = "入网引导凭据（内嵌的父 CA 链）"
+		}
+		n.Log.Info("信任锚未配置 security.ca_cert_paths，来自"+src,
+			"anchors", len(st.cs), "from_credential", st.credAnchors, "from_self_chain", st.selfAnchors)
+	}
+	// 开启了入网、自己又可能有下级、却一个许可都没有 ⇒ 现在起会**拒绝一切入网请求**。
+	// 这几乎必然是漏投放了凭据，所以启动就提醒，别等到有人来入网、被拒了才发现。
+	if cfg.Security.EnrollmentEnabled() && cfg.HasDownstream() && n.enrollPermitAbsent() {
+		n.Log.Warn("enrollment 已开启但没有入网许可 ⇒ 将**拒绝一切入网请求**"+
+			"（入网认证只有许可一个口径）—— 请投放 security.enrollment.token_path 指向的凭据",
+			"token_path", cfg.Security.Enrollment.TokenPath)
+	}
 	n.certBox = identity.NewTLSContainer(identity.TLSCertFrom(n.Id()))
 
 	db, err := store.Open(stateDBPath(cfg))
@@ -247,6 +298,56 @@ type identityBundle struct {
 	selfRenewErr       error
 	certBeforeNotAfter time.Time
 	certAfterSelfRenew time.Time
+	// caRotated 本次启动顺带轮换掉的 **CA 证书链**（nil = 没轮换）。
+	//
+	// 为什么要单独带回给调用方：启动路径（loadIdentity）与运行期路径（renewSelfCert）
+	// 都会轮换 CA 证书，但只有后者能就地打日志 —— 不把结果带出来，就会出现
+	// "启动时换了 CA 证书、日志里却一行都没有"这种最难查的可观测缺口（实测踩到过）。
+	caRotated []*x509.Certificate
+	// credAnchors / selfAnchors 本次加载到的信任锚里，分别有多少张来自
+	// **入网引导凭据**（enroll.token 内嵌的父 CA 链）与**自身证书链自举**。
+	// 只用于启动日志如实说明"锚是哪来的" —— 排错时最常见的问题就是
+	// "我没配 ca_cert_paths，它凭什么连上了父"。
+	credAnchors int
+	selfAnchors int
+}
+
+// mergeAnchors 合并两组信任锚并按证书 DER 去重 —— 保守但必要：同一张 CA 证书常常
+// 既来自 `security.ca_cert_paths`（外部投放的父 CA 链），又来自本节点自己的证书链（自举）。
+//
+// 顺序无关，只影响 `trust_anchor_count` 这个展示型指标；校验一律按"任一锚验通即可"。
+//
+// 参数：
+//
+//	a — 第一组锚（通常来自配置）
+//	b — 第二组锚（通常来自 identity.ChainAnchors 的自举结果）
+//
+// 返回：
+//
+//	[]*x509.Certificate — 去重后的并集；两组都为空时返回 nil
+func mergeAnchors(a, b []*x509.Certificate) []*x509.Certificate {
+	if len(a) == 0 {
+		return b
+	}
+	if len(b) == 0 {
+		return a
+	}
+	seen := make(map[string]bool, len(a)+len(b))
+	out := make([]*x509.Certificate, 0, len(a)+len(b))
+	for _, list := range [][]*x509.Certificate{a, b} {
+		for _, c := range list {
+			if c == nil {
+				continue
+			}
+			k := string(c.Raw)
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // loadIdentity 加载本节点身份材料并做启动强校验。
@@ -260,20 +361,41 @@ type identityBundle struct {
 // 证书**存在却校验不过**（身份不符 / 链不通 / 格式坏）一律拒绝启动：那是人为错误，必须早暴露，
 // 不能靠自动重入网把它掩盖过去。
 //
+// **信任锚有两个来源，这里合并**（见 identity.ChainAnchors）：
+//   - `security.ca_cert_paths`：外部投放的锚 —— 口径是**我的父**（父的 certs/node.crt.ca
+//     整份文件含父 CA 一路到根），不是"树的根"；只在**首次入网**时必需。
+//   - 本节点自己的证书链：入网换来的链本身就是 `[我, 父CA, …, 根CA]`，登记成锚即可。
+//     于是入网成功后 `ca_cert_paths` 可以整段删掉 —— "每个节点只对自己的父节点负责"
+//     在部署上的落点就是不认识根、也不需要根发证书给它。
+//     注意这一步**不放宽语义**：链里的父 CA 本来就已经作为中间证书参与验链，
+//     这里只是把已经在手里的东西登记下来（详细论证见 identity.ChainAnchors）。
+//
 // 参数：
 //
 //	cfg       — 本节点配置；读 security.* 下的密钥 / 证书 / 信任锚路径
 //	selfRenew — true 表示允许"顺带自签续期"：**根**没有父、没有任何人给它续签，
 //	            而它自己就持有 CA 材料，所以若证书已进续签窗口（含已过期）就先自签换一张
 //	            再校验、并写回证书文件。**只有真正的启动装配传 true**：
-//	            `-check`（只读自检）与证书热重载都必须保持"不落盘"的语义。
+//	            证书热重载（loadIdentityForReload）等只读场景必须保持"不落盘"的语义。
 //
 // 返回：
 //
 //	*identityBundle — 身份材料（私钥、证书链、信任锚池）；证书暂缺时为 pending = true
 //	error           — 任一硬校验失败；错误文案以 "REFUSE TO START:" 开头
 func loadIdentity(cfg *config.Config, selfRenew bool) (*identityBundle, error) {
-	// 信任锚：每一项都可以是文件或目录（目录扫 *.crt/*.pem）
+	// 证书生命期（security.identity_cert_days / ca_cert_days）→ identity 包的签发参数。
+	//
+	// 必须放在**任何签发动作之前**：下面根的自签续期就会用到它，运行期的入网 / 续签 / CA 轮换
+	// 也全都走同一个 issueCert。设成默认值即等价于本项目的历史行为（30 天 / 10 年）。
+	//
+	// 它是包级状态，所以"同一进程里换了配置"不会生效 —— 与 node.yaml 只读、配置只在启动
+	// 与热更时整体替换的既有语义一致（热更换配置对象时这里会跟着重设一次）。
+	identity.SetCertLifetime(identity.CertLifetime{
+		IdentityDays: cfg.Security.IdentityCertDays,
+		CADays:       cfg.Security.CACertDays,
+	})
+
+	// 信任锚来源之一：显式配置的路径，每一项都可以是文件或目录（目录扫 *.crt/*.pem）
 	var cs []*x509.Certificate
 	if len(cfg.Security.CACertPaths) > 0 {
 		var err error
@@ -281,6 +403,24 @@ func loadIdentity(cfg *config.Config, selfRenew bool) (*identityBundle, error) {
 		if err != nil {
 			return nil, fmt.Errorf("REFUSE TO START: %w", err)
 		}
+	}
+
+	// 信任锚来源之二：**入网引导凭据**里内嵌的父 CA 链 —— `enroll.token` 可以同时带许可与锚，
+	// 于是"部署一个子节点"只需要这一份文件（格式见 identity.ParseBootstrap）。
+	//
+	// 内容不符合格式就**拒绝启动**（而不是静默当成"没带锚"）：这份文件很可能正是首次入网要用的
+	// 那一份，悄悄忽略只会让节点以"没有任何信任锚"的样子起不来，而真正的原因（比如键被拼成
+	// `permt=`）一句都看不到。**入网成功后删掉这份文件是允许的** —— 那属于"没配"，不是"配坏了"。
+	var credAnchors []*x509.Certificate
+	if raw, err := cfg.Security.EnrollCredentialRaw(); err != nil {
+		return nil, fmt.Errorf("REFUSE TO START: %w", err)
+	} else if len(raw) > 0 {
+		cred, perr := identity.ParseBootstrap(raw)
+		if perr != nil {
+			return nil, fmt.Errorf("REFUSE TO START: 入网引导凭据（security.enrollment.token_path / token）不合法: %w", perr)
+		}
+		credAnchors = cred.Anchors
+		cs = mergeAnchors(cs, credAnchors)
 	}
 
 	// ① 私钥：必须存在，且必须是 ed25519（绝不自动生成）
@@ -300,32 +440,39 @@ func loadIdentity(cfg *config.Config, selfRenew bool) (*identityBundle, error) {
 		if err != nil {
 			return nil, err
 		}
-		anchors := cs
+		anchors := mergeAnchors(cs, identity.ChainAnchors(id.Chain))
 		if len(anchors) == 0 {
 			anchors = []*x509.Certificate{id.CACert}
 		}
-		b := &identityBundle{id: id, roots: identity.NewPool(anchors...), cs: anchors}
+		b := &identityBundle{
+			id: id, roots: identity.NewPool(anchors...), cs: anchors,
+			credAnchors: len(credAnchors), selfAnchors: len(identity.ChainAnchors(id.Chain)),
+		}
 
 		// 根的自签续期：根没有父，谁都签不了它，但它自己就持有 CA 材料 ——
-		// 所以进入续签窗口（含已过期）时由它自己重签一张，这才叫"第一次启动之后全自动"。
+		// 所以进入续签窗口（含已过期）时由它自己重签，这才叫"第一次启动之后全自动"。
+		//
+		// **身份证书与它自己的 CA 证书一起判**（见 certsNeedRenew）：只盯身份证书的话，
+		// 会出现"身份证书很新、CA 证书已过期、下次启动起不来"这种最难查的状态。
+		// 两证书都在窗口内时按"先 CA、后身份"两步走（见 reissueForSelf）。
 		//
 		// 两种模式共用同一套逻辑，只有"要不要落盘"不同：
 		//   · selfRenew=true（真正的启动装配）→ 校验通过就写回证书文件；
-		//   · selfRenew=false（`-check` 只读自检）→ **只把内存换成新证书**，让后面的强校验
-		//     如实反映"启动时会发生什么"，但绝不落盘。
+		//   · selfRenew=false（只读演练，如证书热重载前的试探）→ **只把内存换成新证书**，
+		//     让后面的强校验如实反映"启动时会发生什么"，但绝不落盘。
 		//
 		// 注意：演练模式**不碰 id**（尤其不改 bundle 里的 id.Cert）。热重载路径会复用这个 bundle，
 		// 一旦在演练里把内存换成新证书，调用方就会以为"证书已经不在窗口了"从而漏掉续期。
-		var renewChain []*x509.Certificate
-		if needRenew(id.Cert) && id.CAKey != nil && id.CACert != nil {
+		var renewRes *selfRenewResult
+		if certsNeedRenew(id) && id.CAKey != nil && id.CACert != nil {
 			b.selfRenewNeeded = true
 			b.certBeforeNotAfter = id.Cert.NotAfter
-			chain, err := reissueChainForSelf(id)
+			res, err := reissueForSelf(id)
 			var candErr error
 			if err == nil {
-				// 先用"启动同一强度"校验新证书：新证书自己都不过关就绝不能落盘，
-				// 否则等于把一张还能用的证书换成坏的
-				candErr = identity.ValidateStartup(withChain(id, chain), anchors, pub)
+				// 先用"启动同一强度"校验候选材料（CA 与身份一起换掉再验）：
+				// 候选自己都不过关就绝不能落盘，否则等于把还能用的证书换成坏的
+				candErr = identity.ValidateStartup(withChain(withCA(id, res.CAChain), res.Chain), anchors, pub)
 			}
 			switch {
 			case err != nil:
@@ -333,13 +480,16 @@ func loadIdentity(cfg *config.Config, selfRenew bool) (*identityBundle, error) {
 			case candErr != nil:
 				b.selfRenewErr = fmt.Errorf("自签重签后的证书未通过强校验，未落盘: %w", candErr)
 			default:
-				renewChain = chain
-				b.certAfterSelfRenew = chain[0].NotAfter
+				renewRes = res
+				b.certAfterSelfRenew = res.Chain[0].NotAfter
 				if selfRenew {
-					if werr := applySelfRenew(cfg, id, chain); werr != nil {
-						b.selfRenewErr, renewChain = werr, nil
+					if werr := applySelfRenew(cfg, id, res); werr != nil {
+						b.selfRenewErr, renewRes = werr, nil
 					} else {
 						b.selfRenewed = true
+						if len(res.CAChain) > 0 {
+							b.caRotated = res.CAChain
+						}
 					}
 				}
 			}
@@ -347,11 +497,11 @@ func loadIdentity(cfg *config.Config, selfRenew bool) (*identityBundle, error) {
 
 		// 强校验按"实际会用的那张证书"判定：
 		//   · selfRenew=true 且已落盘 → id 里就是续期后的证书；
-		//   · 只读演练（-check）→ id 还是磁盘上那张（可能已过期），改用 renewChain 判，
-		//     这样 -check 的结论才与真实启动一致（"能启动，因为启动时会自续"）。
+		//   · 只读演练 → id 还是磁盘上那张（可能已过期），改用候选材料判，
+		//     这样演练的结论才与真实启动一致（"能启动，因为启动时会自续"）。
 		effective := id
-		if renewChain != nil && !b.selfRenewed {
-			effective = withChain(id, renewChain)
+		if renewRes != nil && !b.selfRenewed {
+			effective = withChain(withCA(id, renewRes.CAChain), renewRes.Chain)
 		}
 		if err := identity.ValidateStartup(effective, anchors, pub); err != nil {
 			return nil, fmt.Errorf("REFUSE TO START: startup identity validation failed: %w", err)
@@ -364,8 +514,19 @@ func loadIdentity(cfg *config.Config, selfRenew bool) (*identityBundle, error) {
 			return nil, fmt.Errorf("REFUSE TO START: 证书 %s 不存在，且未开启运行期入网（security.enrollment.enabled=false）",
 				cfg.Security.IdentityCertPath)
 		}
+		// 待入网：**这一档是唯一还要求"手上有东西"的地方** —— 手上没有证书，也就没有可以自举的
+		// 证书链，而首跳仍必须把父的服务端证书验到某个锚上（否则谁都能冒充父发证书）。
+		// 锚的口径是**父的 CA**，两种给法二选一（或都放）：
+		//   · 把**父产出的引导凭据**（内含 permit + 父的 CA 链）投放到 security.enrollment.token_path
+		//     —— 推荐，部署只需一份文件；
+		//   · 或者把父的 certs/node.crt.ca（整份文件，含父 CA 到根）配进 security.ca_cert_paths。
+		// **不需要根节点的 CA**；入网成功后锚会从本节点自己的证书链自举，这一项可以整段删掉。
 		if len(cs) == 0 {
-			return nil, fmt.Errorf("REFUSE TO START: 待入网但没有任何信任锚（security.ca_cert_paths），无法校验父的身份")
+			return nil, fmt.Errorf("REFUSE TO START: 待入网但没有任何信任锚：" +
+				"首次入网至少要给一份**父节点的 CA 证书链** —— 把父产出的引导凭据投放到 " +
+				"security.enrollment.token_path（推荐：一份文件里同时带许可与父 CA 链），" +
+				"或把父的 certs/node.crt.ca（整份文件，含父 CA 到根）配进 security.ca_cert_paths。" +
+				"**不需要根节点的 CA**；入网成功后这一项可以删掉，信任锚会从本节点自己的证书链自举")
 		}
 		// 待入网状态：先带密钥起来，等 ensureCert 拿到证书再对外服务
 		return &identityBundle{
@@ -373,6 +534,8 @@ func loadIdentity(cfg *config.Config, selfRenew bool) (*identityBundle, error) {
 			roots:   identity.NewPool(cs...),
 			cs:      cs,
 			pending: true,
+			// 这一档没有自己的证书 ⇒ 没有可自举的链，锚只能来自配置或引导凭据
+			credAnchors: len(credAnchors),
 		}, nil
 	}
 
@@ -380,7 +543,11 @@ func loadIdentity(cfg *config.Config, selfRenew bool) (*identityBundle, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := identity.ValidateStartup(id, cs, pub); err != nil {
+	// 信任锚 = 配置投放的 + 引导凭据里内嵌的 + 从自己证书链自举的
+	// （后两者让"入网成功之后就再也不需要 trust/"成立）
+	selfAnchors := identity.ChainAnchors(id.Chain)
+	anchors := mergeAnchors(cs, selfAnchors)
+	if err := identity.ValidateStartup(id, anchors, pub); err != nil {
 		// 证书过期多半是"停机超过了剩余有效期"：子节点的证书只能由**父**签发，
 		// 它自己签不了，所以这里给出唯一的自救路径。
 		hint := ""
@@ -389,7 +556,10 @@ func loadIdentity(cfg *config.Config, selfRenew bool) (*identityBundle, error) {
 		}
 		return nil, fmt.Errorf("REFUSE TO START: startup identity validation failed: %w%s", err, hint)
 	}
-	return &identityBundle{id: id, roots: identity.NewPool(cs...), cs: cs}, nil
+	return &identityBundle{
+		id: id, roots: identity.NewPool(anchors...), cs: anchors,
+		credAnchors: len(credAnchors), selfAnchors: len(selfAnchors),
+	}, nil
 }
 
 // loadNodeIdentity 加载"预置证书"的非根节点身份材料。
@@ -768,6 +938,22 @@ func (n *Node) registerMetrics() {
 		}
 		return time.Until(id.Cert.NotAfter).Hours() / 24
 	})
+	// 本节点自己的 CA 证书：它同样是启动强校验的硬门槛（过期 → REFUSE TO START），
+	// 但只有根 / 中继持有；叶子恒为 0（哨兵值，表示"没有这张证书"）。
+	m.Help("ca_cert_not_after_days", "本节点自己的 CA 证书剩余有效天数（0=不持有 CA 证书，负值=已过期）")
+	m.SetGauge("ca_cert_not_after_days", func() float64 {
+		id := n.Id()
+		if id == nil || id.CACert == nil {
+			return 0
+		}
+		return time.Until(id.CACert.NotAfter).Hours() / 24
+	})
+	// CA 证书轮换（只换证书、不换密钥）：issued=自己签的（根自续）/ installed=采纳了父给的 /
+	// offered=作为父签给了子 / refused=拒绝了子的请求 / skipped=本次不需要轮换
+	m.Help("ca_rotate_total", "CA 证书轮换计数（result=issued|installed|offered|refused|skipped）")
+	// 镜像分片：received=从父收到并通过 sha256 校验入存的片 / serve_pieces_total 见下
+	m.Help("selfupdate_pieces_received_total", "从父收到并验证入存的镜像分片数（result=ok|rejected）")
+	m.Help("selfupdate_serve_pieces_total", "本节点对外供出的镜像分片数（source=piece-store|disk）")
 	m.Help("cert_reload_total", "证书热重载次数（result=ok|failed|nochange|missing）")
 	m.Help("enroll_total", "运行期入网计数（result=issued|denied|installed）")
 	m.Help("trust_anchor_count", "当前加载到的信任锚证书数量")
@@ -801,6 +987,16 @@ func (n *Node) registerMetrics() {
 	m.SetGauge("binary_size_bytes", func() float64 { return float64(n.Build().Size) })
 	m.Help("selfupdate_lagging_children", "直接子里仍跑着与父不同镜像的数量（>0 说明还没收敛）")
 	m.SetGauge("selfupdate_lagging_children", func() float64 { return float64(n.laggingChildren()) })
+	// ---- 下发背压（见 README「下发即执行」）----
+	// 「在途」= Assignment 处于 LEASED 且租约仍有效（定义与理由见 delivery.go 的 countInflight）。
+	m.Help("dispatch_throttled_total", "因在途窗口打满而这一轮没投出去的分派次数（reason=child_window|total_window）")
+	m.Help("local_busy_total", "子节点回来 LocalBusy（本机繁忙）的累计次数")
+	m.Help("child_dispatch_inflight", "每个直接子的在途分派数（子在标签里；总数用 sum(child_dispatch_inflight)）")
+	m.SetLabeled("child_dispatch_inflight", func() map[string]float64 { return n.inflightByChild() })
+	m.Help("dispatch_window_per_child", "当前生效的每个子在途窗口（0=不限；开了自适应会随在线子数变化）")
+	m.SetGauge("dispatch_window_per_child", func() float64 { return float64(n.effectiveDispatchWindow()) })
+	m.Help("dispatch_window_total", "全局在途窗口上限（0=不限）")
+	m.SetGauge("dispatch_window_total", func() float64 { return float64(n.C().Command.DispatchWindowTotal()) })
 }
 
 // laggingChildren 数一数"上报的镜像哈希与我不同的直接子"有几个。

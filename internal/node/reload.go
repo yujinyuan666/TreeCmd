@@ -78,12 +78,14 @@ func newReloadWatcher(cfg *config.Config) *reloadWatcher {
 	paths := append([]string(nil), cfg.Security.CertReload.Paths...)
 	if len(paths) == 0 {
 		// 自动口径：身份私钥 / 公钥 / 证书 + 本节点 CA 证书 / CA 私钥 + 全部信任锚（含目录）
+		// + 入网引导凭据（它里面也可能内嵌父的 CA 链 —— 换了凭据就该把新锚吃进来）
 		paths = []string{
 			cfg.Security.IdentityKeyPath,
 			cfg.Security.IdentityPubKeyPath,
 			cfg.Security.IdentityCertPath,
 			cfg.Security.CACertPath,
 			cfg.Security.CAKeyPath,
+			cfg.Security.Enrollment.TokenPath,
 		}
 		paths = append(paths, cfg.Security.CACertPaths...)
 	}

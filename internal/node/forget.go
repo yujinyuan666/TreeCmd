@@ -7,7 +7,7 @@ import (
 	"treecmd/internal/store"
 )
 
-// 失效子节点清理（`/v1/forget`，见 docs/失效节点清理与版本一致性设计.md）。
+// 失效子节点清理（`/v1/forget`；设计与取舍见 README 的「失效节点清理：`/v1/forget`」一节）。
 //
 // 为什么需要它：父端关于一个子节点的记录散落在内存注册表、state.dat.known_children 与
 // bbolt 的四个桶里，而**子节点掉线与被驱逐都不会删这些记录**。于是"误启动的实例"、

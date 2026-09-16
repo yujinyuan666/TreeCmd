@@ -202,6 +202,13 @@ message AssignmentRecord {
   // delivered_attempt = 最近一次实际投递使用的 attempt
   uint64 next_attempt = 16;
   uint64 delivered_attempt = 17;
+  // ---- 下发背压：连续被 LocalBusy 退回的次数（见 README「下发即执行」）----
+  // 父端据此做**指数退避**：退避 = min(local_busy_backoff << (streak-1), local_busy_backoff_max)。
+  // 归零只有两个时机，都在代码里写死：
+  //   ① 收到 InflightHint（子明确报告"我正在跑 attempt N"）—— 唯一正向证据；
+  //   ② 租约回收（子可能已重启，状态不可知 ⇒ 重新开始计数）。
+  // 目的：同一批指令同时被退回时，重投时刻自然错开，避免"每 3 秒齐刷刷重投一次"的同步风暴。
+  int32 local_busy_streak = 18;
 }
 
 message LocalCommandRecord {
@@ -387,6 +394,14 @@ message RegisterRequest {
   // 父端只用它做展示（/v1/tree 里能看见"每个子跑的是哪份镜像"），不参与任何签名。
   string binary_hash = 12;
   int64 binary_size = 13;
+  // 本节点**自己的 CA 证书**剩余有效天数（只有根 / 中继持有 CA 证书；叶子恒为 0）。
+  //
+  // 为什么由子上报：父手上只有子的**身份**证书（mTLS 握手拿到的就是叶子证书），
+  // 完全不知道子的 CA 证书什么时候过期。而 CA 证书过期会让那个节点**下次启动直接
+  // REFUSE TO START**，所以必须让父能在 /v1/tree 里提前看见。
+  //
+  // 同样只作展示用途，不参与任何判定与签名（父不会用它来触发续签 —— 续签由子自己请求）。
+  int32 ca_not_after_days = 14;
 }
 
 message RegisterAck {
@@ -659,6 +674,10 @@ message UpFrame {
     QueryResp query_resp = 12; // 回程段
     QueryData query_data = 13; // 回程段
     BinaryReq binary_req = 17; // 申请父下发它的可执行文件（子连上后发现自己与父不一致时）
+    // 申请"这份镜像由哪些片组成、每片 sha256 是多少"（见 BinaryManifestReq 的注释）。
+    // 旧版本父收到这一帧会当成未知字段忽略 —— 子端必须能在清单请求超时后回退到
+    // "只靠 crc32 + 整份 sha256"的老流程，不能因为拿不到清单就不工作。
+    BinaryManifestReq binary_manifest_req = 19;
   }
 }
 
@@ -684,6 +703,8 @@ message DownFrame {
     RevocationList revocation_list = 13;
     CertRenewOffer cert_renew_offer = 14;
     BinaryChunk binary_chunk = 15; // 父推送自己那份可执行文件的分片（响应 BinaryReq）
+    // 分片清单（响应 BinaryManifestReq）：父先给清单、再推片。
+    BinaryManifest binary_manifest = 17;
   }
 }
 
@@ -709,10 +730,22 @@ message CRLReq {} // 语义 = "给我最新全量"（不依赖增量补齐）
 message CertRenewOffer {
   bytes cert_chain = 1;   // 新的身份证书链（PEM 串接）；身份密钥与 NodeID 不变
   string reason = 2;
+  // 新的 **CA 证书链**（PEM 串接）。只在子节点请求了 `want_ca` 且父签发成功时非空。
+  //
+  // 轮换的是**证书**不是密钥：内容里的 CA 公钥与子节点原来那张**完全相同**，
+  // 所以子节点已入网的下一级手里的旧 CA 证书仍然有效、信任锚（根）也完全不用动
+  // —— 这是"CA 证书能在线轮换而不用全树重新分发 trust/"的全部依据。
+  bytes ca_cert_chain = 3;
 }
 
 message CertRenewReq {  // 子 → 父：请求续签（生命期 2/3 处主动发起）
   string reason = 1;
+  // 是否顺带请求续签本节点的 **CA 证书**（只有持有 CA 材料的中继 / 根会置位）。
+  bool want_ca = 2;
+  // 本节点**当前**的 CA 叶子证书（DER，非 PEM）。父据此确认"要续的是同一把密钥"：
+  // 父会校验它 IsCA、有 certSign、CN 含子节点 ID、能验到本树的根，且公钥与将要签发的一致。
+  // 不这么绑的话，子节点就能借"续签"之名悄悄换掉 CA 密钥 —— 那是另一件事（需要重分发 trust/）。
+  bytes ca_cert = 3;
 }
 
 // 重连对账（3.7）：子上报本地仍未终态的指令，父离线验 origin 签名后重建
@@ -734,10 +767,15 @@ message EvictedEntry {
 // ============================================================================
 // 运行期入网签发（7.10）：子节点**没有自带证书**时的上线路径
 // ============================================================================
-// 这两条 RPC 是唯一"允许客户端不提供证书"的入口（服务端按 ALPN `treecmd-enroll/1` 分流放行），
-// 所以鉴权必须自己扛住：一次性 nonce（防重放）+ 私钥持有证明 PoP（防拿别人的公钥申请）
-// + 入网许可 token / allow_ids 白名单。签发只做一件事：**用父自己的 CA 私钥签子提交的公钥** ——
-// 任何私钥都由子机本地持有，程序绝不代生成、也不回传。
+// 这两条 RPC 是唯一"允许客户端不提供证书"的入口（服务端按 **SNI 前缀 `enroll.`** 分流放行；
+// 不用 ALPN 是因为 gRPC 要求协商结果必须是 h2）。所以鉴权必须自己扛住：
+// 一次性 nonce（防重放）、私钥持有证明 PoP（防拿别人的公钥申请）、入网许可 token（唯一的授权判据）。
+//
+// 为什么"许可"是唯一的授权判据：NodeID 是公开信息（`/v1/tree` 就能读到），且与密钥对之间
+// 没有任何密码学绑定 —— 用"ID 名单"挡不住"自报某个 ID + 自建一对密钥"。
+//
+// 签发只做一件事：**用父自己的 CA 私钥签子提交的公钥**；任何私钥都由子机本地持有，
+// 程序绝不代生成、也不回传。
 message EnrollChallengeReq {
   string node_id = 1; // 申请方自报 NodeID（只用于把 nonce 绑定到这次申请，本身不构成信任）
 }
@@ -782,6 +820,30 @@ message BinaryReq {
   string want_hash = 1;
   // 申请方愿意接收的字节上限；0 = 用父端配置的上限。父按 min(本字段, 父端上限) 截断。
   int64 max_bytes = 2;
+  // 从第几片开始给（断点续传）。0 = 从头开始（与不传等价）。
+  //
+  // 申请方扫自己的片存后把"已经验证通过的连续前缀长度"填进来 —— 必须落在片边界上，
+  // 父端从这一片起推。这样中断一次（父重启 / 网络抖动 / 本节点 OOM）不必从 0 重来。
+  int64 from_index = 3;
+}
+
+// 清单请求：子 → 父，申请"这份镜像由哪些片组成、每片的 sha256 是多少"。
+//
+// 为什么要先要清单：分片帧上只有 crc32（**只查传输损坏**），而"边收边转发"要求
+// 中继把片转发给自己的直接子之前就能证明"这一片确实是那份镜像里的一片"。
+// 所以片级校验必须升级为 sha256，而 sha256 清单只能由持有完整镜像的一方（父）给出。
+message BinaryManifestReq {
+  string want_hash = 1;  // 期望的整份哈希；父逐字节比对，不等即拒
+}
+
+// 清单响应：父 → 子。给了清单之后父才开始推片。
+message BinaryManifest {
+  string hash       = 1;  // 整份 sha256（与 RegisterAck.server_binary_hash 一致）
+  int64  size       = 2;  // 整份字节数
+  int64  chunk_size = 3;  // 片大小（父端 selfupdate.chunk_size 的实际取值）
+  // 每片一个 sha256（32 字节），顺序与片号一致。长度 × chunk_size 应覆盖 size。
+  repeated bytes piece_sha256 = 4;
+  string reason = 5;      // 非空 = 不支持 / 出错（如旧版本父），此时其余字段无意义
 }
 
 // 分片帧：一片一个 DownFrame，父端顺序推、子端顺序收（不重排、不重传）。

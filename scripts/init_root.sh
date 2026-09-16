@@ -12,18 +12,32 @@
 #   keys/ca                     根的 CA 私钥（给子节点签发用，权限 600）
 #   keys/ca.pub                 根的 CA 公钥
 #                               —— 路径与 node.yaml 的 security.ca_key_path 默认约定一致
-#   certs/ca.crt                根的自签 CA 证书 —— **全树的信任锚**
+#   certs/ca.crt                根的自签 CA 证书 —— 信任链的顶端
+#                               （**下级要的不是这一份**：每个子节点拿的是它**自己父**的
+#                                certs/node.crt.ca，含父 CA 一路到根；子节点不需要认识根）
 #   certs/node.crt              根的身份证书链（身份证书 + CA 证书串接）
-#   certs/node.crt.ca           根本节点自己的 CA 证书链（内容 = ca.crt）
-#   trust/root-ca.crt           信任锚副本（校验对端用；node.yaml 默认扫 trust/ 目录）
-#   enroll.token                入网许可（每个子节点的 enroll.token 内容必须与它一致）
+#   certs/node.crt.ca           根本节点自己的 CA 证书链（内容 = ca.crt）——**给直接子节点的投放物**
+#   trust/root-ca.crt           根自己的信任锚副本（校验对端用；node.yaml 默认扫 trust/ 目录）
+#   enroll.token                入网**引导凭据**：入网许可 + 根自己的 CA 证书链（含到根）。
+#                               **整份**拷给每个子节点即可 —— 子节点不用再单独拷 CA、也不用配 trust/
 #
-# 用法：
-#   ./scripts/init_root.sh <节点目录> <根节点ID> [身份证书天数=30] [CA 天数=3650]
+# 用法（**所有参数都可省**）：
+#   ./scripts/init_root.sh [节点目录] [根节点ID] [身份证书天数=30] [CA 天数=3650]
+#
+#   不带参数   = 在**当前目录**初始化，NodeID 自动生成            ← 最常用
+#   只给目录   = 在指定目录初始化，NodeID 自动生成
+#   目录 + ID  = 用你指定的 ID（例：复用一份已知身份）
+#   只想给 ID  = ./scripts/init_root.sh --id <根节点ID>（目录仍是当前目录）
 #
 # 例：
+#   cd /opt/treecmd/root && /path/to/scripts/init_root.sh      # 当前目录 + 自动 NodeID
+#   ./scripts/init_root.sh /opt/treecmd/root                   # 指定目录 + 自动 NodeID
 #   ./scripts/init_root.sh /opt/treecmd/root 0198f0c0-0000-7000-8000-000000000001
-#   ./scripts/init_root.sh /opt/treecmd/root 0198f0c0-0000-7000-8000-000000000001 90 3650   # 想自己指定就显式给天数
+#   ./scripts/init_root.sh /opt/treecmd/root <ID> 90 3650      # 想自己指定天数就显式给
+#
+# NodeID 自动生成时：由本脚本现场造一枚 **UUIDv7**，直接写进证书的 CN。
+#   node.yaml 里的 node.id **留空就行** —— 程序按"node.yaml → 证书身份 → state.dat → 新生成"
+#   的顺序解析身份（ADR-050），证书一旦签发就是权威来源，它自己会读到这一枚。
 #
 # 身份证书天数默认 30：**与程序给子节点签发的口径一致**。根没有父，但它自己持有 CA 材料，
 # 所以程序会在"剩余不足生命期 1/3"时自签续期（启动时若已进窗口也会先续再启动），
@@ -39,18 +53,36 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 FORCE=0
+WANT_ID=""
 ARGS=()
-for a in "$@"; do
-  case "${a}" in
-    -f|--force) FORCE=1 ;;
-    -h|--help) sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) ARGS+=("${a}") ;;
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -f|--force) FORCE=1; shift ;;
+    # 帮助文本直接从本文件头部的注释块里取（到 `set -euo pipefail` 前一行为止），
+    # 这样改注释不会让帮助内容错位（旧写法写死了 2,40p，注释一动就漏行）。
+    -h|--help)
+      sed -n '2,/^set -euo pipefail$/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//' | sed '/./,$!d'
+      exit 0 ;;
+    --id)  [ $# -ge 2 ] || { echo "--id 后面要跟一个 NodeID" >&2; exit 2; }; WANT_ID="$2"; shift 2 ;;
+    --id=*) WANT_ID="${1#--id=}"; shift ;;
+    -*)    echo "未知选项 $1（用 -h 看用法）" >&2; exit 2 ;;
+    *)     ARGS+=("$1"); shift ;;
   esac
 done
 set -- "${ARGS[@]:-}"
 
 DIR="${1:-}"
 NODE_ID="${2:-}"
+
+# 宽容一点：第一个位置参数如果本身就是 UUIDv7 形态，说明用户想"只给 ID"（目录回到当前目录）。
+case "${DIR}" in
+  ????????-????-7???-????-????????????)
+    if [ -z "${NODE_ID}" ]; then NODE_ID="${DIR}"; DIR=""; fi ;;
+esac
+# --id 显式指定优先于位置参数
+# （写成 if 而不是 `[ ... ] && ...`：后者在条件不成立时整体返回非零，会被 set -e 当成失败退出）
+if [ -n "${WANT_ID}" ]; then NODE_ID="${WANT_ID}"; fi
+
 IDENTITY_DAYS="${3:-30}"       # 与程序签发子节点证书同口径：之后由程序自动续期
 CA_DAYS="${4:-3650}"           # CA 是全树信任锚：换 CA 要重新分发 trust/，所以给长期
 
@@ -59,8 +91,49 @@ info() { printf '    %s\n' "$*"; }
 warn() { printf '  \033[33m!\033[0m %s\n' "$*" >&2; }
 die()  { printf '  \033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
-[ -n "${DIR}" ] || { info "用法: ./scripts/init_root.sh <节点目录> <根节点ID> [身份证书天数] [CA 天数]"; exit 2; }
-[ -n "${NODE_ID}" ] || { info "用法: ./scripts/init_root.sh <节点目录> <根节点ID> [身份证书天数] [CA 天数]"; exit 2; }
+# ── 节点目录：没给就用**当前目录**（在哪里跑就在哪里初始化）──
+[ -n "${DIR}" ] || DIR="$(pwd)"
+[ -d "${DIR}" ] || mkdir -p "${DIR}" || die "建不出节点目录 ${DIR}"
+DIR="$(cd "${DIR}" && pwd)"    # 规范化成绝对路径，日志与后续提示里看着清楚
+
+# now_ms —— 当前 Unix 毫秒时间戳。
+#
+# GNU date 支持 %N（纳秒），而 BSD/macOS 的 date 会把 "%N" 原样吐出来，所以要判一下是不是纯数字：
+# 拿不到就退化成"秒 × 1000"（毫秒位为 0）。两者都是合法的 UUIDv7 时间戳，区别只是精度；
+# 唯一性由随机部分保证（74 bit），与时间精度无关。
+now_ms() {
+  local s ns
+  s="$(date +%s)"
+  ns="$(date +%N 2>/dev/null || true)"
+  case "${ns}" in
+    ''|*[!0-9]*) printf '%s' "$(( s * 1000 ))" ;;
+    *)           printf '%s' "$(( s * 1000 + 10#${ns:0:3} ))" ;;
+  esac
+}
+
+# gen_uuidv7 —— 现场造一枚 UUIDv7，字段口径与 internal/identity.NewNodeID 一致：
+#   48 bit 毫秒时间戳 | 4 bit 版本(=7) | 12 bit 随机 | 2 bit 变体(=10xx) | 62 bit 随机
+#
+# 为什么不用 python3/其它解释器：部署机上不一定有。openssl 是本脚本**本来就要**的依赖，
+# 所以随机底座直接从 `openssl rand` 取，再按位覆盖时间戳与版本/变体位。
+gen_uuidv7() {
+  local ms hex
+  ms="$(( $(now_ms) & 0xFFFFFFFFFFFF ))"    # 只留低 48 bit（多出来的位会破坏 8-4-4-4-12 的定长）
+  hex="$(openssl rand -hex 16)"             # 32 个十六进制字符，当随机底座
+  printf '%08x-%04x-7%s-%x%s-%s\n' \
+    "$(( ms >> 16 ))"                    \
+    "$(( ms & 0xFFFF ))"                 \
+    "${hex:0:3}"                         \
+    "$(( (0x${hex:3:1} & 3) | 8 ))" "${hex:4:3}" \
+    "${hex:7:12}"
+}
+
+# ── 根节点 ID：没给就现场生成（写进证书 CN；程序启动时会从证书里读到它）──
+AUTO_ID=0
+if [ -z "${NODE_ID}" ]; then
+  NODE_ID="$(gen_uuidv7)"
+  AUTO_ID=1
+fi
 
 # 根节点的 NodeID 必须是 UUIDv7 形态（程序按 UUIDv7 校验，见 internal/identity）
 case "${NODE_ID}" in
@@ -89,11 +162,18 @@ if [ "${FORCE}" -eq 0 ] && [ -f "${LEAF_CERT}" ]; then
   die "${LEAF_CERT} 已存在 —— 根的身份材料还在。要重做请加 -f（会换掉 CA，全树 trust/ 需重新分发）"
 fi
 
+if [ "${AUTO_ID}" -eq 1 ]; then
+  ID_NOTE="（本次**自动生成** —— 程序启动会从证书里读到它，node.yaml 的 node.id 可以留空）"
+else
+  ID_NOTE="（你指定的 —— 若 node.yaml 里也写了 node.id，两者必须一致）"
+fi
+
 echo "════════════════════════════════════════════════════════════════"
 echo " 初始化根节点身份材料"
 echo "   节点目录   ${DIR}"
 echo "   根节点 ID  ${NODE_ID}"
-echo "   身份证书   ${IDENTITY_DAYS} 天（根本身无续签通道，故默认长期）"
+echo "              ${ID_NOTE}"
+echo "   身份证书   ${IDENTITY_DAYS} 天（根没有父可签发，所以之后由程序自签续期）"
 echo "   CA 证书    ${CA_DAYS} 天"
 echo "   treecmd-node  ${BIN}"
 echo "════════════════════════════════════════════════════════════════"
@@ -160,23 +240,25 @@ ok "本节点 CA 证书链 certs/node.crt.ca"
 
 # ── ④ 信任锚副本 ──
 echo
-echo "④ 投放信任锚副本（未显式配 ca_cert_paths 时程序会自动扫 trust/；也给子节点当信任锚）"
+echo "④ 投放根自己的信任锚副本"
+echo "   （未显式配 ca_cert_paths 时程序会自动扫 trust/；根是链条顶端，用它自己的 CA 当锚）"
+echo "   ⚠️ 这一份是**根自己用**的。子节点要的是**它们自己父**的 certs/node.crt.ca，"
+echo "      不是这份根 CA —— 每个节点只对自己的父节点负责，子节点不需要认识根。"
 cp -f "${DIR}/certs/ca.crt" "${DIR}/trust/root-ca.crt"
 chmod 644 "${DIR}/trust/root-ca.crt"
 ok "信任锚 trust/root-ca.crt"
+info "给直接子节点的投放物是：${DIR}/certs/node.crt.ca（内容含 CA 一路到根）"
 
-# ── ⑤ 入网许可 ──
+# ── ⑤ 入网引导凭据 ──
 echo
-echo "⑤ 生成入网许可（enroll.token）"
-if [ -f "${DIR}/enroll.token" ] && [ "${FORCE}" -eq 0 ]; then
-  warn "enroll.token 已存在，保留不覆盖（内容必须与每个子节点一致）"
-else
-  openssl rand -hex 24 > "${DIR}/enroll.token"
-  chmod 600 "${DIR}/enroll.token"
-  ok "入网许可 enroll.token（把它原样拷到每个子节点）"
-fi
+echo "⑤ 生成入网引导凭据（enroll.token = 入网许可 + 根自己的 CA 证书链）"
+"${SCRIPT_DIR}/make_bootstrap.sh" "${DIR}" >/dev/null
+# 已存在时 make_bootstrap.sh **沿用原有许可**（不轮换），只把 CA 链补进去 ——
+# 子节点手上很可能已经拿着那枚许可，轮换它会把在途部署全部作废。
+ok "入网引导凭据 enroll.token（已存在则许可沿用原值，仅补齐 CA 链）"
 info "根端 node.yaml 里配 security.enrollment: { enabled: true, token_path: enroll.token }"
 info "  —— 根是签发方，enrollment 必须开启，否则子节点会被拒（ERR_ENROLL_DISABLED）"
+info "把这个文件**整份**拷给每个子节点即可：许可与父的 CA 都在里面（不用再单独拷 trust/）"
 
 # ── ⑥ 材料自验（不依赖 node.yaml）──
 echo
@@ -201,10 +283,13 @@ if [ -f "${DIR}/node.yaml" ]; then
   info "${BIN} -config ${DIR}/node.yaml"
 else
   echo "⑦ 还没有 ${DIR}/node.yaml"
-  info "从样例配置抄一份（把 node.id 改成 ${NODE_ID}，其余按约定即可）："
+  info "从样例配置抄一份（**node.id 留空就行**，其余按约定即可）："
   info "  cp ${REPO_DIR}/examples/node.yaml ${DIR}/node.yaml"
   info "  ${BIN} -config ${DIR}/node.yaml            # 启动"
 fi
+info ""
+info "关于 node.yaml 里的 node.id：留空 = 程序自己从证书里读到 ${NODE_ID}；"
+info "  若你显式填了，就必须与这个 ID 一致 —— 不一致会被启动强校验拒绝（REFUSE TO START）。"
 
 echo
 echo "════════════════════════════════════════════════════════════════"

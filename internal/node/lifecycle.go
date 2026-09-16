@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -68,36 +69,154 @@ func (n *Node) maybeOfferRenew(cc *childConn, leaf *x509.Certificate) {
 	}})
 }
 
+// handleCertRenewReq 父端处理子的续签请求（含可选的 CA 证书续签）。
+//
+// 与 maybeOfferRenew 的分工：
+//   - maybeOfferRenew 是"父在子 Connect / RESUME 时看到**叶子证书**进窗口就顺手换发"，
+//     它只看身份证书；
+//   - 本函数是"子显式请求"，**CA 证书只有这一条路径能换** —— 父手上只有子的身份证书
+//     （mTLS 握手拿到的就是叶子证书），并不知道子的 CA 证书什么时候过期，所以由子自报。
+//
+// 一次应答里两边各算各的，**都可以为空**：本次只换 CA 证书、或只换身份证书，都是正常组合；
+// 两个都空就不发（避免制造无意义的帧）。
+//
+// 接收者 n 是本节点（父侧）。本方法由 dispatch 在读循环里调用，所以发送走 cc.send
+// （非阻塞）—— 一帧证书链远小于缓冲上限，不必像分片那样限速。
+//
+// 参数：
+//
+//	cc  — 发起请求的子连接
+//	req — 子发来的续签请求
+func (n *Node) handleCertRenewReq(cc *childConn, req *pb.CertRenewReq) {
+	if cc == nil {
+		return
+	}
+	offer := &pb.CertRenewOffer{}
+	if needRenew(cc.leaf) {
+		chainPEM, err := identity.ReissueFor(cc.leaf, n.Id())
+		if err != nil {
+			n.Log.Warn("cert renew: reissue failed", "child", shortID(cc.nodeID), "err", err)
+		} else {
+			offer.CertChain = chainPEM
+			offer.Reason = req.GetReason()
+		}
+	}
+	if req.GetWantCa() {
+		caPEM, err := n.reissueChildCA(cc, req.GetCaCert())
+		if err != nil {
+			n.Log.Warn("ca renew: refused", "child", shortID(cc.nodeID), "err", err)
+			n.Metrics.Inc("ca_rotate_total", "result", "refused")
+		} else {
+			offer.CaCertChain = caPEM
+			n.Metrics.Inc("ca_rotate_total", "result", "offered")
+		}
+	}
+	if len(offer.CertChain) == 0 && len(offer.CaCertChain) == 0 {
+		n.Log.Debug("cert renew: nothing to offer", "child", shortID(cc.nodeID), "reason", req.GetReason())
+		return
+	}
+	n.Log.Info("cert renew: offering", "child", shortID(cc.nodeID),
+		"cert", len(offer.CertChain) > 0, "ca", len(offer.CaCertChain) > 0, "reason", req.GetReason())
+	_ = cc.send(&pb.DownFrame{ProtoVersion: protoVersion,
+		Frame: &pb.DownFrame_CertRenewOffer{CertRenewOffer: offer}})
+}
+
+// reissueChildCA 校验子提交的"当前 CA 证书"，并用本节点 CA 重签一张**同一把密钥**的新 CA 证书。
+//
+// 为什么必须让子把当前那张 CA 证书一起交上来：这是"只换证书、不换密钥"唯一的依据。
+// 如果父只是"你说 want_ca 我就签一个 CA 证书"，那么拿到子身份密钥的人就能借续签之名
+// 把子的 CA 公钥换掉 —— 那是另一件需要全树重新分发 trust/ 的事，绝不该被静默允许。
+//
+// 四道校验：能解析 / IsCA + certSign / CN 含该子 ID / 能验到本节点的信任锚。
+// 通过之后签出来的新 CA 证书，公钥与 CN 都沿用提交的那张（见 identity.ReissueCAFor）。
+//
+// 接收者 n 是本节点（父侧）。
+//
+// 参数：
+//
+//	cc    — 发起请求的子连接（提供权威的子节点 ID）
+//	caDER — 子提交的当前 CA 叶子证书（DER）
+//
+// 返回：
+//
+//	[]byte — 新 CA 证书链（PEM）；校验不过时为 nil
+//	error  — 本节点无 CA 材料 / 子未提交证书 / 四项校验任一不过 / 签发失败时返回
+func (n *Node) reissueChildCA(cc *childConn, caDER []byte) ([]byte, error) {
+	if n.Id().CAKey == nil || n.Id().CACert == nil {
+		return nil, errors.New("本节点没有 CA 材料，无法签发 CA 证书")
+	}
+	if cc == nil || cc.nodeID == "" {
+		return nil, errors.New("ERR_CHILD_UNKNOWN: 拿不到子节点的权威身份")
+	}
+	if len(caDER) == 0 {
+		return nil, errors.New("ERR_CA_CERT_MISSING: 请求 CA 续签时必须同时提交当前的 CA 证书")
+	}
+	oldCA, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		return nil, fmt.Errorf("ERR_CA_CERT_UNPARSEABLE: %w", err)
+	}
+	if !oldCA.IsCA || oldCA.KeyUsage&x509.KeyUsageCertSign == 0 {
+		return nil, errors.New("ERR_CA_CERT_INVALID: 提交的证书不是 CA 证书（缺 basicConstraints/keyUsage）")
+	}
+	if !strings.Contains(oldCA.Subject.CommonName, cc.nodeID) {
+		return nil, fmt.Errorf("ERR_CA_CERT_CN_MISMATCH: CN %q 不含子节点 ID %s",
+			oldCA.Subject.CommonName, shortID(cc.nodeID))
+	}
+	// 它必须是"本树里签发出来的"：把本节点的 CA 链当作中间证书，让它接到本节点的信任锚。
+	// 这一条同时挡住"拿别的树的 CA 证书来换一张我们签的"。
+	// patchChain = [待验的 CA 证书, 本节点 CA 链...]：中间证书要一并给出，才能逐级上溯。
+	patchChain := append([]*x509.Certificate{oldCA}, n.Id().CAChain...)
+	if err := identity.ChainToAnchor(patchChain, identity.PoolCerts(n.rootsPool()), 0); err != nil {
+		return nil, fmt.Errorf("ERR_CA_CERT_UNTRUSTED: %w", err)
+	}
+	_, pemBytes, err := identity.ReissueCAFor(oldCA, n.Id())
+	return pemBytes, err
+}
+
 // applyCertRenew 子收到换发：校验新证书仍是本节点身份且能验到信任锚，写入本地证书文件后
 // 热更新 TLS 证书容器，并让现有连接以新证书重新握手。
+//
+// 一次 offer 里可能带两种东西，**CA 证书链先处理**（身份证书链的签发者可能就是它）：
+//   - CertChain   新的身份证书链（父用自身 CA 重签**同一把身份公钥**）
+//   - CaCertChain 新的 **CA 证书链**（父用自身 CA 重签**同一把 CA 公钥**）—— 可空
+//
+// 两者**都可以单独出现**：本次只轮换 CA 证书、身份证书还没进窗口，是完全正常的组合。
+// 两个都空才视为协议错误。
 //
 // 接收者 n 是本节点实例；本方法在子这一侧执行。
 //
 // 参数：
 //
-//	offer — 父下发的 CertRenewOffer（内含 PEM 证书链）
+//	offer — 父下发的 CertRenewOffer
 //
 // 返回：
 //
-//	error — 空链 / 链解析失败 / 身份不符 / 链不受信 / 写盘失败时返回；此时不替换内存中的证书
+//	error — 空链 / 解析失败 / 身份不符 / 链不受信 / 写盘失败时返回；此时不替换内存中的证书
 func (n *Node) applyCertRenew(offer *pb.CertRenewOffer) error {
+	gotCA := false
+	if len(offer.GetCaCertChain()) > 0 {
+		if err := n.applyCACertRenew(offer.GetCaCertChain()); err != nil {
+			return err
+		}
+		gotCA = true
+	}
 	if len(offer.CertChain) == 0 {
-		return fmt.Errorf("ERR_EMPTY_CERT_CHAIN")
+		if !gotCA {
+			return fmt.Errorf("ERR_EMPTY_CERT_CHAIN")
+		}
+		return nil // 只轮换了 CA 证书，不动身份证书
 	}
 	chain, err := identity.ParseChainPEM(offer.CertChain)
 	if err != nil || len(chain) == 0 {
 		return fmt.Errorf("ERR_INVALID_CERT_CHAIN: %v", err)
 	}
-	// 新证书必须仍是本节点身份，且能验到信任锚
+	// 新证书必须仍是本节点身份，且能接到信任锚。
+	// 走 identity.ChainToAnchor 而不是裸 Verify：它会认下"CA 证书已在线轮换"的形态
+	// （链末端与信任锚同密钥、不同证书），否则轮换一次之后续签就再也装不上了。
 	if got := identity.NodeIDFromCert(chain[0]); got != n.C().Node.ID {
 		return fmt.Errorf("ERR_CERT_IDENTITY_MISMATCH: %s vs %s", got, n.C().Node.ID)
 	}
-	inters := x509.NewCertPool()
-	for _, c := range chain[1:] {
-		inters.AddCert(c)
-	}
-	if _, err := chain[0].Verify(x509.VerifyOptions{Roots: n.rootsPool(), Intermediates: inters,
-		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err != nil {
+	if err := identity.ChainToAnchor(chain, identity.PoolCerts(n.rootsPool()), 0); err != nil {
 		return fmt.Errorf("ERR_CERT_UNTRUSTED: %w", err)
 	}
 	// 先落盘（崩溃也不会丢新证书），再热切换
@@ -115,55 +234,252 @@ func (n *Node) applyCertRenew(offer *pb.CertRenewOffer) error {
 	return nil
 }
 
+// applyCACertRenew 处理 offer 里的 CA 证书链（**子侧**）。
+//
+// 三道校验，任何一道不过都不落盘、继续用旧 CA 证书（fail-safe）：
+//
+//  1. **只是"同一把密钥换一张证书"** —— 新 CA 证书的公钥必须与当前那张**逐字节相同**。
+//     这一条是"CA 证书轮换不破坏下级信任"的前提，也是"不许借续签之机换掉 CA 密钥"的闸门。
+//  2. CA 证书的基本属性必须与**启动强校验同口径**（IsCA / keyUsage certSign / CN 含本节点 ID），
+//     否则换了以后本节点下次启动就会 REFUSE TO START。
+//  3. 新 CA 证书链能验到本节点的信任锚。
+//
+// 注意**不重建信任锚池**：信任锚是父 / 根，不是自己；轮换自己的 CA 证书跟它没有关系。
+// 也**不触发重连**：TLS 上出示的是身份证书链（id.Chain），里面并不含本节点自己的 CA 证书，
+// 所以换 CA 证书不影响现有会话。
+//
+// 接收者 n 是本节点实例；本方法在子这一侧执行。
+//
+// 参数：
+//
+//	pemBytes — 父下发的 CA 证书链（PEM 串接），pemBytes[0] 是新 CA 证书
+//
+// 返回：
+//
+//	error — 本节点没有 CA 私钥 / 解析失败 / 换公钥 / 属性不符 / 不受信 / 写盘失败时返回
+func (n *Node) applyCACertRenew(pemBytes []byte) error {
+	id := n.Id()
+	if id == nil || id.CAKey == nil || id.CACert == nil {
+		return errors.New("ERR_CA_UNEXPECTED: 本节点没有 CA 材料，不该收到 CA 证书续签")
+	}
+	chain, err := identity.ParseChainPEM(pemBytes)
+	if err != nil || len(chain) == 0 {
+		return fmt.Errorf("ERR_INVALID_CA_CERT_CHAIN: %v", err)
+	}
+	newCA := chain[0]
+	// ① 同一把密钥 —— 这是整个机制成立的前提，所以放在最前面
+	oldPub, ok1 := id.CACert.PublicKey.(ed25519.PublicKey)
+	newPub, ok2 := newCA.PublicKey.(ed25519.PublicKey)
+	if !ok1 || !ok2 || !oldPub.Equal(newPub) {
+		return errors.New("ERR_CA_KEY_CHANGED: 父给的 CA 证书换了公钥 —— " +
+			"本项目只支持轮换 CA 证书、不支持轮换 CA 密钥（换密钥要全树重新分发 trust/）")
+	}
+	// ② 与启动强校验同口径
+	if !newCA.IsCA {
+		return errors.New("ERR_CA_CERT_INVALID: 新 CA 证书 basicConstraints 不是 CA:TRUE")
+	}
+	if newCA.KeyUsage&x509.KeyUsageCertSign == 0 {
+		return errors.New("ERR_CA_CERT_INVALID: 新 CA 证书缺少 keyUsage certSign")
+	}
+	if !strings.Contains(newCA.Subject.CommonName, n.C().Node.ID) {
+		return fmt.Errorf("ERR_CA_CERT_CN_INVALID: CN %q 不含本节点 ID %s", newCA.Subject.CommonName, shortID(n.C().Node.ID))
+	}
+	// ③ 能接到信任锚（同样走 ChainToAnchor：它认下"同密钥、不同证书"的轮换形态）
+	if err := identity.ChainToAnchor(chain, identity.PoolCerts(n.rootsPool()), 0); err != nil {
+		return fmt.Errorf("ERR_CA_CERT_UNTRUSTED: %w", err)
+	}
+	if n.C().Security.CACertPath == "" {
+		return errors.New("ERR_NO_CA_CERT_PATH: 本节点未配置 security.ca_cert_path，无法落盘 CA 证书")
+	}
+	// 先落盘再热切换（与身份证书同一顺序）
+	if err := identity.WriteCertChainFile(n.C().Security.CACertPath, chain); err != nil {
+		return err
+	}
+	id.CACert, id.CAChain = newCA, chain
+	// 这份文件是我们自己写的 → 重算监视基线，免得被当成"外部变更"再触发一轮重载
+	n.refreshReloadBaseline()
+	n.Metrics.Inc("ca_rotate_total", "result", "installed")
+	n.Log.Warn("CA 证书已更新（同一把密钥、只换证书）：本节点此后给下级签发用的是新证书，"+
+		"而下级手里的旧 CA 证书在其有效期内仍然有效 —— 不需要重新入网、不需要重新分发 trust/",
+		"ca_not_after", canonTime(newCA), "ca_fingerprint", certSha256(newCA))
+	return nil
+}
+
 // checkSelfCertRenew 检查本节点证书是否进入续签窗口，是则向父请求续签。
 //
 // 接收者 n 是本节点实例。每次成功 Connect / RESUME 时顺带调用（保证恢复连接后第一时间拿到新证）。
 func (n *Node) checkSelfCertRenew() {
-	if !needRenew(n.Id().Cert) {
+	if !certsNeedRenew(n.Id()) {
 		return
 	}
-	n.Log.Info("cert renew: requesting on connect", "not_after", n.Id().Cert.NotAfter.Format(time.RFC3339))
-	n.up.sendCertRenewReq("on connect (renewal window)")
+	n.Log.Info("cert renew: requesting on connect",
+		"cert_not_after", n.Id().Cert.NotAfter.Format(time.RFC3339), "want_ca", n.caNeedsRenew())
+	n.requestCertRenew("on connect (renewal window)")
+}
+
+// requestCertRenew 向父发一次续签请求（按需顺带请求 CA 证书续签）。
+//
+// 为什么要由**子**来判 CA 证书的窗口、而不是父：父手上只有子的身份证书（mTLS 握手拿到的
+// 就是叶子证书），并不知道子的 CA 证书什么时候过期。让子自报更简单，也不违反既有风格
+// —— 父仍然不认子的"时间判断"，它只负责"你要我就签"，签发本身还要过"同一把密钥"那道校验
+// （见 handleCertRenewReq）。
+//
+// 接收者 n 是本节点实例；没有上行（根）时什么都不做。
+//
+// 参数：
+//
+//	reason — 触发原因（原样带给父，只用于日志）
+func (n *Node) requestCertRenew(reason string) {
+	if n.up == nil {
+		return
+	}
+	req := &pb.CertRenewReq{Reason: reason, WantCa: n.caNeedsRenew()}
+	if req.WantCa && n.Id().CACert != nil {
+		// 带上"当前这张 CA 证书"（DER），父据此确认要续的是**同一把密钥**。
+		// 它是整条链上唯一能证明"只换证书、不换密钥"的东西，见 proto 里 CertRenewReq 的注释。
+		req.CaCert = n.Id().CACert.Raw
+	}
+	n.up.sendCertRenewReq(req)
+}
+
+// caNeedsRenew 判断本节点自己的 CA 证书是否进入续签窗口。
+//
+// 接收者 n 是本节点实例。只有持有 CA 材料的节点（根 / 中继）才有 CA 证书，叶子恒为 false。
+//
+// 返回：
+//
+//	bool — 持有 CA 证书且它已进窗口时为 true
+func (n *Node) caNeedsRenew() bool {
+	id := n.Id()
+	return id != nil && id.CACert != nil && needRenew(id.CACert)
 }
 
 // startCertRenewLoop 启动子节点本地的续签调度：每小时检查一次，进入窗口即主动请求续签
 // （不依赖当前是否正连父；每次成功 Connect 也会顺带检查）。
 //
 // 接收者 n 是本节点实例；没有父（即本节点是根）时直接返回。
+// **身份证书与自己的 CA 证书一起判**，所以中继的 CA 证书也能靠这条循环自动换新。
 func (n *Node) startCertRenewLoop() {
 	if n.up == nil {
 		return
 	}
 	n.loop(time.Hour, 2*time.Minute, "cert-renew-check", func(context.Context) {
-		if needRenew(n.Id().Cert) {
-			n.Log.Info("cert renew: requesting from parent", "not_after", n.Id().Cert.NotAfter.Format(time.RFC3339))
-			n.up.sendCertRenewReq("local schedule (2/3 of lifetime)")
+		if certsNeedRenew(n.Id()) {
+			n.Log.Info("cert renew: requesting from parent",
+				"cert_not_after", n.Id().Cert.NotAfter.Format(time.RFC3339), "want_ca", n.caNeedsRenew())
+			n.requestCertRenew("local schedule (2/3 of lifetime)")
 		}
 	})
 }
 
 // ---------- 根的自签续期（根没有父，只能自己签自己） ----------
 
-// applySelfRenew 把自签续期得到的新证书链落盘，并同步更新内存里的身份包。
+// applySelfRenew 把自签续期得到的材料落盘，并同步更新内存里的身份包。
 //
-// 调用方**必须先用 `identity.ValidateStartup` 校验过新证书**再调它（见 loadIdentity / renewSelfCert）：
-// 本函数只负责"写下去 + 换内存"，不做任何校验，以免把一张坏证书覆盖到好证书上。
+// 调用方**必须先用 `identity.ValidateStartup` 校验过候选材料**再调它（见 loadIdentity / renewSelfCert）：
+// 本函数只负责"写下去 + 换内存"，不做任何校验，以免把坏证书覆盖到好证书上。
+//
+// 落盘顺序是"先 CA、后身份"：两者是同一把密钥的两次表述，任一步崩溃都可恢复
+// （旧身份证书能被新 CA 证书验通、新身份证书也能被旧 CA 证书验通，因为公钥没变），
+// 所以这里不需要额外的事务语义。
 //
 // 参数：
 //
-//	cfg   — 本节点配置；写回目标是 security.identity_cert_path
-//	id    — 本节点身份包（会被就地更新 Cert / Chain）
-//	chain — 校验通过的新证书链，chain[0] 是新身份证书
+//	cfg — 本节点配置；写回目标是 security.identity_cert_path 与 security.ca_cert_path
+//	id  — 本节点身份包（会被就地更新 Cert / Chain / CACert / CAChain）
+//	r   — 校验通过的候选材料；r.CAChain 为空表示本次没有轮换 CA 证书
 //
 // 返回：
 //
-//	error — 写盘失败时返回；此时内存与磁盘都保持原样
-func applySelfRenew(cfg *config.Config, id *identity.Identity, chain []*x509.Certificate) error {
-	if err := identity.WriteCertChainFile(cfg.Security.IdentityCertPath, chain); err != nil {
+//	error — 写盘失败时返回；此时内存保持不变
+func applySelfRenew(cfg *config.Config, id *identity.Identity, r *selfRenewResult) error {
+	if len(r.CAChain) > 0 {
+		if cfg.Security.CACertPath == "" {
+			return errors.New("本节点没有 security.ca_cert_path，无法把轮换后的 CA 证书写下去")
+		}
+		if err := identity.WriteCertChainFile(cfg.Security.CACertPath, r.CAChain); err != nil {
+			return err
+		}
+		id.CACert, id.CAChain = r.CAChain[0], r.CAChain
+	}
+	if err := identity.WriteCertChainFile(cfg.Security.IdentityCertPath, r.Chain); err != nil {
 		return err
 	}
-	id.Cert, id.Chain = chain[0], chain
+	id.Cert, id.Chain = r.Chain[0], r.Chain
 	return nil
+}
+
+// certsNeedRenew 判断本节点是否有证书进了续签窗口 —— **身份证书与自己的 CA 证书都看**。
+//
+// 为什么必须一起看：CA 证书同样是启动强校验的硬门槛（`ValidateStartup` 里
+// `id.CACert.NotAfter` 过期即 REFUSE TO START）。只盯身份证书就会出现
+// "身份证书很新、CA 证书已过期、下次启动起不来"这种最难查的状态。
+//
+// 参数：
+//
+//	id — 本节点身份包；为 nil 时返回 false
+//
+// 返回：
+//
+//	bool — 身份证书或（存在的话）CA 证书任一进窗口即为 true
+func certsNeedRenew(id *identity.Identity) bool {
+	if id == nil {
+		return false
+	}
+	if id.Cert != nil && needRenew(id.Cert) {
+		return true
+	}
+	return id.CACert != nil && needRenew(id.CACert)
+}
+
+// certNotAfterDays 取某身份包身份证书的剩余有效天数。
+//
+// 参数：
+//
+//	id — 身份包；为 nil 或没有证书时返回 0
+//
+// 返回：
+//
+//	int32 — 剩余天数（向下取整）；已过期返回 -1
+func certNotAfterDays(id *identity.Identity) int32 {
+	if id == nil || id.Cert == nil {
+		return 0
+	}
+	return daysUntil(id.Cert.NotAfter)
+}
+
+// caNotAfterDays 取某身份包 CA 证书的剩余有效天数。
+//
+// 参数：
+//
+//	id — 身份包；为 nil 或不持有 CA 证书（叶子）时返回 0
+//
+// 返回：
+//
+//	int32 — 剩余天数；不持有 CA 证书时返回 0，已过期返回 -1。
+//	         0 只用来表示"没有 CA 证书"—— 因为刚签出来的 CA 证书剩余天数必然远大于 0。
+func caNotAfterDays(id *identity.Identity) int32 {
+	if id == nil || id.CACert == nil {
+		return 0
+	}
+	return daysUntil(id.CACert.NotAfter)
+}
+
+// daysUntil 把一个到期时刻折算成"还剩几天"，并给"已过期"一个明确的负值。
+//
+// 参数：
+//
+//	notAfter — 证书的到期时刻
+//
+// 返回：
+//
+//	int32 — 剩余整天数（向下取整）；已过期返回 -1（不返回 0，避免与"没有这张证书"混淆）
+func daysUntil(notAfter time.Time) int32 {
+	d := int32(time.Until(notAfter).Hours() / 24)
+	if d <= 0 {
+		return -1
+	}
+	return d
 }
 
 // withChain 用一条新的证书链复制一份身份包（**不改原对象**）。
@@ -185,7 +501,47 @@ func withChain(id *identity.Identity, chain []*x509.Certificate) *identity.Ident
 	}
 }
 
-// reissueChainForSelf 用本节点 CA 重签自己的身份证书并解析成证书链（**不落盘**）。
+// withCA 用一条新的 CA 证书链复制一份身份包（**不改原对象**）。
+//
+// 用途：CA 证书轮换时，拿"只把 CA 材料换掉"的副本来跑一遍启动强校验、
+// 并用它作为后续重签身份证书的签发方（ReissueFor 的 owner）。
+//
+// 参数：
+//
+//	id     — 原身份包（提供 NodeID / 私钥 / 身份证书）
+//	caChain — 新的 CA 证书链，caChain[0] 是新 CA 证书
+//
+// 返回：
+//
+//	*identity.Identity — 只把 CACert / CAChain 换掉的副本；caChain 为空时原样返回 id
+func withCA(id *identity.Identity, caChain []*x509.Certificate) *identity.Identity {
+	if len(caChain) == 0 {
+		return id
+	}
+	return &identity.Identity{
+		NodeID: id.NodeID, Key: id.Key, Cert: id.Cert, Chain: id.Chain,
+		CAKey: id.CAKey, CACert: caChain[0], CAChain: caChain, RootPool: id.RootPool,
+	}
+}
+
+// selfRenewResult 一次"自签续期"的产物：先 CA、后身份两步的结果。
+//
+// 两个字段都是"已经算出来、还没落盘"的候选值；校验通过后由 applySelfRenew 一起写下去。
+type selfRenewResult struct {
+	// Chain 新的身份证书链，chain[0] 是新身份证书
+	Chain []*x509.Certificate
+	// CAChain 新的 CA 证书链，caChain[0] 是新 CA 证书。
+	// **nil 表示本次没有轮换 CA 证书**（CA 证书还没进窗口）。
+	CAChain []*x509.Certificate
+}
+
+// reissueForSelf 用本节点 CA 重签自己的材料（**不落盘**）。
+//
+// 两步，顺序是硬的：
+//  1. **先**看 CA 证书是否进窗口 → 是就用 ReissueCAFor 换一张（**同一把密钥、同一 CN**，
+//     所以下级手里的旧 CA 证书仍然有效、信任锚完全不用动）；
+//  2. **再**用（可能刚换过的）CA 证书重签身份证书 —— 否则身份证书链里引用的是旧 CA 证书，
+//     虽然仍能验通，但"链里那张 CA 证书"与磁盘上的不是同一张，下次启动会绕远路。
 //
 // 参数：
 //
@@ -193,16 +549,28 @@ func withChain(id *identity.Identity, chain []*x509.Certificate) *identity.Ident
 //
 // 返回：
 //
-//	[]*x509.Certificate — 新证书链（[新身份证书, 本节点 CA 证书…]）
-//	error               — 无 CA 材料 / 旧证书不是 Ed25519 / 新证书身份与旧的不一致时返回
-func reissueChainForSelf(id *identity.Identity) ([]*x509.Certificate, error) {
+//	*selfRenewResult — 待落盘的（身份链, CA 链）
+//	error            — 无 CA 材料 / 旧证书不是 Ed25519 / 重签后身份不符时返回
+func reissueForSelf(id *identity.Identity) (*selfRenewResult, error) {
 	if id == nil || id.Cert == nil {
 		return nil, errors.New("identity certificate missing")
 	}
 	if id.CAKey == nil || id.CACert == nil {
 		return nil, errors.New("no CA material to sign with（本节点不持 CA 私钥与 CA 证书）")
 	}
-	pemBytes, err := identity.ReissueFor(id.Cert, id)
+	out := &selfRenewResult{}
+	// ① 先轮换 CA 证书（只在它进了窗口时才动）
+	owner := id
+	if needRenew(id.CACert) {
+		newCA, _, err := identity.ReissueCAFor(id.CACert, id)
+		if err != nil {
+			return nil, fmt.Errorf("轮换本节点 CA 证书失败: %w", err)
+		}
+		out.CAChain = append([]*x509.Certificate{newCA}, id.CAChain[1:]...)
+		owner = withCA(id, out.CAChain)
+	}
+	// ② 再用（可能刚换过的）CA 证书重签身份证书
+	pemBytes, err := identity.ReissueFor(id.Cert, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -214,7 +582,8 @@ func reissueChainForSelf(id *identity.Identity) ([]*x509.Certificate, error) {
 	if got := identity.NodeIDFromCert(chain[0]); got != id.NodeID {
 		return nil, fmt.Errorf("自签续期后的证书身份不符: %s != %s", got, id.NodeID)
 	}
-	return chain, nil
+	out.Chain = chain
+	return out, nil
 }
 
 // renewSelfCert 运行期的自签续期：重签 → 与启动同一强度校验 → 原子落盘 → 热切换 TLS 材料。
@@ -236,27 +605,52 @@ func (n *Node) renewSelfCert(reason string) error {
 		return errors.New("本节点不能自签续期（有父的节点由父签发；没有 CA 材料则无从自签）")
 	}
 	cur := n.Id()
-	chain, err := reissueChainForSelf(cur)
+	res, err := reissueForSelf(cur)
 	if err != nil {
 		return err
 	}
-	// 先按"启动同一强度"校验**新证书**再落盘：宁可续不上，也不能把一张坏证书写进去
+	// 先按"启动同一强度"校验**候选材料**再落盘：宁可续不上，也不能把坏证书写进去。
+	// 候选要把 CA 与身份**一起**换掉再验 —— 只验身份证书会漏掉"新 CA 证书自己不过关"的情况。
 	pub, err := identity.LoadPublicKeyFile(n.C().Security.IdentityPubKeyPath)
 	if err != nil {
 		return fmt.Errorf("load public key: %w", err)
 	}
-	if err := identity.ValidateStartup(withChain(cur, chain), identity.PoolCerts(n.rootsPool()), pub); err != nil {
+	if err := identity.ValidateStartup(withChain(withCA(cur, res.CAChain), res.Chain),
+		identity.PoolCerts(n.rootsPool()), pub); err != nil {
 		return fmt.Errorf("自签续期未通过启动强度校验: %w", err)
 	}
-	if err := applySelfRenew(n.C(), cur, chain); err != nil {
+	if err := applySelfRenew(n.C(), cur, res); err != nil {
 		return err
 	}
 	n.certBox.Set(identity.TLSCertFrom(cur))
 	// 这份文件是我们自己写的 → 重算监视基线，免得被当成"外部变更"再触发一轮重载
 	n.refreshReloadBaseline()
 	n.Log.Info("cert self-renew: applied", "reason", reason,
-		"not_after", canonTime(chain[0]), "fingerprint", certSha256(chain[0]))
+		"not_after", canonTime(res.Chain[0]), "fingerprint", certSha256(res.Chain[0]))
+	n.noteCARotated(res.CAChain)
 	return nil
+}
+
+// noteCARotated 记录"本节点这次有没有轮换自己的 CA 证书"，并打日志 + 记指标。
+//
+// **启动路径与运行期路径共用它**：启动时的自签续期（loadIdentity）也会轮换 CA 证书，
+// 而它没有 Node 可用来打日志 —— 所以调用方把结果（identityBundle.caRotated）带出来再调本函数。
+// 不这么做就会出现"启动时换了 CA 证书、日志里一行都没有"可观测缺口（实测踩到过）。
+//
+// 接收者 n 是本节点实例。
+//
+// 参数：
+//
+//	caChain — 新轮换出来的 CA 证书链；为空表示本次没有轮换（记 skipped）
+func (n *Node) noteCARotated(caChain []*x509.Certificate) {
+	if len(caChain) == 0 {
+		n.Metrics.Inc("ca_rotate_total", "result", "skipped")
+		return
+	}
+	n.Metrics.Inc("ca_rotate_total", "result", "issued")
+	n.Log.Warn("CA 证书已轮换（同一把密钥、只换证书）：下级手里的旧 CA 证书在其有效期内仍然有效，"+
+		"不需要重新分发 trust/、也不需要下级重新入网",
+		"ca_not_after", canonTime(caChain[0]), "ca_fingerprint", certSha256(caChain[0]))
 }
 
 // canSelfRenew 本节点能否"自签续期"：**没有父**（即根），且自己持有 CA 材料。
@@ -280,7 +674,7 @@ func (n *Node) canSelfRenew() bool {
 // 进入续签窗口就自己重签一张。
 //
 // 与 startCertRenewLoop 互斥且互补：有父的节点由**父**给它签（子自己没 CA 材料）；
-// 没有父的就是根，只能自签。
+// 没有父的就是根，只能自签。**身份证书与自己的 CA 证书一起判**（见 certsNeedRenew）。
 //
 // 接收者 n 是本节点实例。
 func (n *Node) startSelfRenewLoop() {
@@ -288,10 +682,12 @@ func (n *Node) startSelfRenewLoop() {
 		return // 有父（走"父给子签"）或没有 CA 材料（无从自签）
 	}
 	n.loop(time.Hour, 2*time.Minute, "cert-self-renew", func(context.Context) {
-		if !needRenew(n.Id().Cert) {
+		if !certsNeedRenew(n.Id()) {
 			return
 		}
-		n.Log.Info("cert self-renew: certificate in renewal window", "not_after", canonTime(n.Id().Cert))
+		n.Log.Info("cert self-renew: certificate in renewal window",
+			"cert_not_after", canonTime(n.Id().Cert),
+			"ca_not_after", canonTime(n.Id().CACert))
 		if err := n.renewSelfCert("local schedule (2/3 of lifetime)"); err != nil {
 			n.Log.Warn("cert self-renew failed", "err", err)
 		}
@@ -434,6 +830,26 @@ func applyRuntimeParam(c *config.Config, key, val string) bool {
 		*d = int32(v)
 		return true
 	}
+	// numPtr 解析整数并写入 *int32。下发窗口用得到：那两个字段的"没配"与"显式 0"语义不同
+	// （0 = 不限），所以必须走指针，不能落到上面那个把 0 当"没配"的 num 上。
+	numPtr := func(d **int32) bool {
+		v, err := strconv.Atoi(val)
+		if err != nil {
+			return false
+		}
+		x := int32(v)
+		*d = &x
+		return true
+	}
+	// bl 解析布尔（"true"/"1"/"on"… 由 strconv 定），成功则写入 d
+	bl := func(d *bool) bool {
+		v, err := strconv.ParseBool(val)
+		if err != nil {
+			return false
+		}
+		*d = v
+		return true
+	}
 	switch key {
 	case "command.lease_ttl":
 		return dur(&c.Command.LeaseTTL)
@@ -445,6 +861,14 @@ func applyRuntimeParam(c *config.Config, key, val string) bool {
 		return dur(&c.Command.ChildStuckTimeout)
 	case "command.local_busy_backoff":
 		return dur(&c.Command.LocalBusyBackoff)
+	case "command.local_busy_backoff_max":
+		return dur(&c.Command.LocalBusyBackoffMax)
+	case "command.max_dispatch_inflight_per_child":
+		return numPtr(&c.Command.MaxDispatchInflightPerChild)
+	case "command.max_dispatch_inflight":
+		return numPtr(&c.Command.MaxDispatchInflight)
+	case "command.dispatch_window_adaptive":
+		return bl(&c.Command.DispatchWindowAdaptive)
 	case "command.audit_retention":
 		return dur(&c.Command.AuditRetention)
 	case "command.eviction_timeout":

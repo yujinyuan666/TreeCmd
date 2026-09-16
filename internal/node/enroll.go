@@ -31,8 +31,45 @@ import (
 //
 // 三个要点：
 //   - **私钥不出子机**：请求里只有公钥；父的响应里只有证书。程序既不生成也不接收任何私钥。
-//   - **许可不是唯一门槛**：还要 PoP，拿着 token 但没有对应私钥的人签不出有效的 PoP。
+//   - **许可不是唯一门槛，但它是唯一的"授权"判据**：还要 PoP，拿着 token 但没有对应私钥的人
+//     签不出有效的 PoP。反过来，**没有 token 就一定放行不了** —— 见下面 enrollCredential。
 //   - **父必须有 CA 材料**：没有就明确拒绝（`ERR_ENROLL_NO_CA`），而不是发一张假的证书出去。
+
+// enrollCredential 读并解析本节点的**入网引导凭据**（`security.enrollment.token` / `token_path`）。
+//
+// 两侧都用它，但用法不同：
+//   - 父端只取 `Permit` 做常量时间比对（这是"父要不要收你"的唯一判据）；
+//   - 子端取 `Permit` 提交申请，并且**凭据里可能内嵌父的 CA 证书链** —— 那是首跳的信任锚来源，
+//     于是子节点部署时只需要这一份文件（见 identity.ParseBootstrap）。
+//
+// **每次现读**（不缓存）：与"换 token 不需要重注册、SIGHUP/投放即生效"的既有语义一致。
+//
+// 接收者 n 是本节点实例。
+//
+// 返回：
+//
+//	*identity.Bootstrap — 解析结果（许可与锚都可能为空）
+//	error               — 读不到凭据文件 / 内容不符合凭据格式时返回（fail-fast，不静默当成"没许可"）
+func (n *Node) enrollCredential() (*identity.Bootstrap, error) {
+	raw, err := n.C().Security.EnrollCredentialRaw()
+	if err != nil {
+		return nil, err
+	}
+	return identity.ParseBootstrap(raw)
+}
+
+// enrollPermitAbsent 报告"本节点手上没有可用的入网许可"（仅用于启动期提醒与子端早失败）。
+//
+// 接收者 n 是本节点实例。凭据读不到、格式不合法、或解析出来没有 permit，都算"没有"。
+// **真正的判定不在这里**：父端在 Hub.Enroll ② 拒绝，子端在 ensureCertForce 提前失败。
+//
+// 返回：
+//
+//	bool — 拿不到非空许可时为 true
+func (n *Node) enrollPermitAbsent() bool {
+	cred, err := n.enrollCredential()
+	return err != nil || cred.Permit == ""
+}
 
 // ---------- 服务端 ----------
 
@@ -122,30 +159,26 @@ func (h *Hub) Enroll(ctx context.Context, req *pb.EnrollRequest) (*pb.EnrollResp
 	if req.NodeId == "" {
 		return deny("ERR_ENROLL_BAD_REQUEST: node_id 为空")
 	}
-	// ① 白名单
-	if allow := cfg.Security.Enrollment.AllowIDs; len(allow) > 0 {
-		ok := false
-		for _, id := range allow {
-			if id == req.NodeId {
-				ok = true
-				break
-			}
-		}
-		if !ok {
-			return deny("ERR_ENROLL_NOT_ALLOWED: 该 NodeID 不在 security.enrollment.allow_ids 内")
-		}
-	}
-	// ② 入网许可
-	token, err := cfg.Security.EnrollToken()
+	// ① 入网许可 —— **唯一的授权判据：许可为空就拒绝一切入网**。
+	//
+	// 这里**曾经**还有一道 `allow_ids` 白名单（"只允许这些 NodeID 入网"），已删除：
+	// allow_ids 里装的是 NodeID，而 NodeID 是**公开**信息（`/v1/tree` 就能读到）；
+	// 而 PoP 只证明"提交者持有它提交的那对公钥的私钥"，**证明不了"它就是那个 NodeID"** ——
+	// NodeID 与密钥对之间有意没有任何密码学绑定（`node.id` 还允许留空自动生成）。
+	// 于是"自报一个白名单里的 ID + 自建一对密钥"就能换到一张 CN 等于该 ID 的真证书：
+	// 既绕开了授权，又能与真节点撞 ID（父是按 NodeID 索引子节点的）。
+	// ⇒ 白名单**不是**一道能独立成立的闸门，留着只会让人以为多了一层保护。想限定
+	// "这一次准入发给谁"，正确做法是**每节点一枚一次性许可**，而不是给一份 ID 名单。
+	cred, err := n.enrollCredential()
 	if err != nil {
 		return deny("ERR_ENROLL_TOKEN_READ: " + err.Error())
 	}
-	if token == "" {
-		// 没配 token 时只接受"显式点名"的白名单模式；两者都没有就一律拒绝（fail-safe）
-		if len(cfg.Security.Enrollment.AllowIDs) == 0 {
-			return deny("ERR_ENROLL_NO_PERMIT_POLICY: 既未配置 enrollment.token 也未配置 allow_ids，拒绝一切入网")
-		}
-	} else if subtle.ConstantTimeCompare([]byte(token), []byte(req.Permit)) != 1 {
+	if cred.Permit == "" {
+		return deny("ERR_ENROLL_NO_PERMIT_POLICY: 本节点未配置入网许可（security.enrollment.token / token_path）" +
+			" ⇒ 拒绝一切入网。入网认证只有许可一个口径：NodeID 是公开信息、与密钥对没有密码学绑定，" +
+			"给一份 ID 名单挡不住「自报某个 ID + 自建一对密钥」")
+	}
+	if subtle.ConstantTimeCompare([]byte(cred.Permit), []byte(req.Permit)) != 1 {
 		return deny("ERR_ENROLL_BAD_PERMIT: 入网许可不正确")
 	}
 	// ③ 一次性挑战
@@ -264,16 +297,20 @@ func (n *Node) ensureCertForce(ctx context.Context, force bool) error {
 	if !cfg.Security.EnrollmentEnabled() {
 		return fmt.Errorf("NO_CERT: 证书不可用且未开启运行期入网（security.enrollment.enabled）")
 	}
-	token, err := cfg.Security.EnrollToken()
+	cred, err := n.enrollCredential()
 	if err != nil {
 		return err
 	}
-	if token == "" && len(cfg.Security.Enrollment.AllowIDs) > 0 {
-		// 白名单模式：许可为空也允许尝试（服务端按 allow_ids 判定）
+	if cred.Permit == "" {
+		// 没有许可就不必白试一轮：父端一定会拒（许可为空即拒绝一切入网，见 Hub.Enroll ②）。
+		// 提前失败，并把"该放哪份文件"直接写进错误里。
+		return fmt.Errorf("NO_CERT: 证书不可用，且没有入网许可（security.enrollment.token / token_path）—— " +
+			"父端会因为许可为空而拒绝一切入网。请把父产出的引导凭据投放到 token_path 指向的文件" +
+			"（凭据里除 permit 外还可以内嵌父的 CA 链，那样连 trust/ 都不用了）")
 	}
 	var lastErr error
 	for _, p := range cfg.Parents {
-		if err := n.enrollWith(ctx, p, token); err != nil {
+		if err := n.enrollWith(ctx, p, cred.Permit); err != nil {
 			lastErr = err
 			n.Log.Warn("enroll: attempt failed", "parent", shortID(p.ID), "err", err)
 			continue
@@ -294,10 +331,10 @@ func (n *Node) ensureCertForce(ctx context.Context, force bool) error {
 //
 //	ctx   — 上下文
 //	p     — 目标父节点（ID + 地址）；服务端身份必须是它
-//	token — 入网许可 token（可为空，此时靠父端 allow_ids 白名单放行）
+//	permit — 入网许可串（取自引导凭据；为空时本函数不会被调用 —— 父端一定会拒）
 //
 // 返回：任一步失败返回错误；成功时证书已原子写盘并完成热切换。
-func (n *Node) enrollWith(ctx context.Context, p config.Parent, token string) error {
+func (n *Node) enrollWith(ctx context.Context, p config.Parent, permit string) error {
 	cfg := n.C()
 	myID := cfg.Node.ID
 	myPriv := n.Id().Key
@@ -330,7 +367,7 @@ func (n *Node) enrollWith(ctx context.Context, p config.Parent, token string) er
 		IdentityPubkey: myPub,
 		Nonce:          ch.Nonce,
 		PoofSig:        identity.Sign(myPriv, pop),
-		Permit:         token,
+		Permit:         permit,
 		ListenAddr:     cfg.Node.Listen,
 		Note:           "runtime enrollment",
 	}
@@ -353,10 +390,13 @@ func (n *Node) enrollWith(ctx context.Context, p config.Parent, token string) er
 	}
 
 	// ---- 校验响应：只接受"确实是我、链到信任锚"的证书 ----
-	anchors, err := identity.LoadOrScanTrustAnchors(cfg.Security.CACertPaths)
-	if err != nil {
-		return err
-	}
+	//
+	// 用**本节点当前生效的锚池**，而不是只从 security.ca_cert_paths 重新读一遍：
+	// 锚池在启动期已经由"配置锚 ∪ 引导凭据里内嵌的父 CA 链 ∪ 自身证书链自举"合并而成
+	// （见 loadIdentity）。若这里退回"只读 ca_cert_paths"，那么"只带一份引导凭据、
+	// 没配 ca_cert_paths"的节点会卡死在这一步 —— 父端明明已经签发成功，
+	// 子端却报 `no trust anchor loaded`（实测踩到过）。
+	anchors := identity.PoolCerts(n.rootsPool())
 	chain, err := identity.ParseChainPEM(resp.CertChain)
 	if err != nil || len(chain) == 0 {
 		return fmt.Errorf("响应证书链无法解析: %v", err)
@@ -407,7 +447,9 @@ func (n *Node) enrollWith(ctx context.Context, p config.Parent, token string) er
 	}
 	n.idPtr.Store(id)
 	n.certBox.Set(identity.TLSCertFrom(id))
-	n.roots.Store(identity.NewPool(anchors...))
+	// 信任锚：把**刚拿到的这条证书链里的 CA** 并进池。于是"首次入网用的那份父 CA"到此完成使命 ——
+	// 运行期用新锚，重启则由 loadIdentity 从证书链自举出同一批锚，trust/ 里那份文件可以删掉。
+	n.roots.Store(identity.NewPool(mergeAnchors(anchors, identity.ChainAnchors(chain))...))
 	// 我们自己刚写过证书文件 → 重算监视基线，否则这次改动会被当成"外部变更"或反过来漏检
 	n.refreshReloadBaseline()
 	n.Log.Info("enroll: certificate installed",
