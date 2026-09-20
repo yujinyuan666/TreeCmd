@@ -193,6 +193,36 @@ curl -s localhost:18443/v1/tree | grep -o '"lagging_children":[0-9]*'   # 等它
 替换时会给上一版留一份 `<可执行文件>.prev`（回滚与排障用，程序不会自动删）；
 全程**不碰 `node.yaml`**（哈希只活在运行时配置里）。
 
+### 外部脚本：脚本放在二进制旁边，由父按需下发给子
+
+脚本目录固定为 **`<可执行文件所在目录>/script/`**（与 selfupdate 的暂存目录同源口径）。
+**解释器由脚本自己的 shebang 决定**，调用方不指定类型；脚本落盘时是 `0755`，可以手动执行。
+
+```bash
+# 一条指令只带**一个参数**（一个 JSON）：要跑哪个脚本 + 给它的数据
+curl -s -XPOST localhost:18443/v1/commands -d '{"type":"script","aggregate":"TREE",
+  "payload":"'"$(printf '%s' '{"script":"hello.sh","params":{"who":"tree"}}' | base64)"'"}'
+```
+
+| 能力 | 说明 |
+|------|------|
+| **脚本怎么到每个节点** | 执行前，每个节点先看本地 `script/<名字>` 的哈希与指令里的是否一致；不一致（或没有）就**向直接父索取**，父从自己的 `script/` 读出来分片回发（逐片 crc32 + 整份 sha256），子校验通过后**无条件覆盖**写盘，然后才执行。所以"根节点放脚本、其余节点自动拿到" |
+| **为什么是子索取、不是父推送** | 指令投递本身是子主动拉的（`FetchCommands` 拉模式工作队列），父"推脚本"与子"拉指令"是两条独立时序 —— 由父单方面推，子可能在脚本落盘之前就拉到指令并开始执行 |
+| **哈希从哪来** | 调用方**不用自己算**：发起节点在**签名之前**把本地脚本的 sha256 注入载荷，于是它落在 origin 签名的覆盖范围内（中间节点既改不了参数，也改不了"该跑哪个版本"）。顺带一道 fail-fast：发起节点上没有这个脚本，**提交就被拒**，不必等它铺到全树 |
+| **父的身份背书** | 父在下发时会用**自己的身份私钥**对 `(脚本名, 整份哈希)` 签一次，只挂在最后一片上；子用 mTLS 拿到的**父公钥**验，并断言"签名者就是我这次的父"。它管的是**归因**（这份字节是谁给的），**不承担防篡改** —— 内容对不对始终由哈希比对负责。签名只在内存验、不落盘，所以它现在**不提供离线可验证性** |
+| **参数怎么给脚本** | 那一个 JSON **原样**作为 `argv[1]`（不做 shell 解析，也就没有注入面） |
+| **结果怎么回来** | 脚本往**本次执行的工作目录**写 `result.json`（固定名字），节点读它作为本节点结果（**缺失 = 空结果**，纯副作用型脚本不算失败）；stdout / stderr 只作日志（各留 1MB），退出码非 0 = 该节点失败，stderr 尾部进错误信息 |
+| **结果上限 4MB** | 必须远小于 64MB —— 再大就会退化成对象存储引用，而引用**无法跨节点取回**。超限直接判失败并说明原因 |
+| **进程怎么收** | 独立进程组（`Setpgid`）+ 中断时整组信号，先 `SIGTERM`、宽限 5s 再 `SIGKILL`；超时来自指令 deadline。**不会留下脚本 fork 出去的孙进程** |
+| **不自动重跑** | 脚本可能不幂等（写库、发请求），所以 `script` 类型**拒绝"进程重启后自动重跑"**：落 `SELF_FAILED`，等人工确认后用 retry 接口重跑 |
+
+⚠️ **两条必须知道的安全边界**：
+
+1. **脚本以节点进程的身份运行，没有沙箱** —— 它能读写本机任意文件、能联网。信任边界 = 「谁能提交指令（`allowedOrigin`）」+「谁能写节点的 `script/` 目录」+「脚本哈希校验」+「父的身份背书」。别把脚本当成"受限制的东西"。
+2. **脚本名走白名单**（`[A-Za-z0-9._-]`、≤128 字节），并且服务端会解析符号链接、**拒绝逃出脚本目录的文件** —— 否则一条 `{"script":"../../keys/id_ed25519"}` 就能把**节点身份私钥**当成脚本发给全树。下发侧只对"本节点 CA 签发的直接子"开放。
+
+部署前提：**根节点的 `script/` 目录要有人放脚本**（其余节点自动下发）。目录不存在时启动会建一个空的。
+
 
 
 每个节点启动时都要带**自己的私钥与公钥**（`security.identity_key_path` / `security.identity_pubkey_path`）：
@@ -226,9 +256,18 @@ curl -s -XPOST localhost:18443/v1/commands -d '{"type":"echo","payload":"aGVsbG8
 # 手写的对外 API 调用（internal/exec/apis）：整棵子树各调一次上游，结果按 TREE 保层级聚合
 curl -s -XPOST localhost:18443/v1/commands -d '{"type":"uuid_v4","aggregate":"TREE"}'
 curl -s -XPOST localhost:18443/v1/commands -d '{"type":"remote_time","aggregate":"TREE"}'   # 各节点对时
+# 执行外部脚本（internal/exec/script）：脚本放在 <可执行文件同目录>/script/，由父按需下发给子
+curl -s -XPOST localhost:18443/v1/commands \
+  -d '{"type":"script","payload":"'"$(printf '%s' '{"script":"hello.sh","params":{"who":"tree"}}' | base64)"'"}'
 curl -s "localhost:18443/v1/health?depth=-1&timeout=20s"
 curl -s "localhost:18443/v1/health?command_id=<ID>&depth=2&detail=true"
 ```
+
+**谁都能当发起者**：只要该节点配了 `api.http_addr`（判定**不看角色**，根 / 中继 / 叶子一视同仁），
+`POST /v1/commands` 提交的指令就以**它自己为 origin**。`Target` 只有 `SUBTREE` 一种模式（本节点 + 名下子树），
+于是结果只落在这棵子树里 —— `handle.go` 里 `OriginId == 本节点 ⇒ sink=SELF`，本节点结果**不上报给自己的父**，
+**祖先对这条指令一无所知**（拿它的 ID 去父节点查是 `NOT_FOUND`）。所以"从中继提交一条只影响中继及其子树的
+指令"天然成立；要跑这件事见 `test/from-any-node.sh`。
 
 ### 失效节点清理：`/v1/forget`
 
@@ -306,7 +345,8 @@ internal/store/             bbolt：meta / commands / cmdlog / assignments / ass
 internal/registry/          直接子节点表、路径前缀路由、祖先链与环检测（不做 Target 筛选）
 internal/aggregate/         TREE / MERGE / SUM / COUNT / CUSTOM + OnFailure 精确判定公式
 internal/exec/              Executor 接口（含 OnRestart）+ noop / echo / sleep / fail + 安全空执行器
-  apis/                     手写的对外 API 调用：**一个 API 一个函数**（uuid_v4 …）+ Register(reg) 登记进执行器表
+  apis/                     手写的对外 API 调用：**一个 API 一个函数**（uuid_v4、remote_time）+ Register(reg) 登记进执行器表
+  script/                   执行外部脚本（type: "script"）：进程组回收 / 超时 / 输出限长 / result.json 读取
 internal/node/              组装：handle / waitChildren / terminal / 租约 / 取消 / 健康 / 查询 / HTTP API
   enroll.go                 运行期入网签发：服务端（许可+白名单+PoP 校验→用 CA 私钥签公钥）+ 客户端（换取并落盘）
   reload.go                 证书热重载：stat 优先的两级变更判定 + SIGUSR1 + fail-safe + 生效策略
