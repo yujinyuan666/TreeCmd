@@ -678,6 +678,9 @@ message UpFrame {
     // 旧版本父收到这一帧会当成未知字段忽略 —— 子端必须能在清单请求超时后回退到
     // "只靠 crc32 + 整份 sha256"的老流程，不能因为拿不到清单就不工作。
     BinaryManifestReq binary_manifest_req = 19;
+    // 申请父把 <可执行文件同目录>/script/<name> 这个脚本发给我（见 ScriptReq 的注释）。
+    // 编号跳过 18：docs/四项外部经验借鉴方案.md 把它标注为"§2 计划占用"。
+    ScriptReq script_req = 20;
   }
 }
 
@@ -705,6 +708,8 @@ message DownFrame {
     BinaryChunk binary_chunk = 15; // 父推送自己那份可执行文件的分片（响应 BinaryReq）
     // 分片清单（响应 BinaryManifestReq）：父先给清单、再推片。
     BinaryManifest binary_manifest = 17;
+    // 脚本分片（响应 ScriptReq）。编号跳过 16/18：docs/四项外部经验借鉴方案.md 标注为"§2 计划占用"。
+    ScriptChunk script_chunk = 19;
   }
 }
 
@@ -858,6 +863,62 @@ message BinaryChunk {
   uint32 crc32 = 7;  // 对 payload 取 crc32（只查传输损坏；完整性由整份 sha256 兜底）
   bool final = 8;    // 最后一片（或错误终止片）
   string reason = 9; // 非空 = 出错终止（ERR_BINARY_*），此时 payload 必然为空
+}
+
+// ============================================================================
+// 外部脚本下发（父把自己的 script/ 目录里的脚本给直接子）
+// ============================================================================
+// 与上面的可执行文件下发同构，但复用同一套模式而不是同一批帧，因为两者的
+// "目标路径 / 期望哈希 / 大小上限"都不同，混在一起会让两边的校验都变模糊。
+//
+// 方向同样是单向的：子是**唯一发起方**（先发 ScriptReq），父只在收到请求后推分片。
+//
+// 为什么是"子索取"而不是"父主动推"：指令投递本身是子主动拉的（FetchCommands 拉模式工作队列），
+// 父"推脚本"与子"拉指令"是两条独立时序 —— 若由父单方面推，子可能在脚本落盘之前就拉到指令并开始执行。
+// 让子在执行前索取（本地哈希不符才发起），时序问题自然消失。
+message ScriptReq {
+  // 申请方生成的请求 ID，用来把回来的分片匹配到正在等待的那次索取。
+  //
+  // 必须带：普通指令执行路径（handle → runLocal → Executor.Run）拿不到会话的帧通道，
+  // 只能靠"req_id → 等待通道"的路由收片（与 QueryReq/QueryResp 同一套路）。
+  string req_id = 1;
+  // 脚本文件名（不含目录）。父端必须做白名单校验（禁止路径穿越），
+  // 否则 `{"script":"../../keys/id_ed25519"}` 会把节点身份私钥当成脚本发出去。
+  string name = 2;
+  // 期望的 "sha256:"+十六进制。父端自己算一遍，不等即拒（ERR_SCRIPT_HASH_MISMATCH）。
+  string want_sha256 = 3;
+  // 申请方愿意接收的字节上限；0 = 用父端上限。父按 min(本字段, 父端上限) 截断。
+  int64 max_bytes = 4;
+}
+
+// 脚本分片帧：一片一个 DownFrame，父端顺序推、子端顺序收（不重排、不重传）。
+// 失败 / 拒绝也走这条帧（payload 为空 + reason 非空），这样子端只维护一个收帧通道。
+message ScriptChunk {
+  string req_id = 1;  // 回显 ScriptReq.req_id
+  string name = 2;    // 脚本文件名
+  string sha256 = 3;  // 整份脚本的哈希（每片都带）；子端收齐后必须复算并与它一致（见 signature）
+  int64 size = 4;     // 整份脚本的字节数
+  int32 index = 5;    // 从 0 开始
+  int32 total = 6;    // 总片数
+  int64 offset = 7;   // 本片在文件里的偏移
+  bytes payload = 8;  // 明文分片
+  uint32 crc32 = 9;   // 对 payload 取 crc32（只查传输损坏；完整性由整份 sha256 兜底）
+  bool final = 10;    // 最后一片（或错误终止片）
+  string reason = 11; // 非空 = 出错终止（ERR_SCRIPT_*），此时 payload 必然为空
+
+  // ---------------------------------------------------------------- 父的身份背书
+  // 以下两项**只有 final 片带**（签名要对整份内容签，只能等收齐才验），其余片为空。
+  //
+  // 签名**不承担**"内容没被篡改"这件事（那是 sha256 + origin 签名的职责）——它承担的是
+  // **归因**：证明这份字节确实是我父给的、且我父认可的就是这个 sha256。
+  //
+  // 签名者（= 下发这份脚本的父）NodeID。子端会断言"它就是我这次的父"，所以中间节点
+  // 替别人背书、或索取途中父被换掉，都会在这里暴露（ERR_SCRIPT_SIG_SIGNER）。
+  string signer_id = 12;
+  // 父用自己的身份私钥对 script.SignMessage(name, sha256) 的签名（Ed25519，64 字节）。
+  // 子端用 mTLS 拿到的父公钥验 —— 与 HopAttest 同一来源，握手时已由 expectNodeID 核过身份。
+  // 缺失 / 验不过 ⇒ 子端拒绝写盘与执行（ERR_SCRIPT_SIG_MISSING / ERR_SCRIPT_SIG_INVALID）。
+  bytes signature = 13;
 }
 
 // ============================================================================

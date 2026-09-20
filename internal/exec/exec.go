@@ -64,6 +64,18 @@ type NeedsSelfResultProvider interface {
 	NeedsSelfResult() bool
 }
 
+// PayloadPreparer 是可选的：实现它的执行器可以在指令**被 origin 签名之前**改写一次载荷。
+//
+// 为什么需要这个钩子：有些执行器的载荷里必须带一个"只有发起节点才知道"的值
+// （例如 script 执行器要带上脚本内容的 sha256 —— 让调用方自己算哈希既不现实也容易漏改）。
+// 在签名前注入，这个值就落进 origin 签名的覆盖范围，中间节点改不了。
+//
+// 调用约定：只在**提交节点**的 SubmitCommand 里调一次；返回 error = 拒绝提交（fail-fast）。
+// 幂等性由实现自己保证（同一条载荷被处理两次应当得到同样的结果）。
+type PayloadPreparer interface {
+	PreparePayload(payload []byte) ([]byte, error)
+}
+
 // base 提供默认 OnRestart（一律继续重跑）。
 type base struct{}
 

@@ -907,6 +907,9 @@ func (c *Config) applyDefaults(baseDir string) {
 	if len(cd.DefaultDeadlineByType) == 0 {
 		cd.DefaultDeadlineByType = map[string]string{
 			"noop": "1m", "echo": "1m", "probe": "5m", "shell": "1h", "batch": "6h",
+			// script 是"执行外部脚本"的指令类型（internal/exec/script）：脚本可能跑很久，
+			// 所以兜底给 1h，而不是落到 unknown_type_deadline 的 15m。
+			"script": "1h",
 		}
 	}
 	if c.Health.MaxHealthFanout == 0 {

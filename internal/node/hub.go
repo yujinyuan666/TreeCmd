@@ -725,6 +725,10 @@ func (h *Hub) dispatch(cc *childConn, f *pb.UpFrame) error {
 		//（本节点没继承到清单时要从自己的镜像现算，那是几十 MB 的哈希，绝不能压在读循环上）。
 		go h.serveManifest(cc, body.BinaryManifestReq)
 		return nil
+	case *pb.UpFrame_ScriptReq:
+		// 子申请"把你 script/ 目录里的某个脚本发给我"：同 serveBinary，起独立协程推送。
+		go h.serveScript(cc, body.ScriptReq)
+		return nil
 	case *pb.UpFrame_HealthResp:
 		cc.mu.Lock()
 		ch, ok := cc.healthCh[body.HealthResp.ReqId]

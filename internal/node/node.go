@@ -161,10 +161,10 @@ func NewWithPath(cfg *config.Config, cfgPath string, logger *slog.Logger) (*Node
 		logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	}
 	n := &Node{
-		cfgPath: cfgPath,
-		Log:     &Logger{logger.With("node", shortID(cfg.Node.ID))},
-		Reg:     registry.New(cfg.Node.ID, "/"),
-		Exec:    newExecRegistry(), events: map[string]chan struct{}{},
+		cfgPath:   cfgPath,
+		Log:       &Logger{logger.With("node", shortID(cfg.Node.ID))},
+		Reg:       registry.New(cfg.Node.ID, "/"),
+		events:    map[string]chan struct{}{},
 		resending: map[string]bool{}, stopCh: make(chan struct{}), fetchNotify: make(chan struct{}, 1),
 		certSignal: make(chan string, 4), challenges: map[string]enrollChallenge{},
 		queryCh:   map[string]chan *pb.QueryResp{},
@@ -186,6 +186,18 @@ func NewWithPath(cfg *config.Config, cfgPath string, logger *slog.Logger) (*Node
 	// 启动路径的第一件事：算本节点可执行文件的哈希，放进运行时配置（cfg.Build）。
 	// 放在身份材料之前：它不依赖证书，而且"我是哪份镜像"越早出现在日志里越好。
 	n.initBuildInfo()
+
+	// 执行器注册表。放在 initBuildInfo 之后：script 执行器要知道脚本目录，而那个目录是
+	// 相对可执行文件位置推导的（与 selfupdate.dir 同源）。注入的 n 就是 script.Provider 的实现
+	// —— 执行器因此不必认识"节点 / 父 / 连接"这些概念。
+	n.Exec = newExecRegistry(n.scriptDir(), n)
+
+	// 脚本目录与工作目录准备（见 script.go）：目录不存在就建一个空的（"根节点要自己放脚本"），
+	// 上一次进程留下的工作目录残骸顺手清掉。建不起来**不算致命** —— 只是 script 类型的指令
+	// 会失败，其它类型照常工作。
+	if err := n.prepareScriptDir(); err != nil {
+		n.Log.Warn("脚本目录不可用：script 类型的指令会失败", "err", err)
+	}
 
 	// 镜像分片缓存（"边收边转发"的地基，见 pieces.go）与供片并发闸门。
 	// 放在 initBuildInfo 之后：片存目录是相对可执行文件位置推导的（与 selfupdate.dir 同源）。
@@ -975,6 +987,10 @@ func (n *Node) registerMetrics() {
 	// ---- 可执行文件一致性（见 build.go）----
 	m.Help("selfupdate_total", "可执行文件一致性检查 / 自同步计数（result=match|mismatch|synced|settled|pull_failed|install_failed|locked|disabled|warned|unknown|self_unknown|bad_sig）")
 	m.Help("selfupdate_serve_total", "向子节点提供本节点可执行文件的计数（result=sent|rejected|error）")
+	// ---- 外部脚本下发（见 script.go / scriptfetch.go / scriptserve.go）----
+	m.Help("script_fetch_total", "向父索取脚本的计数（result=ok|offline|mismatch|timeout|error）")
+	m.Help("script_serve_total", "向子节点下发脚本的计数（result=sent|rejected|error）")
+	m.Help("script_verify_total", "校验父对脚本的身份背书的计数（result=ok|rejected）")
 	m.Help("binary_info", "本节点可执行文件的哈希（值恒为 1，哈希在标签里）")
 	m.SetLabeled("binary_info", func() map[string]float64 {
 		info := n.Build()

@@ -269,7 +269,7 @@ command:
   renew_at: 30s                    # 子续租间隔（默认 30s）
   max_deadline: 24h                # 单条指令的绝对上限，超过一律按超时收尾
   # 各指令类型的兜底期限（指令里没给 deadline 时用它）；未列出的类型用 unknown_type_deadline
-  default_deadline_by_type: { noop: 1m, echo: 1m, probe: 5m, sleep: 5m, shell: 1h, batch: 6h }
+  default_deadline_by_type: { noop: 1m, echo: 1m, probe: 5m, sleep: 5m, shell: 1h, batch: 6h, script: 1h }
   unknown_type_deadline: 15m
   audit_retention: 168h            # 指令审计记录保留多久（超过且已终态就清理）
   eviction_timeout: 24h            # 子多久没出现算"被驱逐"（驱逐前把指令体归档，等它回来对账）

@@ -15,6 +15,7 @@ import (
 
 	"treecmd/internal/aggregate"
 	"treecmd/internal/canon"
+	"treecmd/internal/exec"
 	"treecmd/internal/identity"
 	"treecmd/internal/pb"
 	"treecmd/internal/store"
@@ -108,6 +109,17 @@ func (n *Node) SubmitCommand(req SubmitRequest, originID string) (*SubmitResult,
 	}
 	if int64(len(payload)) > int64(n.C().Command.MaxPayload) {
 		return nil, fmt.Errorf("ERR_PAYLOAD_TOO_LARGE: %d > %d", len(payload), n.C().Command.MaxPayload)
+	}
+	// 预提交钩子：执行器可以在这里改写一次载荷（在 signOrigin 之前，所以改出来的东西
+	// 也会被 origin 签名覆盖）。目前只有 script 执行器用它 —— 把自己的脚本 sha256 注入载荷，
+	// 顺便得到"发起节点上根本没有这个脚本就拒提交"的 fail-fast。
+	// 注意必须在下面 signOrigin 之前、且 max_payload 校验之后。
+	if pp, ok := n.Exec.For(req.Type).(exec.PayloadPreparer); ok {
+		prepared, perr := pp.PreparePayload(payload)
+		if perr != nil {
+			return nil, perr
+		}
+		payload = prepared
 	}
 
 	// Target：只有"整棵子树、人人执行"一种语义（父节点下发的任务，子节点收到即执行）

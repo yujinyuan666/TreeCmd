@@ -43,6 +43,8 @@ type Upstream struct {
 	reqSeqs   map[string]chan *pb.HealthResponse
 	queryResp map[string]chan *pb.QueryResp
 	queryData map[string]*queryDataBuf
+	// scriptBufs 正在等父下发的脚本（reqID → 收片表，见 scriptfetch.go）
+	scriptBufs map[string]*scriptBuf
 
 	stopOnce sync.Once
 }
@@ -69,7 +71,8 @@ func newUpstream(n *Node) *Upstream {
 	u := &Upstream{
 		n: n, sendCh: make(chan *pb.UpFrame, 256), done: make(chan struct{}),
 		reqSeqs: map[string]chan *pb.HealthResponse{}, queryResp: map[string]chan *pb.QueryResp{},
-		queryData: map[string]*queryDataBuf{},
+		queryData:  map[string]*queryDataBuf{},
+		scriptBufs: map[string]*scriptBuf{},
 	}
 	if st := n.state; st != nil {
 		u.sessionID = st.Session.SessionID
@@ -205,6 +208,9 @@ func (u *Upstream) markDisconnected() {
 //
 //	error — 建连 / 注册 / 读循环失败时返回（流正常 EOF 返回 nil）
 func (u *Upstream) runSession(p config.Parent) error {
+	// 会话一结束，正在等脚本分片的调用方必须立刻醒过来失败 —— 否则要一直等到指令自己超时才
+	// 知道自己不可能收到了（见 scriptfetch.go 的 failScriptWaits）。
+	defer u.failScriptWaits("与父的会话已结束")
 	creds := credentials.NewTLS(identity.ClientTLSConfig(u.n.certBox, u.n.rootsFn(), p.ID))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -435,6 +441,9 @@ func (u *Upstream) dispatch(f *pb.DownFrame) error {
 				"hash", shortHash(body.BinaryChunk.GetHash()), "reason", body.BinaryChunk.GetReason())
 		}
 		return nil
+	case *pb.DownFrame_ScriptChunk:
+		// 脚本分片交给对应的收片表（有人在等就存下来，没人等就丢掉：见 routeScriptChunk）
+		return u.routeScriptChunk(body.ScriptChunk)
 	case *pb.DownFrame_HealthReq:
 		go u.n.serveHealthReqFromParent(body.HealthReq)
 		return nil
