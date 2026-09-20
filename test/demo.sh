@@ -13,7 +13,19 @@
 #   · 中继：自带 listen、且会向根申请 CA 证书 —— 验证"有下级的节点"这条路；
 #   · 中继下的叶子：让整棵树真有 3 层，健康扫描（depth=-1）才有意义。
 #
-# 端口：根 listen 19493 / api 18493；中继 listen 19494；叶子不需要 listen。
+# 端口：根 listen 19493 / api 18493；中继 listen 19494 / api 18494；叶子不需要 listen。
+#
+# 为什么中继也开一个 api：**任意节点都能对外提供 API**（判定只看 `api.http_addr` 是否非空，
+# 不看角色）。于是"从任意节点发起指令"是可测的 —— 发起者就是这条指令的 origin：
+# 结果只落它自己 + 它名下的子树（`OriginId == 本节点` ⇒ sink=SELF，**不上报给它的父**），
+# 祖先对这条指令一无所知。test/from-any-node.sh 就靠这个端口验这件事。
+#
+# 环境变量：
+#   TREECMD_REPO        仓库路径（默认由脚本位置推导）
+#   CONSOLE_PORT        控制台端口（默认 8899）
+#   DEMO_PER_NODE_BIN=1 给每个节点复制一份自己的可执行文件（默认共用 bin/treecmd-node）。
+#                       需要它是因为脚本目录 script/ 相对可执行文件位置推导：共用一份二进制
+#                       会让所有节点共用一个脚本目录，于是"父下发脚本给子"这条链路永远走不到。
 #
 set -euo pipefail
 
@@ -31,6 +43,7 @@ ROOT_ID="0198f0c0-0000-7000-8000-0000de000001"
 ROOT_API="127.0.0.1:18493"
 ROOT_LISTEN="127.0.0.1:19493"
 RELAY_LISTEN="127.0.0.1:19494"
+RELAY_API="127.0.0.1:18494"
 CONSOLE_PORT="${CONSOLE_PORT:-8899}"
 
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
@@ -74,7 +87,18 @@ EOF
       # 有下级的节点要多给一个 CA 私钥路径（没这个文件也不影响叶子启动）
       [ -n "${listen}" ] && echo "  ca_key_path: keys/ca"
     fi
-    [ -z "${parent}" ] && { echo "api:"; echo "  http_addr: ${ROOT_API}"; }
+    # 对外 HTTP API。**任意节点都能开** —— 判定只看 api.http_addr 是否非空，不看角色。
+    # 这里按"角色"给两个节点各开一个（不按名字匹配：名字换了就失效，而且 case 不匹配会让
+    # 整个函数返回非 0，在 set -e 下是个隐患）：
+    #   · 根：控制台连的就是它；
+    #   · 有下级的节点（中继）：用来验"从任意节点发起指令"（见文件头说明）。
+    if [ -z "${parent}" ]; then
+      echo "api:"
+      echo "  http_addr: ${ROOT_API}"
+    elif [ -n "${listen}" ]; then
+      echo "api:"
+      echo "  http_addr: ${RELAY_API}"
+    fi
   } > "${dir}/node.yaml"
   chmod 600 "${dir}/node.yaml"
 }
@@ -94,14 +118,33 @@ prepare_child() {
   cp "${DEMO}/root/enroll.token" "${dir}/enroll.token"; chmod 600 "${dir}/enroll.token"
 }
 
+# run_bin 决定用哪份可执行文件起这个节点，并输出它的路径。
+#
+# 默认返回仓库里那份共用的 bin/treecmd-node。**DEMO_PER_NODE_BIN=1** 时改成
+# "每个节点一份自己的副本"（放在节点目录里）。
+#
+# 为什么需要这个开关：**脚本目录 script/ 是相对可执行文件位置推导的** ——
+# 共用一份二进制就等于所有节点共用一个脚本目录，于是"父把脚本下发给子"这条链路
+# 永远走不到（子在自己目录里就已经找到了）。selfupdate.sh 出于同样的理由也做副本。
+#
+# $1=节点目录；输出要执行的可执行文件路径。
+run_bin() {
+  local dir="$1"
+  if [ "${DEMO_PER_NODE_BIN:-0}" != "1" ]; then printf '%s' "${BIN}"; return 0; fi
+  if [ ! -x "${dir}/treecmd-node" ] || ! cmp -s "${BIN}" "${dir}/treecmd-node"; then
+    cp -f "${BIN}" "${dir}/treecmd-node" && chmod 755 "${dir}/treecmd-node"
+  fi
+  printf '%s' "${dir}/treecmd-node"
+}
+
 start_one() {   # $1=名字 $2=目录
   local name="$1" dir="$2"
-  "${BIN}" -config "${dir}/node.yaml" > "${LOGS}/${name}.log" 2>&1 &
+  "$(run_bin "${dir}")" -config "${dir}/node.yaml" > "${LOGS}/${name}.log" 2>&1 &
   echo "${name}:$!" >> "${PIDFILE}"
 }
 start_one_debug() {  # 名字 目录 —— 带 debug 级（控制台里看后台任务用）
   local name="$1" dir="$2"
-  "${BIN}" -log-level debug -config "${dir}/node.yaml" > "${LOGS}/${name}.log" 2>&1 &
+  "$(run_bin "${dir}")" -log-level debug -config "${dir}/node.yaml" > "${LOGS}/${name}.log" 2>&1 &
   echo "${name}:$!" >> "${PIDFILE}"
 }
 wait_registered() {  # $1=日志文件 $2=超时秒 $3=说明
@@ -216,6 +259,7 @@ cmd_status() {
   done < "${PIDFILE}"
   echo
   info "根 API：curl -s http://${ROOT_API}/v1/tree"
+  info "中继 API：curl -s http://${RELAY_API}/v1/tree —— 从任意节点发起指令时，结果落在那台节点上"
 }
 
 case "${1:-}" in
@@ -232,8 +276,9 @@ case "${1:-}" in
   logs    看某个节点的日志（root | leaf1 | relay | leaf2 | console）
 
 环境变量：
-  TREECMD_REPO   仓库路径（默认 ${REPO}）
-  CONSOLE_PORT   控制台端口（默认 ${CONSOLE_PORT}）
+  TREECMD_REPO        仓库路径（默认 ${REPO}）
+  CONSOLE_PORT        控制台端口（默认 ${CONSOLE_PORT}）
+  DEMO_PER_NODE_BIN=1 给每个节点复制一份自己的可执行文件（脚本目录随之各自独立）
 EOF
   ;;
 esac
