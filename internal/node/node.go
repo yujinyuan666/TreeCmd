@@ -120,6 +120,10 @@ type Node struct {
 	querySess map[string]*querySession
 
 	apiSrv *http.Server
+	// 对外 HTTP 的访问控制（apiauth.go）：只缓存"已经用过的 nonce"，用于挡时间窗内的重放。
+	// 密钥本身不进内存 —— 每次请求现读，于是换密钥既不用重启也不用 SIGHUP。
+	authMu     sync.Mutex
+	authNonces map[string]time.Time
 
 	// 计数器（可观测性）
 	statCmdTerminal map[string]int64

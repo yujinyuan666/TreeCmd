@@ -46,7 +46,7 @@ func (n *Node) StartAPI() error {
 	mux.HandleFunc("/v1/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": true, "node_id": n.C().Node.ID, "path": n.SelfPath()})
 	})
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: addr, Handler: n.withAPIAuth(mux), ReadHeaderTimeout: 5 * time.Second}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("api listen %s: %w", addr, err)
@@ -60,6 +60,7 @@ func (n *Node) StartAPI() error {
 		}
 	}()
 	n.Log.Info("http api listening", "addr", addr)
+	n.logAPIAuthPosture(addr)
 	return nil
 }
 

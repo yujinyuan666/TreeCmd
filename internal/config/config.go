@@ -3,6 +3,7 @@
 package config
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -677,7 +678,66 @@ type PersistSection struct {
 
 // APISection 对外 HTTP 端点（只有中继 / 根才开）。
 type APISection struct {
-	HTTPAddr string `yaml:"http_addr"`
+	HTTPAddr string         `yaml:"http_addr"`
+	Auth     APIAuthSection `yaml:"auth"`
+}
+
+// APIAuthSection 对外 HTTP 端点的访问控制（只作用于**写操作**，见 internal/node/apiauth.go）。
+//
+// 【为什么要它】`api.http_addr` 可以写成 `0.0.0.0`，而写接口里有几个**不可逆**的运维动作：
+// `POST /v1/crl` 吊销节点、`POST /v1/forget` 一条事务删注册表 / 水位 / 驱逐归档 / 结果副本、
+// `POST /v1/commands` 让整棵子树执行指令。没有访问控制时，任何能连上这个端口的人都能执行它们。
+//
+// 【口径】两条规则，前一条命中就不再往下判：
+//
+//  1. **来自回环地址**（127.0.0.1 / ::1）的请求一律放行 —— 本机运维脚本、控制台代理、
+//     `curl localhost:...` 全部零改动；
+//  2. **其它来源的写请求必须带 HMAC 签名**，密钥就是本段配的共享密钥。
+//     **没配密钥 ⇒ 非回环的写请求一律拒绝**（fail-closed，不是"没配就放行"）。
+//
+// 为什么不做成"一律要密钥"：本项目的 HTTP 端点没有 TLS（明文），共享密钥只解决"谁有权动手"，
+// 解决不了窃听；而本机运维是绝对主路径，给它免签可以避免"把密钥投放到每台机器"这种纯负担。
+// 要远程运维就配密钥（推荐 secret_path，权限 600）+ 用 scripts/api_call.py 签。
+//
+// 密钥**不进 config_hash**（`api.*` 本来就不在 6.1 白名单里），且请求时现读文件 ⇒
+// 换密钥既不用重启、也不用 SIGHUP。
+type APIAuthSection struct {
+	Secret       string `yaml:"secret"`        // 共享密钥（与 secret_path 二选一）
+	SecretPath   string `yaml:"secret_path"`   // 从文件读；**优先于 secret**（便于脚本投放与轮换）
+	ProtectReads bool   `yaml:"protect_reads"` // true = 读接口（/v1/tree、/v1/health、结果查询、/metrics）也要签名
+}
+
+// Configured 报告是否配了共享密钥（两个来源有一个非空即算配了）。
+//
+// 接收者 a 是 api.auth 段的配置。
+//
+// 返回：
+//
+//	bool — secret 或 secret_path 非空时为 true
+func (a *APIAuthSection) Configured() bool {
+	return a.Secret != "" || a.SecretPath != ""
+}
+
+// SecretBytes 取共享密钥的原始内容（不做任何解析，去掉首尾空白）。
+//
+// 接收者 a 是 api.auth 段的配置。`secret_path`（文件）优先于 `secret`（直接写在配置里）——
+// 优先文件是为了让脚本能投放与轮换它（权限 600，别进 shell 历史、也别进配置备份）。
+//
+// 参数：无。
+//
+// 返回：
+//
+//	[]byte — 密钥内容；两个来源都没配时返回 nil
+//	error  — 配了 secret_path 但文件读不到时返回
+func (a *APIAuthSection) SecretBytes() ([]byte, error) {
+	if a.SecretPath != "" {
+		b, err := os.ReadFile(a.SecretPath)
+		if err != nil {
+			return nil, fmt.Errorf("read api.auth.secret_path: %w", err)
+		}
+		return bytes.TrimSpace(b), nil
+	}
+	return []byte(strings.TrimSpace(a.Secret)), nil
 }
 
 // Config 完整配置。
@@ -1000,6 +1060,15 @@ func (c *Config) applyDefaults(baseDir string) {
 			sec.Enrollment.TokenPath = "enroll.token"
 		}
 	}
+	if c.HasAPI() && c.API.Auth.Secret == "" && c.API.Auth.SecretPath == "" {
+		// 对外 HTTP 的共享密钥：约定文件 api.secret（脚本投放，权限 600）。
+		// **只在文件确实存在时才补** —— 没有它时写接口退化成"只接受本机请求"（见 APIAuthSection），
+		// 那是合法状态，不是配置错误。
+		tp := filepath.Join(baseDir, "api.secret")
+		if _, err := os.Stat(tp); err == nil {
+			c.API.Auth.SecretPath = "api.secret"
+		}
+	}
 	if c.Persist.StatePath == "" {
 		c.Persist.StatePath = "state.dat"
 	}
@@ -1022,6 +1091,7 @@ func (c *Config) applyDefaults(baseDir string) {
 		c.Security.CertReload.Paths[i] = resolve(c.Security.CertReload.Paths[i])
 	}
 	c.Security.Enrollment.TokenPath = resolve(c.Security.Enrollment.TokenPath)
+	c.API.Auth.SecretPath = resolve(c.API.Auth.SecretPath)
 	c.SelfUpdate.Dir = resolve(c.SelfUpdate.Dir)
 	c.Persist.StatePath = resolve(c.Persist.StatePath)
 }
@@ -1111,6 +1181,13 @@ func (c *Config) Validate() error {
 	if c.Security.Enrollment.TokenPath != "" {
 		if _, err := os.Stat(c.Security.Enrollment.TokenPath); err != nil {
 			return fmt.Errorf("security.enrollment.token_path: %w", err)
+		}
+	}
+	// 对外 HTTP 的共享密钥：同样只校验"配了路径就必须能读到"。**没配是合法状态**
+	// （写接口退化成只接受本机请求），所以这里绝不能写成"没配就拒绝启动"。
+	if c.API.Auth.SecretPath != "" {
+		if _, err := os.Stat(c.API.Auth.SecretPath); err != nil {
+			return fmt.Errorf("api.auth.secret_path: %w（配了就要能读到：脚本投放、权限 600）", err)
 		}
 	}
 	// 注意：**不在这里**因为"证书不存在 + 没配凭据"就拒绝启动 ——
