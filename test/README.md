@@ -289,6 +289,41 @@ COUNT=50 ./backpressure.sh # 改批量
 ② 开跑前用 `lsof` 体检端口，占用即**明确失败** —— 上一轮被断言中断时留下的旧节点照样在监听，
 不查就会让"根已上线"变成本次验收串到旧树上的假象。
 
+## 对外 HTTP 的访问控制怎么验（`api-auth.sh`）
+
+前面那些脚本验的都是"树内部"的事；`api-auth.sh` 验的是**对外的门锁**：
+写接口（`POST /v1/crl`、`POST /v1/forget`、`POST /v1/commands`…）**不能被"能连上这个端口的人"执行** ——
+本机（回环）免签放行；其它来源必须带共享密钥的 HMAC 签名；**没配密钥 ⇒ 非本机写请求一律拒绝**
+（fail-closed，而不是"没配就放行"）。口径见 README 的「访问控制：写接口的本机豁免与远程签名」。
+
+```bash
+./api-auth.sh          # 跑完整验证，结束后自动清场
+./api-auth.sh keep     # 跑完留着节点（自己 ./api-auth.sh stop 收）
+API_AUTH_LAN_IP=10.0.0.5 ./api-auth.sh    # 自动探测不到本机非回环地址时手动指定
+```
+
+它**刻意把节点的 api 绑在 `0.0.0.0`**，再从**本机自己的非回环地址**打过去 —— 那条路走的是网卡，
+对端就是网卡地址，与"局域网里另一台机器"完全等价。绑 `127.0.0.1` 是验不了这件事的：
+所有请求都是回环，整条规则永远不会触发。
+
+三个阶段，每阶段重启一次（按"启动前把日志挪走"的规矩重来）：
+
+| 阶段 | 断言 |
+|---|---|
+| ① 对外监听、**没有密钥** | 本机写请求 200 且真的写进去了；远程**读**请求仍 200；远程**写**请求 403 `ERR_API_AUTH_NOT_CONFIGURED`；**签了名也没用**（判据是节点有没有密钥）；被拒的 GUID 一个都没进 CRL |
+| ② 目录里放 `api.secret`（`node.yaml` 一个字没改 ⇒ 验**约定补全**） | 本机写请求放行；远程无签名 401 `ERR_API_AUTH_REQUIRED`；`scripts/api_call.py` 签名的请求 200 **且真的执行了**；错密钥 / 过期时间戳（1 小时前）/ 原样重放（同 ts+nonce）/ 签名换目标 全部 401；被拒的 GUID 都没进 CRL |
+| ③ 显式 `secret_path` + `protect_reads: true` | 远程**读**请求也要签名（401），本机读请求仍放行；**重启后吊销列表还在** |
+
+> 顺带说一句：第 ③ 阶段那条"重启后吊销列表还在"的断言，第一次跑就抓到了一个**既有缺陷** ——
+> `loadCRL()` 没有任何调用点（函数在、调用点漏了），于是 CRL 只写盘不读回，**父重启一次被吊销的
+> 节点就复活了**。修复是启动时（`store.Open` 之后、任何服务起来之前）调用它。
+
+> 签名工具与测试**共用同一份实现**（`scripts/api_call.py`，测试用 `importlib` 按路径加载它），
+> 所以"服务端认了这个签名"本身就是"两边 canonical 编码逐字节一致"的证据 —— 测试里不要自己重写签名算法。
+
+> ⚠️ 重放用例需要**同一个 ts + nonce 发两次**，所以那两个值由测试自己生成再喂给签名函数
+> （`api_call.py` 每次调用都会新造 nonce，这是它的正常行为，也是我们想要的）。
+
 ## 入网授权策略怎么验（`enroll-policy.sh`）
 
 `zero-trust.sh` 看的是"信任锚从哪来"，`enroll-policy.sh` 看的是**另一半：谁可以进来、凭什么进来**。
@@ -329,8 +364,9 @@ COUNT=50 ./backpressure.sh # 改批量
 | `.selfupdate/` | `selfupdate.sh` 的工作区：各节点的二进制副本与节点目录 |
 | `zerotrust/` + `.zerotrust.pids` | `zero-trust.sh` 的工作区：一棵三层小树的节点目录、日志与 pid 表 |
 | `enroll-policy/` + `.enroll-policy.pids` | `enroll-policy.sh` 的工作区：一个根 + 一个反复重入网的子节点 |
+| `apiauth/` + `.apiauth.pids` | `api-auth.sh` 的工作区：一个 api 绑 `0.0.0.0` 的根节点、它的共享密钥（`api.secret`）与日志 |
 
-想彻底清干净：`./demo.sh stop && ./selfupdate.sh stop && ./zero-trust.sh stop && ./enroll-policy.sh stop && rm -rf demo zerotrust enroll-policy logs .demo.pids .selfupdate .zerotrust.pids .enroll-policy.pids`。
+想彻底清干净：`./demo.sh stop && ./selfupdate.sh stop && ./zero-trust.sh stop && ./enroll-policy.sh stop && ./api-auth.sh stop && rm -rf demo zerotrust enroll-policy apiauth logs .demo.pids .selfupdate .zerotrust.pids .enroll-policy.pids .apiauth.pids`。
 
 > 各验收脚本自己清场时一律用 `mv` 把上一轮状态挪到临时目录、**不用 `rm`** ——
 > 本仓库的测试环境踩过"批量删除被沙箱拦下、脚本半途而废"的坑；挪走还顺便留了现场可回查。

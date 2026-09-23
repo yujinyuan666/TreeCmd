@@ -57,6 +57,11 @@ id_ed25519.pub
 enroll.token
 enroll.token.*
 
+# 对外 HTTP 的共享密钥（api.auth.secret_path 指向的那份，见 internal/node/apiauth.go）
+# 它等价于"能执行 HTTP 写接口的凭据"，泄露 = 别人可以吊销节点、清注册状态
+api.secret
+api.secret.*
+
 # 若你确实想提交某个**公开**的信任锚证书（如示例 CA），
 # 取消下面一行注释并改成实际路径（注意目录被 ignore 时需连目录一起放开）：
 # !trust-anchors/
@@ -122,6 +127,10 @@ test/.zerotrust.pids
 # 一个根 + 一个反复重入网的子节点（含它每次被拒的记录）。
 test/enroll-policy/
 test/.enroll-policy.pids
+# test/api-auth.sh（对外 HTTP 访问控制的端到端验证）的运行产物：
+# 一个根节点（api 刻意绑 0.0.0.0）、它的共享密钥与日志、pid 表。
+test/apiauth/
+test/.apiauth.pids
 
 
 # ---------------------------------------------------------------------------
