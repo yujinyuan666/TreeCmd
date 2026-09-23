@@ -129,15 +129,50 @@ node:
 
 
 # ---------------------------------------------------------------------------
-# api —— 对外 HTTP 端点（提交指令 / 查结果 / 健康 / 指标）
+# api —— 对外 HTTP 端点（提交指令 / 查结果 / 健康 / 指标 / 运维）
 #   【可选】不写 = 不开 HTTP 端点（纯中间层可以不开）。
 #   端点：POST /v1/commands、GET /v1/commands/{id}（cancel / retry 同前缀）、
-#         GET /v1/health、GET /v1/tree、GET /v1/crl、POST /v1/revoke、GET /metrics
+#         GET /v1/health、GET /v1/tree、GET /v1/crl、POST /v1/crl、
+#         GET/POST /v1/forget、GET /metrics、GET /v1/healthz
 #   ⚠️ 端口在启动时绑定：改了必须重启进程（SIGHUP 不会重绑）。
 # ---------------------------------------------------------------------------
 api:
   http_addr: 127.0.0.1:18443
-  
+
+  # ===== 访问控制：只保护**写操作**（见 internal/node/apiauth.go）=====
+  # 写接口里有几个**不可逆**的动作：POST /v1/crl 吊销节点、POST /v1/forget 清注册状态、
+  # POST /v1/commands 让整棵子树干活。所以非本机来源的写请求必须带共享密钥的 HMAC 签名。
+  #
+  # 口径（前一条命中就不再往下判）：
+  #   ① /v1/healthz 永远放行（存活探针）；
+  #   ② 读请求（GET/HEAD/OPTIONS）默认放行，protect_reads: true 时才要签名；
+  #   ③ 来自**回环地址**（127.0.0.1 / ::1）的请求一律放行 —— 本机脚本、控制台代理、
+  #      curl localhost 全部零改动；
+  #   ④ 其余（非回环的写请求）必须带签名；**没配密钥 ⇒ 一律拒绝**（fail-closed）。
+  #
+  # 三个请求头（域分隔 treecmd/api/v1；canonical 编码见 internal/canon）：
+  #   X-Treecmd-Timestamp: <Unix 秒>（与服务端时钟差必须在 ±60s 内）
+  #   X-Treecmd-Nonce:     <一次性随机串>（防时间窗内重放）
+  #   X-Treecmd-Signature: base64(HMAC-SHA256(secret, payload))
+  #   payload = 域 ‖ 方法 ‖ 路径 ‖ 原始 query ‖ sha256(body) ‖ 时间戳 ‖ nonce
+  #
+  # 远程运维**别手搓签名**：用 scripts/api_call.py。
+  # 生成密钥：head -c 32 /dev/urandom | base64 > api.secret && chmod 600 api.secret
+  #
+  # ⚠️ 回环豁免看的是 **TCP 对端地址**，所以别在 API 端口前面挂本地反向代理 /
+  #    端口转发 —— 那样所有请求的对端都会变成 127.0.0.1，豁免就等于对所有来源放行。
+  # ⚠️ 密钥不进 config_hash，且每个请求现读文件 ⇒ 换密钥既不用重启、也不用 SIGHUP。
+  # 【可选】整段不写 = 不配密钥：写接口只接受本机请求（对外监听时启动会打 WARN）。
+  # （所以这里整段是注释掉的 —— 抄这份样例直接就能跑，不会因为缺密钥文件拒绝启动。）
+  # auth:
+  #   # 从文件读（推荐：脚本投放、权限 600）。相对路径按 data_dir 展开。
+  #   # 约定文件同 enroll.token：节点目录里存在 api.secret 时会被**自动采纳**，这一行可以不写。
+  #   secret_path: api.secret
+  #   # 或者直接写在配置里（不推荐：会进配置备份与 shell 历史）
+  #   # secret: <与运维机一致的随机串>
+  #   # 【可选·默认 false】true = 读接口（/v1/tree、/v1/health、结果查询、/metrics）也要签名
+  #   protect_reads: false
+
 # ---------------------------------------------------------------------------
 # parents —— 上游父节点（写了它就是"非根"）
 # ---------------------------------------------------------------------------

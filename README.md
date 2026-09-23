@@ -251,6 +251,9 @@ GET  /v1/healthz
 GET  /metrics                         Prometheus 文本
 ```
 
+**这些端点是分等级的**：`POST` 那几条是**写操作**（其中 `/v1/crl` 与 `/v1/forget` 是不可逆的运维动作），
+`GET` 那几条只读。访问控制只管写操作 —— 见下面「访问控制」小节。
+
 ```bash
 curl -s -XPOST localhost:18443/v1/commands -d '{"type":"echo","payload":"aGVsbG8=","aggregate":"TREE"}'
 # 手写的对外 API 调用（internal/exec/apis）：整棵子树各调一次上游，结果按 TREE 保层级聚合
@@ -268,6 +271,60 @@ curl -s "localhost:18443/v1/health?command_id=<ID>&depth=2&detail=true"
 于是结果只落在这棵子树里 —— `handle.go` 里 `OriginId == 本节点 ⇒ sink=SELF`，本节点结果**不上报给自己的父**，
 **祖先对这条指令一无所知**（拿它的 ID 去父节点查是 `NOT_FOUND`）。所以"从中继提交一条只影响中继及其子树的
 指令"天然成立；要跑这件事见 `test/from-any-node.sh`。
+
+### 访问控制：写接口的本机豁免与远程签名
+
+`api.http_addr` 可以写成 `0.0.0.0`，而写接口里躺着几个**不可逆**的动作：`POST /v1/crl` 吊销节点
+（本节点不校验 `?node=` 与自己的关系，直接写 CRL 并推给所有直接子）、`POST /v1/forget` 一条事务
+删掉注册表 / 水位 / 驱逐归档 / 结果副本、`POST /v1/commands` 让整棵子树执行指令。
+所以非本机来源的写请求必须带**共享密钥的 HMAC 签名**（实现：`internal/node/apiauth.go`）。
+
+判定顺序（前一条命中就不再往下判）：
+
+| # | 请求 | 结果 |
+|---|------|------|
+| ① | `GET /v1/healthz`（存活探针） | **永远放行** |
+| ② | 读请求（`GET`/`HEAD`/`OPTIONS`） | 默认放行；`api.auth.protect_reads: true` 时要签名 |
+| ③ | 来自**回环地址**（127.0.0.1 / ::1） | 放行 —— 本机脚本、控制台代理、`curl localhost` 全部零改动 |
+| ④ | 其余（非回环的写请求） | 必须带签名；**没配密钥 ⇒ 一律拒绝**（403，fail-closed） |
+
+```yaml
+api:
+  http_addr: 0.0.0.0:18443
+  auth:
+    secret_path: api.secret     # 从文件读（推荐 600；约定文件 api.secret 存在时**不必写这行**）
+    protect_reads: false        # true = 读接口也要签名
+```
+
+签名三个请求头（域分隔 `treecmd/api/v1`，canonical 编码见 `internal/canon`）：
+
+```
+X-Treecmd-Timestamp: <Unix 秒>          # 与服务端时钟差必须在 ±60s 内
+X-Treecmd-Nonce:     <一次性随机串>      # 防时间窗内的重放
+X-Treecmd-Signature: base64(HMAC-SHA256(secret, payload))
+payload = 域 ‖ 方法 ‖ 路径 ‖ 原始 query ‖ sha256(body) ‖ 时间戳 ‖ nonce
+```
+
+**别手搓签名，用 `scripts/api_call.py`**（零依赖，只用标准库；本机也照签，服务端照验）：
+
+```bash
+head -c 32 /dev/urandom | base64 > root/api.secret && chmod 600 root/api.secret   # 生成密钥
+# 本机运维（不配密钥也能跑，回环豁免）：
+curl -s -XPOST localhost:18443/v1/forget?node=<GUID>&mode=stale
+# 远程运维（把 api.secret 拷到运维机，用签名工具）：
+scripts/api_call.py --host 192.168.1.10:18443 --secret-file ./api.secret \
+    POST '/v1/crl?node=<GUID>'
+```
+
+三条边界要知道：
+
+- **回环豁免看的是 TCP 对端地址**（`RemoteAddr`，不看任何可伪造的头）⇒ **别在 API 端口前面挂本地
+  反向代理 / 端口转发**，那会让所有请求的对端都变成 127.0.0.1，豁免等于对所有来源放行。真要放代理后面就配密钥。
+- **密钥不进 `config_hash`**，而且**每个请求现读文件** ⇒ 换密钥既不用重启、也不用 SIGHUP。
+- **明文 HTTP**：共享密钥只解决"谁有权动手"，解决不了窃听；要跨不可信网络请自行套 TLS 隧道。
+  验收这条不变量：`test/api-auth.sh`（本机放行 / 远程 403 / 签名 200 / 错签·过期·重放 401）。
+
+### 失效节点清理：`/v1/forget`
 
 ### 失效节点清理：`/v1/forget`
 
