@@ -264,6 +264,10 @@ func NewWithPath(cfg *config.Config, cfgPath string, logger *slog.Logger) (*Node
 		return nil, fmt.Errorf("open store: %w", err)
 	}
 	n.Store = db
+	// 吊销列表必须**读回来**：Revoke / applyCRL 每次都写盘了，但此前没有任何地方在启动时
+	// 调用 loadCRL（函数在，调用点漏了）⇒ 父重启一次，被吊销的节点就"复活"了。
+	// 放在 Store 打开之后、任何服务起来之前：这样拦截器一上线看到的就是正确的吊销集合。
+	n.loadCRL()
 	obj, err := store.NewObjectStore(cfg.Command.ObjectStoreDir)
 	if err != nil {
 		return nil, fmt.Errorf("open object store: %w", err)
