@@ -51,6 +51,8 @@ import (
 const (
 	// apiAuthDomain 签名域分隔串：同一对密钥不会被复用到别的协议 / 用途上。
 	apiAuthDomain = "treecmd/api/v1"
+	// apiRespAuthDomain 响应签名的域（与请求签名分开：两边的字段结构本就不同）。
+	apiRespAuthDomain = "treecmd/api/v1/response"
 	// apiAuthSkew 时间戳允许的偏差（两端时钟差必须小于它，NTP 对齐时毫无压力）。
 	apiAuthSkew = 60 * time.Second
 	// apiAuthMaxBody 验签要先把 body 读进内存算摘要，给个上限别让人用大 body 打爆内存。
@@ -65,8 +67,11 @@ const (
 	headerAPISignature = "X-Treecmd-Signature"
 	// headerAPIAudience 签名声明的**接收方**（目标 node_id）。服务端只认"签给自己的"。
 	headerAPIAudience = "X-Treecmd-Audience"
-	// headerAPIChannelBinding 通道绑定值：base64(TLS exporter)，把签名钉死在这一条 TLS 连接上。
+	// headerAPIChannelBinding 通道绑定值：base64(证书哈希)，把签名钉死在这个服务端上。
 	headerAPIChannelBinding = "X-Treecmd-Channel-Binding"
+	// 响应签名：让客户端能验证"这确实是那个节点自己回的"，而不是中间人编的。
+	headerAPIRespTimestamp = "X-Treecmd-Response-Timestamp"
+	headerAPIRespSignature = "X-Treecmd-Response-Signature"
 	// apiAuthCBLabel 通道绑定的用途标签。**两端必须逐字节一致** —— 它决定"这份绑定是给谁用的"，
 	// 换标签等于换一套绑定（避免同一张证书被复用到别的协议上）。
 	apiAuthCBLabel = "treecmd/api/v1 channel binding"
@@ -113,8 +118,140 @@ func (n *Node) withAPIAuth(next http.Handler) http.Handler {
 			writeErr(w, statusForAPIAuth(err), errCodeOf(err), err.Error())
 			return
 		}
-		next.ServeHTTP(w, r)
+		n.serveSignedResponse(next, w, r)
 	})
+}
+
+// serveSignedResponse 执行处理器，并在响应上补签名（配了共享密钥时）。
+//
+// 接收者 n 是本节点实例。
+//
+// 【为什么响应也要签】请求签名只保护"我发出来的东西没被改"，保护不了"我收到的东西是谁说的"。
+// 明文链路上，中间人可以随手编一个 `{"command_id":..,"status":"OK"}` 让运维以为指令执行成功了
+// —— 指令其实根本没下发。响应签名把状态码 / 路径 / body 摘要 / 请求 nonce / 时间戳一起签上，
+// 于是"响应是不是那个节点自己回的、是不是这次请求的响应"都可验证（见 scripts/api_call.py）。
+//
+// 参数：
+//
+//	next — 业务处理器
+//	w    — 原始响应写入器
+//	r    — 请求（nonce 会被回显进响应签名，用于把响应绑定到这一次请求）
+func (n *Node) serveSignedResponse(next http.Handler, w http.ResponseWriter, r *http.Request) {
+	secret, ok, err := n.apiSecret()
+	if err != nil || !ok {
+		// 没配密钥 / 读不到 ⇒ 无从签起，原样转发（**不拒绝**：响应签名是加固项，不是准入项）
+		next.ServeHTTP(w, r)
+		return
+	}
+	sw := &apiSigningWriter{ResponseWriter: w, status: 200}
+	next.ServeHTTP(sw, r)
+	sw.finish(secret, r)
+}
+
+// apiSigningWriter 缓冲整个响应，以便在**写完之前**把签名头塞进去。
+//
+// HTTP 的头必须在 body 之前发出，所以要签名就得先把 body 攒住。代价是响应不再流式 ——
+// 对外 HTTP 返回的是 JSON 小报文，这个代价换"响应可被验证"是划算的。
+//
+// 缓冲区超过 apiAuthMaxBody 时**降级为直发且不签名**（见 Write）：宁可少一份保护，
+// 也不能让一个巨大的响应把内存吃掉 —— 那是把加固项变成新的攻击面。
+type apiSigningWriter struct {
+	http.ResponseWriter
+	status   int
+	body     bytes.Buffer
+	overflow bool
+	flushed  bool
+}
+
+// WriteHeader 记下状态码（**不立即下发**：要等签名头就绪）。
+//
+// 接收者 w 是缓冲中的响应。
+//
+// 参数：
+//
+//	code — 业务给定的 HTTP 状态码
+func (w *apiSigningWriter) WriteHeader(code int) {
+	if !w.flushed {
+		w.status = code
+	}
+}
+
+// Write 缓冲响应体；超限后切换成"直发 + 不签名"。
+//
+// 接收者 w 是缓冲中的响应。
+//
+// 参数：
+//
+//	b — 本次要写的字节
+//
+// 返回：
+//
+//	int   — 写出的字节数
+//	error — 底层连接出错时返回
+func (w *apiSigningWriter) Write(b []byte) (int, error) {
+	if w.overflow {
+		return w.ResponseWriter.Write(b)
+	}
+	if w.body.Len()+len(b) > apiAuthMaxBody {
+		w.overflow = true
+		w.flushed = true
+		w.ResponseWriter.WriteHeader(w.status)
+		if _, err := w.ResponseWriter.Write(w.body.Bytes()); err != nil {
+			return 0, err
+		}
+		w.body.Reset()
+		return w.ResponseWriter.Write(b)
+	}
+	return w.body.Write(b)
+}
+
+// finish 补上签名头，然后把状态码与 body 真正发出去。
+//
+// 接收者 w 是缓冲中的响应；已经降级成直发时什么都不做。
+//
+// 参数：
+//
+//	secret — 共享密钥（与请求签名同一份）
+//	r      — 请求；它的 nonce 会被回显进签名，把响应绑定到这一次请求
+func (w *apiSigningWriter) finish(secret []byte, r *http.Request) {
+	if w.overflow {
+		return
+	}
+	ts := time.Now().Unix()
+	nonce := strings.TrimSpace(r.Header.Get(headerAPINonce))
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(apiRespAuthPayload(r.Method, r.URL.Path, w.status, w.body.Bytes(), nonce, ts))
+	h := w.Header()
+	h.Set(headerAPIRespTimestamp, strconv.FormatInt(ts, 10))
+	h.Set(headerAPIRespSignature, base64.StdEncoding.EncodeToString(mac.Sum(nil)))
+	w.flushed = true
+	w.ResponseWriter.WriteHeader(w.status)
+	_, _ = w.ResponseWriter.Write(w.body.Bytes())
+}
+
+// apiRespAuthPayload 拼接响应签名的"待签内容"。
+//
+// 参数：
+//
+//	method — HTTP 方法
+//	path   — 请求路径（不含 query）
+//	status — 响应状态码（**参与签名**：否则中间人可以把 500 改成 200 而签名照样对）
+//	body   — 响应体原文
+//	nonce  — 请求里带的 nonce（回显；不带的话响应可以被搬到别的请求上重放）
+//	ts     — 响应时间戳（Unix 秒）
+//
+// 返回：canonical 编码后的字节串（字段顺序与 scripts/api_call.py 必须一致）。
+func apiRespAuthPayload(method, path string, status int, body []byte, nonce string, ts int64) []byte {
+	sum := sha256.Sum256(body)
+	return canon.NewWriter().
+		Str(apiRespAuthDomain).
+		Str(method).
+		Str(path).
+		I64(int64(status)).
+		Bytes(sum[:]).
+		Str(nonce).
+		I64(ts).
+		Out()
 }
 
 // apiAuthApplies 判断这个请求是否在访问控制的射程内。

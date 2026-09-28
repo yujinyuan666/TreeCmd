@@ -74,6 +74,10 @@ import time
 DOMAIN = "treecmd/api/v1"
 # 与 internal/node/apiauth.go 的 apiAuthCBLabel 保持一致：通道绑定的用途标签
 CB_LABEL = "treecmd/api/v1 channel binding"
+# 与 internal/node/apiauth.go 的 apiRespAuthDomain 保持一致
+RESP_DOMAIN = "treecmd/api/v1/response"
+# 时间戳允许偏差（秒），与服务端 apiAuthSkew 一致
+SKEW = 60
 # 默认目标与密钥文件名（与节点目录里的约定一致）
 DEFAULT_HOST = "127.0.0.1:18443"
 DEFAULT_SECRET_FILE = "api.secret"
@@ -106,6 +110,40 @@ def canonical(method: str, path: str, raw_query: str, body: bytes, ts: int, nonc
             + field(audience.encode())
             + field(host.encode())
             + field(channel_binding.encode()))
+
+
+def response_payload(method: str, path: str, status: int, body: bytes, nonce: str, ts: int) -> bytes:
+    """拼出响应签名的"待签内容"（字段顺序必须与 apiauth.go 的 apiRespAuthPayload 一致）。"""
+    return (field(RESP_DOMAIN.encode())
+            + field(method.encode())
+            + field(path.encode())
+            + i64(status)
+            + field(hashlib.sha256(body).digest())
+            + field(nonce.encode())
+            + i64(ts))
+
+
+def verify_response(secret: bytes, resp, body: bytes, method: str, path: str, nonce: str) -> None:
+    """校验响应签名；**校验不过就直接退出**（拿到一份来路不明的响应比拿不到更危险）。
+
+    服务端配了共享密钥时会在响应上带 X-Treecmd-Response-Timestamp / -Signature。明文链路上
+    中间人可以随手编一个假的 200，让运维以为指令已经执行 —— 校完这个签名才知道它确实是
+    那个节点、针对这一次请求回的（nonce 被回显进签名）。
+    """
+    sig = resp.getheader("X-Treecmd-Response-Signature")
+    if not sig:
+        return  # 服务端没配密钥 / body 太大降级了 —— 不签名是合法状态，不阻塞
+    ts_raw = resp.getheader("X-Treecmd-Response-Timestamp") or ""
+    try:
+        ts = int(ts_raw)
+    except ValueError:
+        sys.exit(f"响应签名的时间戳不是整数：{ts_raw!r}")
+    if abs(ts - int(time.time())) > SKEW:
+        sys.exit(f"响应签名的时间戳超出 ±{SKEW}s（偏差 {ts - int(time.time())}s）—— 两端时钟要对齐")
+    want = base64.b64encode(hmac.new(secret, response_payload(method, path, resp.status, body, nonce, ts),
+                                     hashlib.sha256).digest()).decode()
+    if not hmac.compare_digest(want, sig.strip()):
+        sys.exit("响应签名校验失败 —— 这份响应不是目标节点用共享密钥签的（中间人？），拒绝采信")
 
 
 def channel_binding_of(sock) -> str:
@@ -233,6 +271,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--cert", default=None, help="客户端证书（PEM，含私钥也行）；节点开了 mTLS 时用")
     ap.add_argument("--key", default=None, help="客户端私钥（证书与私钥分开时用）")
     ap.add_argument("--no-bind-host", action="store_true", help="不把 Host 头纳入签名（前面是改写 Host 的反向代理时才用）")
+    ap.add_argument("--no-verify-response", action="store_true", help="不校验响应签名（默认会校验：拿到来路不明的响应比拿不到更危险）")
     ap.add_argument("--timeout", type=float, default=30.0, help="超时秒数，默认 30")
     return ap
 
@@ -283,6 +322,8 @@ def main() -> int:
         conn.request(method, target, body=body or None, headers=headers)
         resp = conn.getresponse()
         data = resp.read()
+        if not args.no_verify_response:
+            verify_response(secret, resp, data, method, path, nonce)
     except OSError as exc:
         sys.exit(f"连不上 {args.host}：{exc}")
     finally:
