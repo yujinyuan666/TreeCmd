@@ -115,6 +115,7 @@ footer{color:var(--fg3);padding:18px 16px 32px;max-width:1180px;margin:0 auto;fo
   <button data-tab="health" aria-selected="false">健康</button>
   <button data-tab="cmd" aria-selected="false">指令</button>
   <button data-tab="metrics" aria-selected="false">指标</button>
+  <button data-tab="verify" aria-selected="false">功能验收</button>
 </nav>
 
 <main>
@@ -223,6 +224,32 @@ footer{color:var(--fg3);padding:18px 16px 32px;max-width:1180px;margin:0 auto;fo
       <div id="metricBox" class="muted">—</div>
     </div>
   </section>
+
+  <!-- ================= 功能验收 ================= -->
+  <section id="tab-verify" hidden>
+    <div class="card">
+      <h2>全功能验收 <span class="hint">对当前目标执行只读检查</span></h2>
+      <div class="field" style="margin-bottom:8px">
+        <button id="btnVerify" class="primary">开始验收</button>
+        <span class="muted">健康扫描会递归到 depth=-1；节点数量较多时请增大 timeout。</span>
+      </div>
+      <div id="verifySummary" class="muted">—</div>
+      <div id="verifyBox" style="margin-top:10px">—</div>
+    </div>
+    <div class="card" style="margin-top:12px">
+      <h2>失效节点清理预览 <span class="hint">GET /v1/forget（只读）</span></h2>
+      <div class="field">
+        <label for="forgetNode">NodeID</label>
+        <input id="forgetNode" size="38" placeholder="填写直接子节点 NodeID">
+        <select id="forgetMode">
+          <option value="garbage">garbage</option>
+          <option value="stale">stale</option>
+        </select>
+        <button id="btnForgetPreview">预览</button>
+      </div>
+      <div id="forgetBox" class="muted" style="margin-top:8px">—</div>
+    </div>
+  </section>
 </main>
 
 <footer>
@@ -315,7 +342,7 @@ $('tabs').addEventListener('click', (e) => {
   const b = e.target.closest('button[data-tab]');
   if (!b) return;
   [...$('tabs').children].forEach(x => x.setAttribute('aria-selected', String(x === b)));
-  ['overview','tree','health','cmd','metrics'].forEach(t => { $('tab-' + t).hidden = (t !== b.dataset.tab); });
+  ['overview','tree','health','cmd','metrics','verify'].forEach(t => { $('tab-' + t).hidden = (t !== b.dataset.tab); });
   if (b.dataset.tab === 'health' && state.connected && !state.health) loadHealth();
   if (b.dataset.tab === 'metrics' && state.connected && !state.metrics) loadMetrics();
 });
@@ -496,6 +523,73 @@ async function loadMetrics() {
 }
 
 function loadMetricsIfVisible() { return $('tab-metrics').hidden ? null : loadMetrics(); }
+
+/* ------------------------------------------------------------------ *
+ * 功能验收
+ * ------------------------------------------------------------------ */
+function verifyRow(name, ok, detail) {
+  return `<div class="node-row"><span class="dot ${ok ? 'ok' : 'bad'}"></span>`
+    + `<span class="nm">${esc(name)}</span><span class="spacer"></span>`
+    + `<span class="sub">${esc(detail)}</span></div>`;
+}
+
+async function runVerification() {
+  if (!state.connected) { await connect(); if (!state.connected) return; }
+  $('verifySummary').textContent = '验收中…';
+  $('verifyBox').innerHTML = '';
+  const [tree, health, metrics, crl] = await Promise.all([
+    api('/v1/tree'),
+    api(`/v1/health?depth=-1&detail=true&timeout=${encodeURIComponent($('healthTimeout').value.trim() || '60s')}`),
+    api('/metrics'),
+    api('/v1/crl'),
+  ]);
+  const rows = [];
+  const treeOK = tree.ok && tree.body && tree.body.node_id && Array.isArray(tree.body.children);
+  rows.push(verifyRow('树快照 /v1/tree', treeOK,
+    treeOK ? `本节点 ${tree.body.node_name || tree.body.node_id}，直接子 ${tree.body.children.length}` : `HTTP ${tree.status}`));
+
+  const healthOK = health.ok && health.body && health.body.health;
+  const healthStatus = healthOK ? health.body.health.status : '';
+  const healthSummary = healthOK ? health.body.health.summary : null;
+  const healthNodes = healthSummary && Number.isFinite(Number(healthSummary.total))
+    ? 1 + Number(healthSummary.total) : (healthOK ? 1 : 0);
+  rows.push(verifyRow('递归健康 /v1/health', healthOK && !healthStatus.includes('UNHEALTHY'),
+    healthOK ? `状态 ${healthStatus}，返回节点约 ${healthNodes} 个` : `HTTP ${health.status}`));
+
+  const metricText = typeof metrics.body === 'string' ? metrics.body : '';
+  const metricOK = metrics.ok && metricText.includes('children_') && metricText.includes('cert_');
+  rows.push(verifyRow('Prometheus /metrics', metricOK,
+    metricOK ? `${parsePrometheus(metricText).length} 条指标` : `HTTP ${metrics.status}`));
+
+  const crlOK = crl.ok && crl.body && Number.isInteger(crl.body.version);
+  rows.push(verifyRow('CRL /v1/crl', crlOK,
+    crlOK ? `版本 ${crl.body.version}，吊销 ${crl.body.revoked || 0} 个` : `HTTP ${crl.status}`));
+
+  if (treeOK && tree.body.children.length && !$('forgetNode').value.trim()) {
+    $('forgetNode').value = tree.body.children[0].node_id || '';
+  }
+  const passed = rows.filter(x => x.includes('dot ok')).length;
+  const total = rows.length;
+  $('verifySummary').innerHTML = `<span class="badge ${passed === total ? 'ok' : 'warn'}">`
+    + `${passed}/${total} 项基础检查通过</span> <span class="muted">指令场景请在“指令”页逐项提交。</span>`;
+  $('verifyBox').innerHTML = rows.join('');
+}
+
+async function previewForget() {
+  const node = $('forgetNode').value.trim();
+  if (!node) {
+    $('forgetBox').innerHTML = '<div class="warnbox">请先填写 NodeID。</div>';
+    return;
+  }
+  const mode = $('forgetMode').value;
+  const r = await api(`/v1/forget?node=${encodeURIComponent(node)}&mode=${mode}`);
+  const p = r.body && r.body.plan ? r.body.plan : r.body;
+  $('forgetBox').innerHTML = `<div class="${r.ok ? 'warnbox' : 'errbox'}">`
+    + `HTTP ${r.status} · ${esc(JSON.stringify(p))}</div>`;
+}
+
+$('btnVerify').addEventListener('click', runVerification);
+$('btnForgetPreview').addEventListener('click', previewForget);
 
 /* ------------------------------------------------------------------ *
  * 预设场景（对应平时手工测的那几种）
