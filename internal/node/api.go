@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -47,9 +48,28 @@ func (n *Node) StartAPI() error {
 		writeJSON(w, 200, map[string]any{"ok": true, "node_id": n.C().Node.ID, "path": n.SelfPath()})
 	})
 	srv := &http.Server{Addr: addr, Handler: n.withAPIAuth(mux), ReadHeaderTimeout: 5 * time.Second}
-	ln, err := net.Listen("tcp", addr)
+	rawLn, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("api listen %s: %w", addr, err)
+	}
+	// TLS（api.tls）：配了 cert_path + key_path 就把监听器包成 tls.Listener。
+	//
+	// 为什么用 tls.NewListener 而不是 srv.ServeTLS：ServeTLS 只在"给了证书文件路径"时才会
+	// 装载材料，靠 GetConfigForClient 单独供给的话它会尝试 LoadX509KeyPair("","") 并直接失败。
+	// 自己包监听器还顺带让"热重载"和"握手前才决定配置"这两件事都落在同一个回调上。
+	var ln net.Listener = rawLn
+	scheme := "http"
+	if t := n.C().API.TLS; t.Enabled() {
+		rel, err := newAPITLSReloader(&t)
+		if err != nil {
+			_ = rawLn.Close()
+			return fmt.Errorf("api tls: %w", err)
+		}
+		ln = tls.NewListener(rawLn, &tls.Config{
+			MinVersion:         t.MinTLSVersion(),
+			GetConfigForClient: rel.ConfigFor,
+		})
+		scheme = "https"
 	}
 	n.apiSrv = srv
 	n.wg.Add(1)
@@ -59,7 +79,7 @@ func (n *Node) StartAPI() error {
 			n.Log.Error("http api stopped", "err", err)
 		}
 	}()
-	n.Log.Info("http api listening", "addr", addr)
+	n.Log.Info("http api listening", "addr", addr, "scheme", scheme)
 	n.logAPIAuthPosture(addr)
 	return nil
 }

@@ -25,13 +25,16 @@ import (
 // `POST /v1/commands` 让整棵子树执行指令。裸奔时，任何能连上这个端口的人都能做这些事 ——
 // 这就是"访问控制缺失"。本文件补上它。
 //
+// 【链路本身】`api.tls.require` 打开时，明文请求一律拒绝（**含回环来源**）—— 见 requireAPIHTTPS。
+//
 // 【口径】判定顺序如下，前一条命中就不再往下走：
 //
 //  1. `/v1/healthz` —— 永远放行（存活探针，只回 ok / node_id / path，不触发任何跨节点调用）
 //  2. 读请求（GET / HEAD / OPTIONS）—— 只有 `api.auth.protect_reads` 打开才要签名
-//  3. 回环来源（127.0.0.1 / ::1）且**不像被代理转发过** —— 放行：本机运维脚本、控制台代理、
+//  3. mTLS：出示了被 CA 验过的客户端证书且 `api.tls.trust_client_cert` 打开 ⇒ 放行
+//  4. 回环来源（127.0.0.1 / ::1）且**不像被代理转发过** —— 放行：本机运维脚本、控制台代理、
 //     curl localhost 都走这里（收紧的细节见 loopbackBypassAllowed）
-//  4. 其余（非回环的写请求）—— 必须带正确的 HMAC 签名；**没配密钥就一律拒绝**
+//  5. 其余（非回环的写请求）—— 必须带正确的 HMAC 签名；**没配密钥就一律拒绝**
 //
 // 【签名格式】三个请求头（域分隔 `treecmd/api/v1`，canonical 编码见 internal/canon）：
 //
@@ -68,6 +71,7 @@ const (
 	errAPIAuthFailed        = "ERR_API_AUTH_FAILED"
 	errAPIAuthUnavailable   = "ERR_API_AUTH_UNAVAILABLE"
 	errAPIAuthTooLarge      = "ERR_API_AUTH_TOO_LARGE"
+	errAPIAuthTLSRequired   = "ERR_API_TLS_REQUIRED"
 )
 
 // withAPIAuth 给对外 HTTP 端点套上访问控制：受保护的请求先过 authorizeAPI，再交给业务处理。
@@ -82,6 +86,14 @@ const (
 // 返回：包装后的处理器；是否拦截每个请求由 apiAuthApplies 决定。
 func (n *Node) withAPIAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// ⓪ 先判"这条链路本身够不够格"，再看"谁在调用"：api.tls.require 打开时连回环来源的
+		// 明文请求也拒 —— 否则 TLS 终止型反向代理（对外 HTTPS、回源明文）会把远程请求伪装成
+		// 本机请求递进来，那正是"本地反代绕过"的另一条路。
+		if err := n.requireAPIHTTPS(r); err != nil {
+			n.auditReject("api_auth", "", "", err)
+			writeErr(w, statusForAPIAuth(err), errCodeOf(err), err.Error())
+			return
+		}
 		if !n.apiAuthApplies(r) {
 			next.ServeHTTP(w, r)
 			return
@@ -134,8 +146,58 @@ func (n *Node) apiAuthApplies(r *http.Request) bool {
 //
 // 返回：放行返回 nil；否则返回形如 "ERR_API_AUTH_xxx: ..." 的错误（错误文本里带来源地址，
 // 方便从日志里定位是谁在试探）。
+// requireAPIHTTPS 执行 api.tls.require：这个端点只以 HTTPS 提供。
+//
+// 接收者 n 是本节点实例。
+//
+// 为什么**连回环来源也拒**：TLS 终止型反向代理（对外 HTTPS、回源走明文 HTTP）会把远程请求
+// 以"对端是 127.0.0.1 的明文请求"递进来 —— 那正是"本地反代绕过"的另一条路。只约束远程来源
+// 的话，这一条正好被绕过去。
+//
+// 参数：
+//
+//	r — 请求；r.TLS 非 nil 表示它确实是从 TLS 连接上进来的
+//
+// 返回：要求 HTTPS 但请求是明文时返回错误；其余返回 nil。
+func (n *Node) requireAPIHTTPS(r *http.Request) error {
+	if !n.C().API.TLS.Require || r.TLS != nil {
+		return nil
+	}
+	return fmt.Errorf("%s: 本端点只接受 HTTPS 请求（api.tls.require: true）；"+
+		"若前面挂了 TLS 终止型反向代理，请让代理与本机之间也走 HTTPS，或关掉 require（来源 %s）",
+		errAPIAuthTLSRequired, r.RemoteAddr)
+}
+
+// clientCertTrusted 判断"客户端证书"能否直接作为本次请求的身份凭据。
+//
+// 接收者 n 是本节点实例。成立条件（全都要满足）：
+//
+//  1. `api.tls.trust_client_cert` 显式打开（默认关：不能因为配了 mTLS 就悄悄免掉 HMAC）；
+//  2. 请求走的是 TLS 且**真的出示了客户端证书**；
+//  3. 证书通过了 CA 校验 —— 判据是 VerifiedChains 非空：crypto/tls 只在验链成功后才填它，
+//     光有 PeerCertificates 不代表验过（ClientAuth 为 off 时没人去验）。
+//
+// 参数：
+//
+//	r — 请求
+//
+// 返回：可以用证书身份替代 HMAC 时返回 true。
+func (n *Node) clientCertTrusted(r *http.Request) bool {
+	t := n.C().API.TLS
+	if !t.Enabled() || !t.TrustClientCert || r.TLS == nil {
+		return false
+	}
+	return len(r.TLS.PeerCertificates) > 0 && len(r.TLS.VerifiedChains) > 0
+}
+
 func (n *Node) authorizeAPI(r *http.Request) error {
-	// ① 回环来源免签：本机运维是主路径（scripts/start_node.sh、test/*.sh、控制台代理、curl localhost）。
+	// ① mTLS 身份：证书已经把"谁在调用"钉死，且 TLS 通道本身提供了防窃听 / 防中继 / 防篡改，
+	//    此时再要求 HMAC 属于纯负担 —— 但只有显式打开 trust_client_cert 才走这条路。
+	if n.clientCertTrusted(r) {
+		return nil
+	}
+
+	// ② 回环来源免签：本机运维是主路径（scripts/start_node.sh、test/*.sh、控制台代理、curl localhost）。
 	//
 	// ⚠️ 判据是 **TCP 对端地址**（RemoteAddr），绝不能单凭 X-Forwarded-For 之类可伪造的头。
 	// 但它有个前提：对端地址会被**部署形态**改写 —— API 端口前面一旦挂了本地反向代理 / 端口
@@ -148,7 +210,7 @@ func (n *Node) authorizeAPI(r *http.Request) error {
 		return nil
 	}
 
-	// ② 取密钥。没配 ⇒ 非回环请求一律拒绝（fail-closed）。
+	// ③ 取密钥。没配 ⇒ 非回环请求一律拒绝（fail-closed）。
 	secret, configured, err := n.apiSecret()
 	if err != nil {
 		return fmt.Errorf("%s: %w", errAPIAuthUnavailable, err)
@@ -158,7 +220,7 @@ func (n *Node) authorizeAPI(r *http.Request) error {
 			"写接口只接受本机(回环)请求（来源 %s）", errAPIAuthNotConfigured, r.RemoteAddr)
 	}
 
-	// ③ 凭据齐全性：先把头看一遍再读 body —— 这样"什么凭据都不带"的探测连内存都吃不到。
+	// ④ 凭据齐全性：先把头看一遍再读 body —— 这样"什么凭据都不带"的探测连内存都吃不到。
 	if !hasAPISignature(r) {
 		return fmt.Errorf("%s: 非本机来源的写请求必须带 %s / %s / %s 三个头（来源 %s）",
 			errAPIAuthRequired, headerAPITimestamp, headerAPINonce, headerAPISignature, r.RemoteAddr)
@@ -178,7 +240,7 @@ func (n *Node) authorizeAPI(r *http.Request) error {
 			errAPIAuthFailed, apiAuthSkew, d.Round(time.Second), r.RemoteAddr)
 	}
 
-	// ④ 验签。body 要参与摘要（否则签名可以被搬到另一个 body 上）。
+	// ⑤ 验签。body 要参与摘要（否则签名可以被搬到另一个 body 上）。
 	body, err := readBodyForAuth(r)
 	if err != nil {
 		return err
@@ -193,7 +255,7 @@ func (n *Node) authorizeAPI(r *http.Request) error {
 			errAPIAuthFailed, r.RemoteAddr)
 	}
 
-	// ⑤ 防重放：时间窗内同一个 nonce 只认一次。放在验签**之后** —— 只有持密钥的人
+	// ⑥ 防重放：时间窗内同一个 nonce 只认一次。放在验签**之后** —— 只有持密钥的人
 	// 才能往表里塞条目，否则谁都能用假 nonce 把表刷满、把合法请求挤掉。
 	if !n.redeemNonce(nonce) {
 		return fmt.Errorf("%s: nonce %q 已用过（重放；来源 %s）", errAPIAuthFailed, nonce, r.RemoteAddr)
@@ -517,7 +579,7 @@ func (n *Node) redeemNonce(nonce string) bool {
 //
 //	err — authorizeAPI 返回的错误
 //
-// 返回：500（密钥读取失败）、413（body 超限）、403（未配密钥 ⇒ 能力上就没有）、
+// 返回：500（密钥读取失败）、413（body 超限）、403（未配密钥 / 只接受 HTTPS ⇒ 能力上就没有）、
 // 401（缺少凭据 / 签名不符 / 过期 / 重放），以及无法识别时的默认值 401。
 func statusForAPIAuth(err error) int {
 	switch errCodeOf(err) {
@@ -525,7 +587,7 @@ func statusForAPIAuth(err error) int {
 		return 500
 	case errAPIAuthTooLarge:
 		return 413
-	case errAPIAuthNotConfigured:
+	case errAPIAuthNotConfigured, errAPIAuthTLSRequired:
 		return 403
 	}
 	return 401
@@ -556,6 +618,13 @@ func (n *Node) logAPIAuthPosture(addr string) {
 			n.Log.Info("api auth: 回环免签已按可信代理白名单解析真实来源",
 				"addr", addr, "trusted_proxies", a.TrustedProxies)
 		}
+	}
+	if t := n.C().API.TLS; t.Enabled() {
+		n.Log.Info("api tls: 对外端点以 HTTPS 提供", "cert_path", t.CertPath,
+			"client_auth", t.ClientAuth, "require", t.Require)
+	} else if exposed {
+		n.Log.Warn("api tls: 对外端点仍是明文 HTTP —— 指令内容 / 结果 / 拓扑在链路上可被窃听，" +
+			"响应可被伪造，且中间人能把在途请求转发给别的节点再执行一次；建议配 api.tls.cert_path / key_path")
 	}
 	switch {
 	case a.Configured() && a.ProtectReads:

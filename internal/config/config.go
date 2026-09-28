@@ -5,6 +5,7 @@ package config
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -681,6 +682,87 @@ type PersistSection struct {
 type APISection struct {
 	HTTPAddr string         `yaml:"http_addr"`
 	Auth     APIAuthSection `yaml:"auth"`
+	TLS      APITLSSection  `yaml:"tls"`
+}
+
+// APITLSSection 对外 HTTP 端点的 TLS 配置（**默认明文**，与历史行为一致）。
+//
+// 【为什么要有它】HMAC 签名只解决"谁有权动手"，解决不了三个问题：
+//
+//  1. **没有保密性** —— 指令内容、结果、拓扑在链路上是明文；
+//  2. **没有服务器认证** —— 客户端不知道自己连的是不是真节点，响应也可以被伪造 / 篡改
+//     （签名只覆盖请求，响应是裸的）；
+//  3. **挡不住链路内中继** —— 中间人可以把在途请求原样转发给别的节点再执行一次
+//     （防重放的 nonce 表是**每节点**一份，跨节点不共享）。
+//
+// 这三条里有两条只能靠 TLS 解决。开了它之后，`api.auth` 的 HMAC 仍然照常工作（身份 +
+// 请求完整性 + 防重放），两者是叠加而不是替代。
+//
+// 【热重载】证书 / 密钥 / 客户端 CA 每次握手前按文件 mtime 检查一次，变了就重新加载 ⇒
+// 换证书不必重启进程（与 security.cert_reload 同一口径）。
+type APITLSSection struct {
+	CertPath string `yaml:"cert_path"` // 服务端证书（PEM，可含链）
+	KeyPath  string `yaml:"key_path"`  // 服务端私钥（PEM，权限 600）
+	// CAPath 校验**客户端**证书的 CA（文件或目录，目录扫 *.crt/*.pem）。client_auth 不为 off 时必需。
+	CAPath string `yaml:"ca_path"`
+	// ClientAuth 客户端证书策略：off（默认，不要求）| optional（要了就验）| require（必须有且必须验过）。
+	ClientAuth string `yaml:"client_auth"`
+	// TrustClientCert true = 出示了被 CAPath 验过的客户端证书即视为已认证（**免 HMAC**）。
+	//
+	// 默认 false（不隐式放宽）：证书再叠加 HMAC，两者都要。改成 true 的理由是" TLS 已经把
+	// 客户端身份钉死了，再让运维机保管一份共享密钥是纯负担" —— 那是**显式**的取舍，不该是默认值。
+	TrustClientCert bool `yaml:"trust_client_cert"`
+	// Require true = 这个端点**只以 HTTPS 提供**：明文请求一律拒绝（**含回环来源**）。
+	//
+	// 为什么连回环也要管：TLS 终止型反向代理（代理对外 HTTPS、回源走明文 HTTP）会把远程请求
+	// 以"看起来像本机"的明文请求递进来 —— 那正是"本地反代绕过"的另一个入口。
+	Require bool `yaml:"require"`
+	// MinVersion 最低 TLS 版本："1.2"（默认）或 "1.3"。
+	MinVersion string `yaml:"min_version"`
+}
+
+// Enabled 报告是否配了可用的服务端 TLS 材料（证书与私钥都给了才算）。
+//
+// 接收者 t 是 api.tls 段的配置。
+//
+// 返回：
+//
+//	bool — cert_path 与 key_path 都非空时为 true；只写了一半时按"没开"处理（启动校验会报错，见 Validate）
+func (t *APITLSSection) Enabled() bool {
+	return t.CertPath != "" && t.KeyPath != ""
+}
+
+// ClientAuthType 把 client_auth 的写法映射成 crypto/tls 的策略常量。
+//
+// 接收者 t 是 api.tls 段的配置。
+//
+// 返回：
+//
+//	tls.ClientAuthType — off ⇒ NoClientCert；optional ⇒ VerifyClientCertIfGiven；
+//	                     require ⇒ RequireAndVerifyClientCert；空串按 off 处理
+func (t *APITLSSection) ClientAuthType() tls.ClientAuthType {
+	switch strings.ToLower(strings.TrimSpace(t.ClientAuth)) {
+	case "optional":
+		return tls.VerifyClientCertIfGiven
+	case "require":
+		return tls.RequireAndVerifyClientCert
+	default:
+		return tls.NoClientCert
+	}
+}
+
+// MinTLSVersion 把 min_version 的写法映射成 crypto/tls 的版本常量。
+//
+// 接收者 t 是 api.tls 段的配置。
+//
+// 返回：
+//
+//	uint16 — "1.3" ⇒ VersionTLS13；其余（含空串 / 未知写法）⇒ VersionTLS12
+func (t *APITLSSection) MinTLSVersion() uint16 {
+	if strings.TrimSpace(t.MinVersion) == "1.3" {
+		return tls.VersionTLS13
+	}
+	return tls.VersionTLS12
 }
 
 // APIAuthSection 对外 HTTP 端点的访问控制（只作用于**写操作**，见 internal/node/apiauth.go）。
@@ -1287,6 +1369,43 @@ func (c *Config) Validate() error {
 		if _, _, err := net.ParseCIDR(s); err != nil && net.ParseIP(s) == nil {
 			return fmt.Errorf("api.auth.trusted_proxies: %q 不是合法的 CIDR 或 IP（例：127.0.0.1/32、::1/128）", p)
 		}
+	}
+	// 对外 HTTP 的 TLS：只写一半（有证书没密钥）是配置错误，必须拒绝启动 ——
+	// 否则它会静默退化成明文，而 operator 以为自己已经开了 HTTPS。
+	if c.API.TLS.CertPath != "" && c.API.TLS.KeyPath == "" {
+		return errors.New("api.tls: 写了 cert_path 就必须写 key_path")
+	}
+	if c.API.TLS.KeyPath != "" && c.API.TLS.CertPath == "" {
+		return errors.New("api.tls: 写了 key_path 就必须写 cert_path")
+	}
+	if c.API.TLS.Enabled() {
+		for _, p := range []string{c.API.TLS.CertPath, c.API.TLS.KeyPath} {
+			if _, err := os.Stat(p); err != nil {
+				return fmt.Errorf("api.tls: %w（证书 / 密钥必须存在且可读；密钥建议 600）", err)
+			}
+		}
+		switch strings.ToLower(strings.TrimSpace(c.API.TLS.ClientAuth)) {
+		case "", "off", "optional", "require":
+		default:
+			return fmt.Errorf("invalid api.tls.client_auth %q (off|optional|require)", c.API.TLS.ClientAuth)
+		}
+		if c.API.TLS.ClientAuthType() != tls.NoClientCert {
+			if c.API.TLS.CAPath == "" {
+				return errors.New("api.tls: client_auth 不是 off 时必须配 ca_path（拿什么验客户端证书？）")
+			}
+			if _, err := os.Stat(c.API.TLS.CAPath); err != nil {
+				return fmt.Errorf("api.tls.ca_path: %w（客户端 CA，文件或目录）", err)
+			}
+		}
+		switch strings.TrimSpace(c.API.TLS.MinVersion) {
+		case "", "1.2", "1.3":
+		default:
+			return fmt.Errorf("invalid api.tls.min_version %q (1.2|1.3)", c.API.TLS.MinVersion)
+		}
+	}
+	// require 但没开 TLS ⇒ 所有请求（含本机）都会被拒，端点等于自杀。这种配置必须在启动时拦下。
+	if c.API.TLS.Require && !c.API.TLS.Enabled() {
+		return errors.New("api.tls.require: true 但没配 cert_path / key_path —— 那会让所有请求都被拒（端点等于关闭）")
 	}
 	// 注意：**不在这里**因为"证书不存在 + 没配凭据"就拒绝启动 ——
 	// 配置层看不到"证书文件在不在"，而无证书时到底算不算错由启动强校验判定
