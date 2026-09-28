@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"treecmd/internal/canon"
+	"treecmd/internal/config"
 )
 
 // 对外 HTTP 端点的访问控制（只作用于写操作）。
@@ -28,7 +29,8 @@ import (
 //
 //  1. `/v1/healthz` —— 永远放行（存活探针，只回 ok / node_id / path，不触发任何跨节点调用）
 //  2. 读请求（GET / HEAD / OPTIONS）—— 只有 `api.auth.protect_reads` 打开才要签名
-//  3. 回环来源（127.0.0.1 / ::1）—— 放行：本机运维脚本、控制台代理、curl localhost 都走这里
+//  3. 回环来源（127.0.0.1 / ::1）且**不像被代理转发过** —— 放行：本机运维脚本、控制台代理、
+//     curl localhost 都走这里（收紧的细节见 loopbackBypassAllowed）
 //  4. 其余（非回环的写请求）—— 必须带正确的 HMAC 签名；**没配密钥就一律拒绝**
 //
 // 【签名格式】三个请求头（域分隔 `treecmd/api/v1`，canonical 编码见 internal/canon）：
@@ -135,11 +137,14 @@ func (n *Node) apiAuthApplies(r *http.Request) bool {
 func (n *Node) authorizeAPI(r *http.Request) error {
 	// ① 回环来源免签：本机运维是主路径（scripts/start_node.sh、test/*.sh、控制台代理、curl localhost）。
 	//
-	// ⚠️ 依据是 **TCP 对端地址**（RemoteAddr），绝不能用 X-Forwarded-For 之类可伪造的头。
-	// 由此带来一个部署前提：**别在 API 端口前面挂本地反向代理 / 端口转发**，否则所有请求的
-	// 对端都会变成 127.0.0.1，这一条豁免就等于对所有来源放行。真要放在代理后面，请配密钥 ——
-	// 配了密钥之后，回环请求里**带了签名**的仍然会被照常校验（见下面第 ④ 步）。
-	if isLoopbackRemote(r.RemoteAddr) && !hasAPISignature(r) {
+	// ⚠️ 判据是 **TCP 对端地址**（RemoteAddr），绝不能单凭 X-Forwarded-For 之类可伪造的头。
+	// 但它有个前提：对端地址会被**部署形态**改写 —— API 端口前面一旦挂了本地反向代理 / 端口
+	// 转发（nginx、ssh -L、frpc、kubectl port-forward…），所有远程请求的对端都变成 127.0.0.1，
+	// 这一条豁免就等于对所有来源放行。所以 loopbackBypassAllowed 在这之上再压两道闸：
+	// 带转发特征头的对端必须在 `api.auth.trusted_proxies` 里；在里面的，还要按 RFC 7239
+	// 剥掉可信跳、确认真实来源仍是回环。配了密钥之后，回环请求里**带了签名**的仍然会被照常
+	// 校验（见下面第 ④ 步）。
+	if n.loopbackBypassAllowed(r) && !hasAPISignature(r) {
 		return nil
 	}
 
@@ -194,6 +199,156 @@ func (n *Node) authorizeAPI(r *http.Request) error {
 		return fmt.Errorf("%s: nonce %q 已用过（重放；来源 %s）", errAPIAuthFailed, nonce, r.RemoteAddr)
 	}
 	return nil
+}
+
+// loopbackBypassAllowed 判断"回环免签"这条豁免对当前请求是否仍然成立。
+//
+// 接收者 n 是本节点实例。成立要同时满足三件事（见 APIAuthSection 的注释），
+// 任一条不满足就 false ⇒ 请求继续往下走签名校验（fail-closed，不会变成"放行"）：
+//
+//  1. `api.auth.loopback_bypass` 没被显式关掉；
+//  2. 请求**不带转发特征头**，或者它的对端在 `api.auth.trusted_proxies` 里 ——
+//     本机 curl 不会带这些头，带了就说明前面有东西把 RemoteAddr 改写成回环了；
+//  3. 剥掉可信代理跳之后的**真实来源**仍是回环（对端可信时按 X-Forwarded-For / Forwarded 解析）。
+//
+// 参数：
+//
+//	r — 请求
+//
+// 返回：可以免签时返回 true。
+func (n *Node) loopbackBypassAllowed(r *http.Request) bool {
+	a := &n.C().API.Auth
+	if !a.LoopbackBypassEnabled() {
+		return false
+	}
+	peer := hostOfRemote(r.RemoteAddr)
+	if hasForwardedHeaders(r) && !a.TrustsProxy(peer) {
+		return false
+	}
+	return isLoopbackHost(clientHostForAuth(r, a))
+}
+
+// clientHostForAuth 判定请求的"真实来源主机"。
+//
+// 参数：
+//
+//	r    — 请求
+//	a    — api.auth 段配置（提供可信代理白名单）
+//
+// 返回：
+//
+//	string — 裸主机字符串。对端不在白名单里时就是对端本身（**转发头一律不信**，否则任何人
+//	都能用 X-Forwarded-For: 127.0.0.1 骗到免签）；对端在白名单里时，取转发链上
+//	**从右往左第一个不可信的跳**；全是可信跳或没有转发头时退回对端本身。
+func clientHostForAuth(r *http.Request, a *config.APIAuthSection) string {
+	peer := hostOfRemote(r.RemoteAddr)
+	if !a.TrustsProxy(peer) {
+		return peer
+	}
+	if hop := firstUntrustedForwardedHop(r, a); hop != "" {
+		return hop
+	}
+	return peer
+}
+
+// firstUntrustedForwardedHop 从转发链里取真实客户端那一跳。
+//
+// 参数：
+//
+//	r — 请求；依次看 X-Forwarded-For（逗号分隔的 IP 列表，最左是原始客户端）与
+//	    RFC 7239 的 Forwarded（`for=...`，同样按逗号分隔、最左是原始客户端）
+//	a — api.auth 段配置（白名单）
+//
+// 返回：
+//
+//	string — 从右往左第一个**不在白名单里**的跳；全都可信时返回最左一跳；解析不出任何跳时返回空串
+func firstUntrustedForwardedHop(r *http.Request, a *config.APIAuthSection) string {
+	hops := forwardedHops(r)
+	if len(hops) == 0 {
+		return ""
+	}
+	var leftmost string
+	for i := len(hops) - 1; i >= 0; i-- {
+		hop := strings.TrimSpace(hops[i])
+		if hop == "" {
+			continue
+		}
+		if leftmost == "" {
+			leftmost = hop
+		}
+		if !a.TrustsProxy(hop) {
+			return hop
+		}
+	}
+	return leftmost
+}
+
+// forwardedHops 取出请求里的转发链（按"最左 = 原始客户端"的顺序）。
+//
+// 参数：
+//
+//	r — 请求
+//
+// 返回：
+//
+//	[]string — X-Forwarded-For 的每个元素；没有 XFF 时退而解析 Forwarded 里的每个 `for=`；
+//	          两个头都没有时返回 nil。X-Real-IP 只在两者都没有时作为单跳兜底。
+func forwardedHops(r *http.Request) []string {
+	if v := r.Header.Get("X-Forwarded-For"); strings.TrimSpace(v) != "" {
+		return strings.Split(v, ",")
+	}
+	if v := r.Header.Get("Forwarded"); strings.TrimSpace(v) != "" {
+		out := []string{}
+		for _, seg := range strings.Split(v, ",") {
+			for _, kv := range strings.Split(seg, ";") {
+				kv = strings.TrimSpace(kv)
+				if strings.EqualFold(kv, "for") || !strings.HasPrefix(strings.ToLower(kv), "for=") {
+					continue
+				}
+				out = append(out, strings.Trim(strings.TrimSpace(kv[4:]), "\""))
+			}
+		}
+		return out
+	}
+	if v := r.Header.Get("X-Real-IP"); strings.TrimSpace(v) != "" {
+		return []string{v}
+	}
+	return nil
+}
+
+// hasForwardedHeaders 判断请求是否带有"被代理转发过"的特征头。
+//
+// 参数：
+//
+//	r — 请求
+//
+// 返回：
+//
+//	bool — 出现 Forwarded / X-Forwarded-For / X-Real-IP / Via 中任意一个（且非空）时为 true。
+//	       Via 也算：只要是正常代理都会加它，本机 curl 不会产生。
+func hasForwardedHeaders(r *http.Request) bool {
+	for _, h := range []string{"Forwarded", "X-Forwarded-For", "X-Real-IP", "Via"} {
+		if strings.TrimSpace(r.Header.Get(h)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// hostOfRemote 从 RemoteAddr 里取出裸主机（去掉端口与 IPv6 方括号）。
+//
+// 参数：
+//
+//	remoteAddr — "127.0.0.1:54321" / "[::1]:54321"
+//
+// 返回：
+//
+//	string — 裸主机；解析不出 host:port 时原样返回（方括号保留，交给 isLoopbackHost 处理）
+func hostOfRemote(remoteAddr string) string {
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return host
+	}
+	return remoteAddr
 }
 
 // hasAPISignature 判断请求是否带了完整的签名三件套（缺一即视为"没带"）。
@@ -286,21 +441,6 @@ func apiAuthPayload(method, path, rawQuery string, body []byte, ts int64, nonce 
 		I64(ts).
 		Str(nonce)
 	return w.Out()
-}
-
-// isLoopbackRemote 判断 TCP 对端地址是否来自回环（本机）。
-//
-// 参数：
-//
-//	remoteAddr — http.Request.RemoteAddr 形式（"127.0.0.1:54321" / "[::1]:54321"）
-//
-// 返回：回环返回 true；解析不出 IP（含畸形输入）一律 false（宁严不宽）。
-func isLoopbackRemote(remoteAddr string) bool {
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		host = remoteAddr
-	}
-	return isLoopbackHost(host)
 }
 
 // isLoopbackHost 判断一个主机名字段是不是回环 IP。
@@ -402,6 +542,21 @@ func statusForAPIAuth(err error) int {
 func (n *Node) logAPIAuthPosture(addr string) {
 	a := &n.C().API.Auth
 	exposed := listenExposesOutside(addr)
+	// 对外监听 + 回环免签：这是"前面挂了反代就全线失守"的组合，必须说出来。
+	//
+	// 为什么不是致命错误：反代是别人的部署自由，本项目无权替它决定；而且只要配了
+	// trusted_proxies（或干脆关掉 loopback_bypass），这条就不再成立 —— 所以这里是 WARN
+	// 而不是拒绝启动，但**每次启动都要说一遍**。
+	if exposed && a.LoopbackBypassEnabled() {
+		if len(a.TrustedProxies) == 0 {
+			n.Log.Warn("api auth: 监听地址对外可达且回环免签开启 —— 若该端口前面有反向代理 / 端口转发，"+
+				"远程请求会以 127.0.0.1 出现从而被放行；请把代理地址写进 api.auth.trusted_proxies，"+
+				"或设 api.auth.loopback_bypass: false", "addr", addr)
+		} else {
+			n.Log.Info("api auth: 回环免签已按可信代理白名单解析真实来源",
+				"addr", addr, "trusted_proxies", a.TrustedProxies)
+		}
+	}
 	switch {
 	case a.Configured() && a.ProtectReads:
 		n.Log.Info("api auth: 写接口与读接口都要求签名（本机来源免签）", "secret_path", a.SecretPath)

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -695,9 +696,18 @@ type APISection struct {
 //  2. **其它来源的写请求必须带 HMAC 签名**，密钥就是本段配的共享密钥。
 //     **没配密钥 ⇒ 非回环的写请求一律拒绝**（fail-closed，不是"没配就放行"）。
 //
-// 为什么不做成"一律要密钥"：本项目的 HTTP 端点没有 TLS（明文），共享密钥只解决"谁有权动手"，
-// 解决不了窃听；而本机运维是绝对主路径，给它免签可以避免"把密钥投放到每台机器"这种纯负担。
-// 要远程运维就配密钥（推荐 secret_path，权限 600）+ 用 scripts/api_call.py 签。
+// 为什么不做成"一律要密钥"：本项目的 HTTP 端点没有 TLS（明文，除非配了 api.tls），共享密钥
+// 只解决"谁有权动手"，解决不了窃听；而本机运维是绝对主路径，给它免签可以避免"把密钥投放到
+// 每台机器"这种纯负担。要远程运维就配密钥（推荐 secret_path，权限 600）+ 用 scripts/api_call.py 签。
+//
+// 【回环免签为什么还要收紧】"来自回环"的判据是 **TCP 对端地址**，而它会被部署形态改写：
+// API 端口前面一旦挂了反向代理 / 端口转发（nginx、ssh -L、frpc、`kubectl port-forward`…），
+// 所有远程请求的对端都变成 127.0.0.1，第 1 条豁免就等于对全网放行。所以免签要同时满足：
+//
+//	· `loopback_bypass` 没被显式关掉；
+//	· 请求**没有转发特征头**（带了 Forwarded / X-Forwarded-For / X-Real-IP / Via 的对端
+//	  若不在 `trusted_proxies` 里，就不算"本机"—— 本机 curl 不会带这些头）；
+//	· 剥掉可信代理跳之后得到的真实来源仍是回环（见 `trusted_proxies`）。
 //
 // 密钥**不进 config_hash**（`api.*` 本来就不在 6.1 白名单里），且请求时现读文件 ⇒
 // 换密钥既不用重启、也不用 SIGHUP。
@@ -705,6 +715,86 @@ type APIAuthSection struct {
 	Secret       string `yaml:"secret"`        // 共享密钥（与 secret_path 二选一）
 	SecretPath   string `yaml:"secret_path"`   // 从文件读；**优先于 secret**（便于脚本投放与轮换）
 	ProtectReads bool   `yaml:"protect_reads"` // true = 读接口（/v1/tree、/v1/health、结果查询、/metrics）也要签名
+
+	// LoopbackBypass 回环免签开关：**nil（没写）= true**，保持历史行为；显式写 false 时
+	// 回环来源也照常走签名（"本机"不再是一种授权）。
+	//
+	// 为什么用指针：**默认值必须是 true**（存量部署的 `curl localhost` 不能因为升级就 401），
+	// 而 bool 的零值是 false —— 用 nil 表示"没写"才能把"没写"与"写了 false"区分开。
+	LoopbackBypass *bool `yaml:"loopback_bypass"`
+
+	// TrustedProxies 可信代理白名单（CIDR 或裸 IP）。**默认空 = 一个都不信**：此时任何
+	// X-Forwarded-For / Forwarded 头都被忽略（既能防伪造，也能让"回环 + 转发头"这一
+	// 反代特征直接失去免签资格）。
+	//
+	// 配了之后（如 `["127.0.0.1/32", "::1/128"]`）：只有**对端**落在白名单里，才按 RFC 7239
+	// 从右往左剥掉可信跳，取第一个不可信的作为真实来源。于是"API 前面挂了本地反代"这种
+	// 部署既能继续用，又不会把远程请求误判成本机请求。
+	TrustedProxies []string `yaml:"trusted_proxies"`
+}
+
+// LoopbackBypassEnabled 报告回环免签是否开启。
+//
+// 接收者 a 是 api.auth 段的配置。
+//
+// 返回：
+//
+//	bool — 没写（nil）或显式写 true 时为 true；显式写 false 时为 false
+func (a *APIAuthSection) LoopbackBypassEnabled() bool {
+	return a.LoopbackBypass == nil || *a.LoopbackBypass
+}
+
+// TrustsProxy 判断某个对端地址是否在可信代理白名单内。
+//
+// 接收者 a 是 api.auth 段的配置。**每次调用重新解析 CIDR**：白名单通常只有一两条，
+// 这点开销可以忽略，换来的是不必在配置对象上维护"解析后的副本"（避免 SIGHUP 重载时的
+// 状态同步问题）。
+//
+// 参数：
+//
+//	host — 裸主机（"127.0.0.1" / "::1"），带端口或方括号也认
+//
+// 返回：
+//
+//	bool — 命中白名单时 true；白名单为空、host 解析不出 IP、或 CIDR 写错时一律 false（宁严不宽）
+func (a *APIAuthSection) TrustsProxy(host string) bool {
+	ip := parseIPHost(host)
+	if ip == nil {
+		return false
+	}
+	for _, cidr := range a.TrustedProxies {
+		_, netw, err := net.ParseCIDR(strings.TrimSpace(cidr))
+		if err != nil {
+			// 裸 IP 也接受：补成单地址网段（IPv4 /32、IPv6 /128）
+			if single := net.ParseIP(strings.TrimSpace(cidr)); single != nil {
+				if single.Equal(ip) {
+					return true
+				}
+			}
+			continue
+		}
+		if netw.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseIPHost 把一个主机字段解析成 IP（兼容带端口 / 带方括号的写法）。
+//
+// 参数：
+//
+//	host — 形如 "127.0.0.1"、"127.0.0.1:54321"、"[::1]:54321" 的字段
+//
+// 返回：
+//
+//	net.IP — 解析结果；解析不出来时返回 nil
+func parseIPHost(host string) net.IP {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	return net.ParseIP(host)
 }
 
 // Configured 报告是否配了共享密钥（两个来源有一个非空即算配了）。
@@ -1188,6 +1278,14 @@ func (c *Config) Validate() error {
 	if c.API.Auth.SecretPath != "" {
 		if _, err := os.Stat(c.API.Auth.SecretPath); err != nil {
 			return fmt.Errorf("api.auth.secret_path: %w（配了就要能读到：脚本投放、权限 600）", err)
+		}
+	}
+	// 可信代理白名单：写错的 CIDR 必须**启动时就暴露**，不能等到"某个请求突然被当成远程"
+	// 才被发现 —— 那时它要么静默拒绝合法的本机运维，要么（更糟）把远程请求当本机放行。
+	for _, p := range c.API.Auth.TrustedProxies {
+		s := strings.TrimSpace(p)
+		if _, _, err := net.ParseCIDR(s); err != nil && net.ParseIP(s) == nil {
+			return fmt.Errorf("api.auth.trusted_proxies: %q 不是合法的 CIDR 或 IP（例：127.0.0.1/32、::1/128）", p)
 		}
 	}
 	// 注意：**不在这里**因为"证书不存在 + 没配凭据"就拒绝启动 ——
