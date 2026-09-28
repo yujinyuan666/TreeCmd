@@ -1,6 +1,7 @@
 package node
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -28,6 +29,11 @@ type apiTLSReloader struct {
 	clientAuth  tls.ClientAuthType
 	minVersion  uint16
 	requireOnly bool // api.tls.require：明文请求一律拒绝
+
+	// leafHash 当前服务端**叶子证书 DER 的 SHA-256**（RFC 5929 的 tls-server-end-point）。
+	// 它是通道绑定值：客户端从自己看到的服务端证书算同一个哈希，于是签名被钉死在
+	// "这张证书所代表的那个服务端"上 —— 换个服务端（中间人 / 另一个节点）就签不上。
+	leafHash []byte
 
 	mu    sync.RWMutex
 	cfg   *tls.Config
@@ -119,6 +125,14 @@ func (r *apiTLSReloader) build() (*tls.Config, error) {
 		MinVersion:   r.minVersion,
 		ClientAuth:   r.clientAuth,
 	}
+	// 通道绑定值取自**叶子证书**：cert.Certificate[0] 就是它的 DER（证书链在 [1:]）。
+	// 带上 apiAuthCBLabel 做域分隔 —— 同一张证书不该在别的协议 / 用途上算出同一个绑定值。
+	if len(cert.Certificate) > 0 {
+		h := sha256.New()
+		h.Write([]byte(apiAuthCBLabel))
+		h.Write(cert.Certificate[0])
+		r.leafHash = h.Sum(nil)
+	}
 	if r.caPath != "" {
 		pool, err := loadClientCAPool(r.caPath)
 		if err != nil {
@@ -152,6 +166,19 @@ func (r *apiTLSReloader) fileStamp() string {
 		out += "|" + p + ":" + st.ModTime().UTC().Format("20060102150405.000") + ":" + fmt.Sprint(st.Size())
 	}
 	return out
+}
+
+// LeafCertHash 返回当前服务端叶子证书的通道绑定值。
+//
+// 接收者 r 是重载器。
+//
+// 返回：
+//
+//	[]byte — 32 字节证书哈希（证书热重载后随之变化）；尚未加载成功时为 nil
+func (r *apiTLSReloader) LeafCertHash() []byte {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.leafHash
 }
 
 // loadClientCAPool 读客户端 CA（文件或目录）成证书池。

@@ -813,6 +813,49 @@ type APIAuthSection struct {
 	// 从右往左剥掉可信跳，取第一个不可信的作为真实来源。于是"API 前面挂了本地反代"这种
 	// 部署既能继续用，又不会把远程请求误判成本机请求。
 	TrustedProxies []string `yaml:"trusted_proxies"`
+
+	// ChannelBinding 通道绑定策略（防"中间人把在途请求转发到别的连接 / 别的节点再执行一次"）：
+	//
+	//   · auto（默认）—— 走 TLS 时**要求**请求声明并匹配通道绑定值；明文时无法计算，不要求；
+	//   · require    —— 一律要求 ⇒ 明文请求根本拿不到绑定值，等于"签名只在 HTTPS 上可用"；
+	//   · off        —— 不校验（客户端不会算 / 前面是 TLS 终止代理时）。
+	ChannelBinding string `yaml:"channel_binding"`
+
+	// BindHost 是否把 Host 头纳入签名：**nil（没写）= true**。
+	//
+	// 作用：同一份签名换个主机名投出去就失效（挡"把签好的请求投到别的虚拟主机 / 别的入口"）。
+	// 前面是**会改写 Host 的反向代理**时要显式写 false —— 那时代理看到的目标名与客户端签的不同。
+	BindHost *bool `yaml:"bind_host"`
+}
+
+// ChannelBindingMode 归一化通道绑定策略。
+//
+// 接收者 a 是 api.auth 段的配置。
+//
+// 返回：
+//
+//	string — "off" / "auto" / "require"；没写按 "auto"。**写成别的（含拼错）按 "require"**：
+//	        配置文件里的拼错不该悄悄退化成"不校验"，宁可让调用方立刻收到 401 去查配置。
+func (a *APIAuthSection) ChannelBindingMode() string {
+	switch strings.ToLower(strings.TrimSpace(a.ChannelBinding)) {
+	case "", "auto":
+		return "auto"
+	case "off":
+		return "off"
+	default:
+		return "require"
+	}
+}
+
+// HostBound 报告 Host 头是否参与签名。
+//
+// 接收者 a 是 api.auth 段的配置。
+//
+// 返回：
+//
+//	bool — 没写（nil）或显式写 true 时为 true
+func (a *APIAuthSection) HostBound() bool {
+	return a.BindHost == nil || *a.BindHost
 }
 
 // LoopbackBypassEnabled 报告回环免签是否开启。
@@ -1369,6 +1412,11 @@ func (c *Config) Validate() error {
 		if _, _, err := net.ParseCIDR(s); err != nil && net.ParseIP(s) == nil {
 			return fmt.Errorf("api.auth.trusted_proxies: %q 不是合法的 CIDR 或 IP（例：127.0.0.1/32、::1/128）", p)
 		}
+	}
+	switch strings.ToLower(strings.TrimSpace(c.API.Auth.ChannelBinding)) {
+	case "", "off", "auto", "require":
+	default:
+		return fmt.Errorf("invalid api.auth.channel_binding %q (auto|off|require)", c.API.Auth.ChannelBinding)
 	}
 	// 对外 HTTP 的 TLS：只写一半（有证书没密钥）是配置错误，必须拒绝启动 ——
 	// 否则它会静默退化成明文，而 operator 以为自己已经开了 HTTPS。

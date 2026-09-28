@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -62,6 +63,13 @@ const (
 	headerAPITimestamp = "X-Treecmd-Timestamp"
 	headerAPINonce     = "X-Treecmd-Nonce"
 	headerAPISignature = "X-Treecmd-Signature"
+	// headerAPIAudience 签名声明的**接收方**（目标 node_id）。服务端只认"签给自己的"。
+	headerAPIAudience = "X-Treecmd-Audience"
+	// headerAPIChannelBinding 通道绑定值：base64(TLS exporter)，把签名钉死在这一条 TLS 连接上。
+	headerAPIChannelBinding = "X-Treecmd-Channel-Binding"
+	// apiAuthCBLabel 通道绑定的用途标签。**两端必须逐字节一致** —— 它决定"这份绑定是给谁用的"，
+	// 换标签等于换一套绑定（避免同一张证书被复用到别的协议上）。
+	apiAuthCBLabel = "treecmd/api/v1 channel binding"
 
 	// apiPathHealthz 存活探针，永远免认证。
 	apiPathHealthz = "/v1/healthz"
@@ -72,6 +80,8 @@ const (
 	errAPIAuthUnavailable   = "ERR_API_AUTH_UNAVAILABLE"
 	errAPIAuthTooLarge      = "ERR_API_AUTH_TOO_LARGE"
 	errAPIAuthTLSRequired   = "ERR_API_TLS_REQUIRED"
+	errAPIAuthAudience      = "ERR_API_AUTH_AUDIENCE"
+	errAPIAuthChannelBind   = "ERR_API_AUTH_CHANNEL_BINDING"
 )
 
 // withAPIAuth 给对外 HTTP 端点套上访问控制：受保护的请求先过 authorizeAPI，再交给业务处理。
@@ -240,22 +250,68 @@ func (n *Node) authorizeAPI(r *http.Request) error {
 			errAPIAuthFailed, apiAuthSkew, d.Round(time.Second), r.RemoteAddr)
 	}
 
-	// ⑤ 验签。body 要参与摘要（否则签名可以被搬到另一个 body 上）。
+	// ⑤ 接收方（audience）：签名必须**签给本节点**。
+	//
+	// 挡的是这条攻击：nonce 表是**每节点一份**的，所以"签给 A 的请求"被中间人原样转发给
+	// 共享同一密钥的 B 时，B 的 nonce 表里没有它 ⇒ 会被当成一次全新请求再执行一次
+	// （`POST /v1/crl` 吊销、`/v1/forget` 删数据、`/v1/commands` 让整棵子树执行指令 —— 全是
+	// 不可逆动作）。把目标 node_id 写进签名后，这类"跨节点中继"在验签时就断了。
+	audience := strings.TrimSpace(r.Header.Get(headerAPIAudience))
+	if !strings.EqualFold(audience, n.C().Node.ID) {
+		return fmt.Errorf("%s: %s=%q 不是本节点（本节点 node_id=%q；"+
+			"要远程调用请显式声明目标节点，别把签好的请求转发给别人（来源 %s）",
+			errAPIAuthAudience, headerAPIAudience, audience, n.C().Node.ID, r.RemoteAddr)
+	}
+
+	// ⑥ 通道绑定：把签名钉死在"这一条 TLS 连接"上。
+	//
+	// HMAC 证明的是"请求内容没被改"，证明不了"它是从哪条链路进来的"。中间人可以把在途请求
+	// 挪到**自己新建的一条连接**上投递（抓到的字节一个没改，签名照样对）。把 TLS exporter
+	// （RFC 5705，双方各自从握手密钥导出、链路上不传输）纳入签名后，换一条连接就签不上。
+	cbRaw := strings.TrimSpace(r.Header.Get(headerAPIChannelBinding))
+	cb, cbErr := n.channelBindingOf(r)
+	switch mode := n.C().API.Auth.ChannelBindingMode(); {
+	case cbRaw == "" && mode == "off":
+		// 明确关闭：不校验
+	case cbRaw == "" && mode == "auto" && r.TLS == nil:
+		// 明文链路本来就导不出绑定值 —— 让它过，但 TLS 那段 WARN 已经在启动时喊过了
+	case cbRaw == "":
+		return fmt.Errorf("%s: 缺少 %s（策略 %s；客户端要用本次 TLS 连接的 exporter 值签名，"+
+			"或把 api.auth.channel_binding 设为 off 以明确放弃这项保护；来源 %s）",
+			errAPIAuthChannelBind, headerAPIChannelBinding, mode, r.RemoteAddr)
+	case cbErr != nil:
+		return fmt.Errorf("%s: 本端算不出通道绑定值（%v；来源 %s）", errAPIAuthChannelBind, cbErr, r.RemoteAddr)
+	default:
+		got, derr := base64.StdEncoding.DecodeString(cbRaw)
+		if derr != nil {
+			return fmt.Errorf("%s: %s 不是 base64（来源 %s）", errAPIAuthChannelBind, headerAPIChannelBinding, r.RemoteAddr)
+		}
+		if !hmac.Equal(cb, got) {
+			return fmt.Errorf("%s: 通道绑定值不匹配 —— 这份签名是在**另一条 TLS 连接**上签的"+
+				"（典型的中间人转发；来源 %s）", errAPIAuthChannelBind, r.RemoteAddr)
+		}
+	}
+
+	// ⑦ 验签。body 要参与摘要（否则签名可以被搬到另一个 body 上）。
 	body, err := readBodyForAuth(r)
 	if err != nil {
 		return err
 	}
-	payload := apiAuthPayload(r.Method, r.URL.Path, r.URL.RawQuery, body, ts, nonce)
+	host := ""
+	if n.C().API.Auth.HostBound() {
+		host = r.Host
+	}
+	payload := apiAuthPayload(r.Method, r.URL.Path, r.URL.RawQuery, body, ts, nonce, audience, host, cbRaw)
 	mac := hmac.New(sha256.New, secret)
 	mac.Write(payload)
 	want := mac.Sum(nil)
 	got, derr := base64.StdEncoding.DecodeString(strings.TrimSpace(sigRaw))
 	if derr != nil || !hmac.Equal(want, got) {
-		return fmt.Errorf("%s: 签名不匹配（来源 %s；payload 覆盖 方法/路径/query/body 摘要/时间戳/nonce）",
-			errAPIAuthFailed, r.RemoteAddr)
+		return fmt.Errorf("%s: 签名不匹配（来源 %s；payload 覆盖 方法/路径/query/body 摘要/"+
+			"时间戳/nonce/接收方/Host/通道绑定）", errAPIAuthFailed, r.RemoteAddr)
 	}
 
-	// ⑥ 防重放：时间窗内同一个 nonce 只认一次。放在验签**之后** —— 只有持密钥的人
+	// ⑧ 防重放：时间窗内同一个 nonce 只认一次。放在验签**之后** —— 只有持密钥的人
 	// 才能往表里塞条目，否则谁都能用假 nonce 把表刷满、把合法请求挤掉。
 	if !n.redeemNonce(nonce) {
 		return fmt.Errorf("%s: nonce %q 已用过（重放；来源 %s）", errAPIAuthFailed, nonce, r.RemoteAddr)
@@ -482,17 +538,23 @@ func readBodyForAuth(r *http.Request) ([]byte, error) {
 
 // apiAuthPayload 拼接签名的"待签内容"。
 //
+// 字段顺序就是协议：**两端必须逐字节一致**（scripts/api_call.py 与 test/api-auth.sh 在证这件事）。
+// 后三个字段（audience / host / channelBinding）是防中继用的，见 authorizeAPI 第 ⑤⑥ 步。
+//
 // 参数：
 //
-//	method   — HTTP 方法（大写，如 POST）
-//	path     — 请求路径（r.URL.Path，不含 query）
-//	rawQuery — 原始 query（r.URL.RawQuery，**原样**：重排或重新转义都会算出不同的串）
-//	body     — 请求体原文（空体即空切片，摘要照样参与）
-//	ts       — Unix 秒时间戳
-//	nonce    — 一次性随机串
+//	method         — HTTP 方法（大写，如 POST）
+//	path           — 请求路径（r.URL.Path，不含 query）
+//	rawQuery       — 原始 query（r.URL.RawQuery，**原样**：重排或重新转义都会算出不同的串）
+//	body           — 请求体原文（空体即空切片，摘要照样参与）
+//	ts             — Unix 秒时间戳
+//	nonce          — 一次性随机串
+//	audience       — 接收方 node_id（客户端声明的 X-Treecmd-Audience，原样参与）
+//	host           — Host 头（api.auth.bind_host 为 false 时传空串）
+//	channelBinding — 通道绑定值的 base64 原文（没有时传空串）
 //
 // 返回：canonical 编码后的字节串（canon.Writer：Str 带 8 字节大端长度前缀，I64 定长 8 字节）。
-func apiAuthPayload(method, path, rawQuery string, body []byte, ts int64, nonce string) []byte {
+func apiAuthPayload(method, path, rawQuery string, body []byte, ts int64, nonce, audience, host, channelBinding string) []byte {
 	sum := sha256.Sum256(body)
 	w := canon.NewWriter().
 		Str(apiAuthDomain).
@@ -501,8 +563,44 @@ func apiAuthPayload(method, path, rawQuery string, body []byte, ts int64, nonce 
 		Str(rawQuery).
 		Bytes(sum[:]).
 		I64(ts).
-		Str(nonce)
+		Str(nonce).
+		Str(audience).
+		Str(host).
+		Str(channelBinding)
 	return w.Out()
+}
+
+// channelBindingOf 取通道绑定值：服务端叶子证书 DER 的 SHA-256。
+//
+// 接收者 n 是本节点实例。
+//
+// 【为什么是证书哈希而不是 TLS exporter】标准做法两选一：RFC 5705 的 exporter（绑定"这一条连接"，
+// 最强）与 RFC 5929 的 tls-server-end-point（绑定"这张证书"，即服务端身份）。这里选后者，
+// 因为 exporter 需要**客户端也能导出密钥材料**，而常见客户端（Python 的 ssl、curl）没有这个
+// 接口；证书哈希则是任何 TLS 客户端都能算的（Python：`sock.getpeercert(binary_form=True)`
+// 再取 SHA-256）。它挡住的正是我们要挡的那件事：把签好的请求投给**另一个服务端**，
+// 或者投给一个伪造的服务端 —— 那张证书不一样，哈希就对不上。
+//
+// 参数：
+//
+//	r — 请求；明文请求时返回错误（绑定值只在 TLS 上存在）
+//
+// 返回：
+//
+//	[]byte — 32 字节证书哈希
+//	error  — 明文 / 本端没开 api.tls / 证书尚未加载成功时返回
+func (n *Node) channelBindingOf(r *http.Request) ([]byte, error) {
+	if r.TLS == nil {
+		return nil, errors.New("请求不是从 TLS 连接上进来的，没有通道绑定值")
+	}
+	if n.apiTLS == nil {
+		return nil, errors.New("本端没开 api.tls（拿不到服务端证书）")
+	}
+	h := n.apiTLS.LeafCertHash()
+	if len(h) == 0 {
+		return nil, errors.New("服务端证书尚未加载成功")
+	}
+	return h, nil
 }
 
 // isLoopbackHost 判断一个主机名字段是不是回环 IP。
