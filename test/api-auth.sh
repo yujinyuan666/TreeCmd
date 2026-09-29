@@ -36,6 +36,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${HERE}/lib/platform.sh"   # 跨平台：文件权限 / 端口占用检测（GNU/Linux 上往往没有 lsof）
 REPO="${TREECMD_REPO:-$(cd "${HERE}/.." && pwd)}"
 BIN="${REPO}/bin/treecmd-node"
 SCRIPTS="${REPO}/scripts"
@@ -206,7 +207,7 @@ wait_api() { # 等端口可用（启动是后台的，别用固定 sleep 赌）
 stop_root
 rm -rf "${WORK}"
 mkdir -p "${ROOT_DIR}" "${LOGS}"
-if lsof -ti "tcp:${API_PORT}" >/dev/null 2>&1; then
+if port_in_use "${API_PORT}"; then
   die "端口 ${API_PORT} 已被占用（有残留进程？）—— 先清掉再跑，否则验收会假通过"
 fi
 info "本机非回环地址 = ${LAN_IP}（用它冒充'局域网里的另一台机器'）"
@@ -251,8 +252,8 @@ TOKEN="$(mint alice)" || die "adduser 失败"
 chk "① 阶段被拒的请求一条都没落进 CRL" "$(revoked_list)" ""
 
 TOKFILE="${ROOT_DIR}/user/alice"
-chk "token 文件的权限" "$(stat -f '%Lp' "${TOKFILE}")" "600"
-chk "user 目录的权限" "$(stat -f '%Lp' "${ROOT_DIR}/user")" "700"
+chk "token 文件的权限" "$(file_mode "${TOKFILE}")" "600"
+chk "user 目录的权限" "$(file_mode "${ROOT_DIR}/user")" "700"
 # 格式：<16 位随机串>.<base64 签名>
 chk "token 的形态（16 位随机串 + 签名）" \
   "$(python3 -c 'import sys,base64; t=open(sys.argv[1]).read().strip(); r,s=t.split("."); print("ok" if len(r)==16 and len(base64.b64decode(s))==64 else "bad")' "${TOKFILE}")" "ok"

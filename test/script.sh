@@ -32,6 +32,7 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # API 没有免签来源（含本机）：所有请求都要带 user token —— 见 lib/apitoken.sh
 . "${HERE}/lib/apitoken.sh"   # 对外 API 一律要 user token：装好后所有 curl 自动带上
+. "${HERE}/lib/platform.sh"   # 跨平台：文件摘要（GNU 上是 sha256sum，BSD 上是 shasum）
 cd "${HERE}" || exit 1
 
 KEEP="${1:-}"
@@ -94,7 +95,7 @@ printf '%s' "${param}" > result.json
 echo "hello.sh ran in $(pwd)" >&2
 SCRIPT
 chmod 755 "${ROOT_SCRIPT}"
-ROOT_SHA="$(shasum -a 256 "${ROOT_SCRIPT}" | awk '{print $1}')"
+ROOT_SHA="$(sha256_of "${ROOT_SCRIPT}")"
 ok "已放置（sha256=${ROOT_SHA:0:12}…）"
 
 # 超限用例的脚本：往 result.json 写 5MB（超过 4MB 上限）
@@ -189,7 +190,7 @@ else fail "断言未通过（见上）"; fi
 printf '\n⑤ 脚本真的落到子节点上了吗（且带父的身份背书）\n'
 for f in "${CHILD_SCRIPTS[@]}"; do
   if [ ! -f "$f" ]; then fail "子节点没有拿到脚本：${f}"; continue; fi
-  got="$(shasum -a 256 "$f" | awk '{print $1}')"
+  got="$(sha256_of "$f")"
   if [ "$got" != "${ROOT_SHA}" ]; then fail "子节点的脚本内容与根不一致：${f}"; else ok "下发且逐字节一致：${f#${DEMO}/}"; fi
 done
 # 落盘只说明"字节到了"；还要确认这份字节带着**父的身份背书**、而且子端验过了。
@@ -209,7 +210,7 @@ cat > "${TAMPERED}" <<'SCRIPT'
 printf '%s' '{"tampered":true}' > result.json
 SCRIPT
 chmod 755 "${TAMPERED}"
-if [ "$(shasum -a 256 "${TAMPERED}" | awk '{print $1}')" = "${ROOT_SHA}" ]; then
+if [ "$(sha256_of "${TAMPERED}")" = "${ROOT_SHA}" ]; then
   fail "篡改后的脚本与正确内容相同，用例无效"
 else
   ok "已把 ${TAMPERED#${DEMO}/} 换成一份内容错误的脚本"
@@ -225,7 +226,7 @@ else
     *COMMAND_STATUS_COMPLETED*) ok "被覆盖回正确内容并执行成功（哈希校验 + 无条件覆盖都生效）" ;;
     *) fail "终态不符合预期：${OUT2}" ;;
   esac
-  if [ "$(shasum -a 256 "${TAMPERED}" | awk '{print $1}')" = "${ROOT_SHA}" ]; then
+  if [ "$(sha256_of "${TAMPERED}")" = "${ROOT_SHA}" ]; then
     ok "磁盘上的脚本已被覆盖回与根一致"
   else
     fail "磁盘上的脚本没被覆盖回正确内容"

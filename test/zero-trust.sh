@@ -30,6 +30,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # API 没有免签来源（含本机）：所有请求都要带 user token —— 见 lib/apitoken.sh
 . "${HERE}/lib/apitoken.sh"   # 对外 API 一律要 user token：装好后所有 curl 自动带上
+. "${HERE}/lib/platform.sh"   # 跨平台：端口占用检测（GNU/Linux 上往往没有 lsof）
 REPO="${TREECMD_REPO:-$(cd "${HERE}/.." && pwd)}"
 BIN="${REPO}/bin/treecmd-node"
 INIT_ROOT="${REPO}/scripts/init_root.sh"
@@ -185,13 +186,11 @@ cmd_run() {
   # 端口体检：上一轮被中断（比如某个断言 die 了）时可能留下**还在跑**的旧节点，
   # 而旧进程照样在监听同样的端口 —— 于是"根已上线"会变成**假通过**（命中的是旧进程的 API），
   # 后面所有结论都建立在错的树上。宁可在这里明确失败，也不静默串台。
-  if command -v lsof >/dev/null 2>&1; then
-    for p in "${ROOT_API##*:}" "${ROOT_LISTEN##*:}" "${RELAY_LISTEN##*:}" "${AUTO_API##*:}" "${AUTO_LISTEN##*:}"; do
-      if lsof -nP -iTCP:"${p}" -sTCP:LISTEN >/dev/null 2>&1; then
-        die "端口 ${p} 已被占用 —— 多半是上一次验收留下的节点。先 ./zero-trust.sh stop，或手工 kill 掉占用者再跑"
-      fi
-    done
-  fi
+  for p in "${ROOT_API##*:}" "${ROOT_LISTEN##*:}" "${RELAY_LISTEN##*:}" "${AUTO_API##*:}" "${AUTO_LISTEN##*:}"; do
+    if port_in_use "${p}"; then
+      die "端口 ${p} 已被占用 —— 多半是上一次验收留下的节点。先 ./zero-trust.sh stop，或手工 kill 掉占用者再跑"
+    fi
+  done
 
   echo "════════════════════════════════════════════════════════════════"
   echo " zero-trust 验收：信任锚自举（入网成功后不再需要 trust/）"

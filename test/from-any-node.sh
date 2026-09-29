@@ -27,6 +27,7 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # API 没有免签来源（含本机）：所有请求都要带 user token —— 见 lib/apitoken.sh
 . "${HERE}/lib/apitoken.sh"   # 对外 API 一律要 user token：装好后所有 curl 自动带上
+. "${HERE}/lib/platform.sh"   # 跨平台：文件摘要（GNU 上是 sha256sum，BSD 上是 shasum）
 cd "${HERE}" || exit 1
 
 KEEP="${1:-}"
@@ -107,7 +108,7 @@ cat > "${RELAY_SCRIPT}" <<'SCRIPT'
 printf '{"ran_in":"%s","argv1":%s}' "$(pwd)" "${1:-\"\"}" > result.json
 SCRIPT
 chmod 755 "${RELAY_SCRIPT}"
-RELAY_SHA="$(shasum -a 256 "${RELAY_SCRIPT}" | awk '{print $1}')"
+RELAY_SHA="$(sha256_of "${RELAY_SCRIPT}")"
 info "脚本 sha256=${RELAY_SHA:0:12}…"
 miss=0
 for n in root leaf1; do [ -f "${DEMO}/${n}/script/${SCRIPT_NAME}" ] && miss=1; done
@@ -209,7 +210,7 @@ LEAF_SCRIPT="${DEMO}/leaf2/script/${SCRIPT_NAME}"
 if [ ! -f "${LEAF_SCRIPT}" ]; then
   fail "leaf-beta 没有拿到脚本"
 else
-  got="$(shasum -a 256 "${LEAF_SCRIPT}" | awk '{print $1}')"
+  got="$(sha256_of "${LEAF_SCRIPT}")"
   if [ "${got}" = "${RELAY_SHA}" ]; then ok "已从中继下发到 leaf-beta，且逐字节一致"; else fail "内容与中继那份不一致"; fi
 fi
 if grep -q "脚本身份背书校验通过" logs/leaf2.log 2>/dev/null; then

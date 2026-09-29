@@ -21,6 +21,7 @@ export LC_ALL=${LC_ALL:-en_US.UTF-8} 2>/dev/null || true
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # API 没有免签来源（含本机）：所有请求都要带 user token —— 见 lib/apitoken.sh
 . "${HERE}/lib/apitoken.sh"   # 对外 API 一律要 user token：装好后所有 curl 自动带上
+. "${HERE}/lib/platform.sh"   # 跨平台：文件摘要 / 字节数（GNU 与 BSD 的 stat、shasum 写法不同）
 REPO="${TREECMD_REPO:-$(cd "${HERE}/.." && pwd)}"
 BIN="${REPO}/bin/treecmd-node"
 DEMO="${HERE}/demo"
@@ -40,7 +41,7 @@ warn() { printf '  \033[33m!\033[0m %s\n' "$*" >&2; }
 die()  { printf '  \033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 step() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 
-short_hash() { shasum -a 256 "$1" | cut -c1-12; }
+short_hash() { sha256_of "$1" | cut -c1-12; }
 
 # build_variant <版本标记> <输出路径>：只改 buildinfo.Version 注入值 —— 字节变了哈希就变了。
 # 已存在时复用（prepare 用 REBUILD=1 强制重造）。
@@ -80,8 +81,8 @@ cmd_prepare() {
   step "预生成两个变体（v1 / v2）"
   REBUILD=1 build_variant v1 "${BIN}.v1"
   REBUILD=1 build_variant v2 "${BIN}.v2"
-  ok "v1 = $(short_hash "${BIN}.v1")（$(stat -f%z "${BIN}.v1") 字节）"
-  ok "v2 = $(short_hash "${BIN}.v2")（$(stat -f%z "${BIN}.v2") 字节）"
+  ok "v1 = $(short_hash "${BIN}.v1")（$(file_size "${BIN}.v1") 字节）"
+  ok "v2 = $(short_hash "${BIN}.v2")（$(file_size "${BIN}.v2") 字节）"
 }
 
 # ---------- 起树 ----------

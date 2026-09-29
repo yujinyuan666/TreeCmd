@@ -331,6 +331,24 @@ API_AUTH_LAN_IP=10.0.0.5 ./api-auth.sh    # 自动探测不到本机非回环地
 > 多节点的脚本（如 `from-any-node.sh` 要打中继的 API）自己写 `-H "X-Treecmd-Token: ..."` 覆盖，
 > 包装器会尊重调用处给的头。
 
+## 跨平台：`lib/platform.sh`（macOS / Linux 都能跑）
+
+这套脚本最早是按 macOS 写的，搬到 Linux（实测 **openEuler 22.03 aarch64**）会踩三处**不报错、只给出错误结论**的差异，
+所以统一收口到 `test/lib/platform.sh`（source 之后直接用，不改变任何断言口径）：
+
+| 函数 | 替代了什么 | 为什么要替 |
+|---|---|---|
+| `file_size` | `stat -f%z` | GNU 的 `-f` 是"文件系统统计"，会把格式串当**文件名**去 stat → 打出无关内容并非零退出 |
+| `file_mode` | `stat -f '%Lp'` | 同上（GNU 是 `-c %a`） |
+| `sha256_of` | `shasum -a 256` | 优先用 coreutils 的 `sha256sum`；`shasum` 由 perl-Digest-SHA 提供，精简发行版未必有 |
+| `port_in_use` | `lsof -ti tcp:<port>` | **openEuler 最小安装没有 `lsof`**；改走 `ss`（判输出是否为空 —— `ss` 无匹配项时**照样返回 0**），再兜底 bash 的 `/dev/tcp` |
+
+已在 macOS（BSD 分支）与 openEuler（GNU 分支）两侧各验一次：`file_size` / `file_mode` / `sha256_of`
+与各自平台的原生命令逐字节一致，`port_in_use` 在"起一个监听 → 停掉"两个状态上取值正确。
+
+> 仍按平台硬编码、但两边都存在的：`/usr/bin/python3`（macOS 与 openEuler 都自带）。
+> 要移植到没有该路径的发行版时，改 `PYTHON` 环境变量或那几处硬编码。
+
 ## 入网授权策略怎么验（`enroll-policy.sh`）
 
 `zero-trust.sh` 看的是"信任锚从哪来"，`enroll-policy.sh` 看的是**另一半：谁可以进来、凭什么进来**。

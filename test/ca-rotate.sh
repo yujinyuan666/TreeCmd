@@ -23,6 +23,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # API 没有免签来源（含本机）：所有请求都要带 user token —— 见 lib/apitoken.sh
 . "${HERE}/lib/apitoken.sh"   # 对外 API 一律要 user token：装好后所有 curl 自动带上
+. "${HERE}/lib/platform.sh"   # 跨平台：文件摘要（GNU 上是 sha256sum，BSD 上是 shasum）
 REPO="${TREECMD_REPO:-$(cd "${HERE}/.." && pwd)}"
 DEMO="${HERE}/demo"
 API_TOKEN_DIR="${DEMO}/root"      # token 签在哪个节点目录下（下面所有 curl 自动带上）
@@ -35,10 +36,10 @@ die()  { printf '  \033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 step() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 
 # fp <文件>：证书文件内容的短指纹（用文件哈希即可 —— 内容变了才算变了）
-fp() { shasum -a 256 "$1" | cut -c1-12; }
+fp() { sha256_of "$1" | cut -c1-12; }
 
 # pubkey <文件>：证书里公钥的指纹（同一把密钥 = 同一个值）
-pubkey() { openssl x509 -in "$1" -noout -pubkey 2>/dev/null | shasum -a 256 | cut -c1-16; }
+pubkey() { openssl x509 -in "$1" -noout -pubkey 2>/dev/null | sha256_of - | cut -c1-16; }
 
 cleanup_tree() {
   "${HERE}/demo.sh" stop >/dev/null 2>&1 || true
