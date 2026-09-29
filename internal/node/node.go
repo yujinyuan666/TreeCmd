@@ -123,12 +123,12 @@ type Node struct {
 	// apiTLS 对外 HTTP 的 TLS 重载器（apitls.go）。开了 api.tls 才非 nil。
 	apiTLS *apiTLSReloader
 	// 对外 HTTP 的授权缓存（usertoken.go）：token → 用户名，来自 `user/` 目录的扫描结果。
-	// 目录 mtime 变了就重扫（`-adduser` 之后立即生效，不用重启）；未命中且有节流时直接 403。
-	userMu       sync.Mutex
-	userTokens   map[string]string
-	userStamp    time.Time // 上次扫描时 user/ 目录的 mtime
-	userLastScan time.Time // 上次扫描的时刻（节流用）
-	userScanned  bool      // 是否已经扫过（区分"没扫过"与"扫过但目录不存在"）
+	// 目录 mtime（或"目录在不在"）一变就重扫，于是 `-adduser` 与 `rm user/<用户名>` 都立刻生效。
+	userMu         sync.Mutex
+	userTokens     map[string]string
+	userStamp      time.Time // 上次扫描时 user/ 目录的 mtime
+	userScanned    bool      // 是否已经扫过（区分"没扫过"与"扫过但目录不存在"）
+	userDirMissing bool      // 上次扫描时 user/ 目录还不存在
 
 	// 计数器（可观测性）
 	statCmdTerminal map[string]int64

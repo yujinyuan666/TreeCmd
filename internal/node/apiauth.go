@@ -170,7 +170,7 @@ func (n *Node) logAPIAuthPosture(addr string) {
 	// 除了 /v1/healthz，谁都不进来。
 	if caPub, err := n.userTokenCAPub(); err != nil {
 		n.Log.Warn("api auth: 无法校验 user token，除 "+apiPathHealthz+" 外的请求都会被拒绝", "err", err)
-	} else if err := n.rescanUserTokens(caPub); err != nil {
+	} else if err := n.refreshUserTokens(caPub); err != nil {
 		n.Log.Warn("api auth: 扫描 user token 目录失败", "dir", dir, "err", err)
 	}
 

@@ -66,13 +66,6 @@ const (
 	userTokenMaxFileBytes = 4 << 10
 	// userTokenMaxNameLen 用户名长度上限（文件名长度也受它约束）。
 	userTokenMaxNameLen = 64
-
-	// userTokenRescanInterval 缓存未命中时的重扫节流：mtime 没变的情况下，最快多久重扫一次。
-	//
-	// 为什么需要：未获授权的请求会走到"重扫目录"这一步，不节流的话，随便谁都能用错 token
-	// 把本节点的磁盘读打满（放大攻击）。1 秒的窗口换来的代价只是"刚签发的 token 最坏晚 1 秒
-	// 生效"，而 mtime 一变就是立即重扫，实际操作里感觉不到延迟。
-	userTokenRescanInterval = time.Second
 )
 
 // ValidAPIUsername 判断用户名能否作为 token 文件名。
@@ -315,8 +308,12 @@ func loadCAKeyForUserToken(cfg *config.Config) (ed25519.PrivateKey, error) {
 //
 // 接收者 n 是本节点实例。
 //
-// 流程：内存缓存（token → 用户名）命中即返回；未命中则按 user/ 目录 mtime 判断要不要重扫
-// （`-adduser` 之后立即生效），重扫后再查一次；仍然没有就返回"未授权"。
+// 流程：先按 user/ 目录的 mtime 判断缓存是否还新鲜（变了就重扫，`-adduser` 与
+// `rm user/<用户名>` 都靠这一步立刻生效），再查缓存；查不到就是未授权。
+//
+// **为什么命中也要先看 mtime**：只看"未命中才重扫"的话，被删掉的 token 会一直留在缓存里
+// —— 收回权限会变成"要等节点重启"，那是不可接受的（**踩过**：验收脚本里"删了就失效"这条
+// 断言就是这么抓出来的）。代价是每个请求多一次 stat，几微秒，换来的是"删文件即生效"。
 //
 // 参数：
 //
@@ -340,10 +337,7 @@ func (n *Node) userTokenUsername(raw string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if name, ok := n.cachedUserToken(raw); ok {
-		return name, nil
-	}
-	if err := n.rescanUserTokens(caPub); err != nil {
+	if err := n.refreshUserTokens(caPub); err != nil {
 		return "", err
 	}
 	if name, ok := n.cachedUserToken(raw); ok {
@@ -353,72 +347,40 @@ func (n *Node) userTokenUsername(raw string) (string, error) {
 		errAPIAuthTokenInvalid, headerAPIToken)
 }
 
-// userTokenCAPub 取用于验签的 CA 公钥。
-//
-// 接收者 n 是本节点实例。公钥从 CA 私钥导出：节点持有 CA 私钥才有资格签发 token，
-// 也才有资格校验它 —— 这条把"谁能发凭据"与"谁能进这个端点"钉成了同一件事。
-//
-// 返回：
-//
-//	ed25519.PublicKey — CA 公钥
-//	error            — 本节点不持有 CA 材料时返回（此时除了 /v1/healthz 一律拒绝）
-func (n *Node) userTokenCAPub() (ed25519.PublicKey, error) {
-	id := n.Id()
-	if id == nil || len(id.CAKey) != ed25519.PrivateKeySize {
-		return nil, fmt.Errorf("%s: 本节点不持有 CA 私钥（security.ca_key_path），无法校验 user token；"+
-			"请让该节点带上 CA 材料（treecmd-node -genkey -keydir keys -with-ca）后重启", errAPIAuthUnavailable)
-	}
-	return id.CAKey.Public().(ed25519.PublicKey), nil
-}
-
-// cachedUserToken 在缓存里查一份 token。
+// refreshUserTokens 在 user/ 目录"变了"时重建 token → 用户名 缓存，没变时只做一次 stat。
 //
 // 接收者 n 是本节点实例。
 //
-// 参数：
-//
-//	raw — token 原文
-//
-// 返回：命中时返回用户名与 true。
-func (n *Node) cachedUserToken(raw string) (string, bool) {
-	n.userMu.Lock()
-	defer n.userMu.Unlock()
-	name, ok := n.userTokens[raw]
-	return name, ok
-}
-
-// rescanUserTokens 重新扫描 user/ 目录，重建 token → 用户名 缓存。
-//
-// 接收者 n 是本节点实例。
-//
-// 【节流】目录 mtime 没变时，两次重扫之间至少隔 userTokenRescanInterval —— 否则未授权的
-// 请求可以靠"错 token"逼着本节点反复读盘（放大攻击）。mtime 一变（例如刚跑了 -adduser）
-// 就是立即重扫，所以正常操作感觉不到这个窗口。
-//
+// 判据是目录 mtime + "目录在不在"这两件事实：任一与上次扫描时不同就重扫。
 // 扫描时逐份用 CA 公钥验签：验不过的文件**不进入缓存**（只记一条 WARN），
-// 于是"往 user/ 目录塞一个自己编的文件"不构成授权。
+// 于是"往 user/ 目录里塞一个自己编的文件"不构成授权 —— 目录权限只是第二道。
+//
+// 为什么不需要节流：能改目录 mtime 的只有本机有权写这个目录的人（= 已经是可信操作者），
+// 而远程攻击者改不动它，所以无法逼着本节点反复读盘 —— 每个请求最多一次 stat。
 //
 // 参数：
 //
 //	caPub — 用于验签的 CA 公钥
 //
-// 返回：目录读不了（除"不存在"外）时返回错误；其余情况（含目录不存在）返回 nil 并清空缓存。
-func (n *Node) rescanUserTokens(caPub ed25519.PublicKey) error {
+// 返回：目录读不了（除"不存在"外）时返回错误；其余情况（含目录不存在）返回 nil 并更新缓存。
+func (n *Node) refreshUserTokens(caPub ed25519.PublicKey) error {
 	dir := n.C().UserDir
 	st, statErr := os.Stat(dir)
-	stamp := time.Time{}
-	if statErr == nil {
+	missing := statErr != nil
+	if missing && !os.IsNotExist(statErr) {
+		return fmt.Errorf("%s: 看不了 user 目录 %s: %w", errAPIAuthUnavailable, dir, statErr)
+	}
+	var stamp time.Time
+	if !missing {
 		stamp = st.ModTime()
 	}
 
 	n.userMu.Lock()
-	changed := statErr != nil || !stamp.Equal(n.userStamp) || !n.userScanned
-	throttled := time.Since(n.userLastScan) < userTokenRescanInterval
-	if !changed && throttled {
-		n.userMu.Unlock()
+	uptodate := n.userScanned && n.userDirMissing == missing && (missing || stamp.Equal(n.userStamp))
+	n.userMu.Unlock()
+	if uptodate {
 		return nil
 	}
-	n.userMu.Unlock()
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -455,9 +417,43 @@ func (n *Node) rescanUserTokens(caPub ed25519.PublicKey) error {
 	n.userTokens = fresh
 	n.userStamp = stamp
 	n.userScanned = true
-	n.userLastScan = time.Now()
+	n.userDirMissing = missing
 	n.userMu.Unlock()
 	return nil
+}
+
+// userTokenCAPub 取用于验签的 CA 公钥。
+//
+// 接收者 n 是本节点实例。公钥从 CA 私钥导出：节点持有 CA 私钥才有资格签发 token，
+// 也才有资格校验它 —— 这条把"谁能发凭据"与"谁能进这个端点"钉成了同一件事。
+//
+// 返回：
+//
+//	ed25519.PublicKey — CA 公钥
+//	error            — 本节点不持有 CA 材料时返回（此时除了 /v1/healthz 一律拒绝）
+func (n *Node) userTokenCAPub() (ed25519.PublicKey, error) {
+	id := n.Id()
+	if id == nil || len(id.CAKey) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("%s: 本节点不持有 CA 私钥（security.ca_key_path），无法校验 user token；"+
+			"请让该节点带上 CA 材料（treecmd-node -genkey -keydir keys -with-ca）后重启", errAPIAuthUnavailable)
+	}
+	return id.CAKey.Public().(ed25519.PublicKey), nil
+}
+
+// cachedUserToken 在缓存里查一份 token。
+//
+// 接收者 n 是本节点实例。
+//
+// 参数：
+//
+//	raw — token 原文
+//
+// 返回：命中时返回用户名与 true。
+func (n *Node) cachedUserToken(raw string) (string, bool) {
+	n.userMu.Lock()
+	defer n.userMu.Unlock()
+	name, ok := n.userTokens[raw]
+	return name, ok
 }
 
 // readUserTokenFile 读一份 token 文件（去空白、封顶 userTokenMaxFileBytes）。
