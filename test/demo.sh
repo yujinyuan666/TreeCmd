@@ -137,24 +137,42 @@ run_bin() {
   printf '%s' "${dir}/treecmd-node"
 }
 
-start_one() {   # $1=名字 $2=目录
-  local name="$1" dir="$2"
-  "$(run_bin "${dir}")" -config "${dir}/node.yaml" > "${LOGS}/${name}.log" 2>&1 &
+# start_node <名字> <目录> [二进制参数...]
+#
+# 【日志必须由**父进程**先清空】不能写成 `> "${LOGS}/${name}.log"` 让子进程去截断：
+# 重定向是在 fork 出来的子进程里做的，而父进程 `start_node` 一返回，调用方立刻就用
+# `grep` 去读那份日志了 —— 两者在竞速。子进程还没轮到调度时（这个二进制 20MB，exec 之前
+# 先要把它读进来），文件里还是**上一轮**的内容，于是：
+#   · `wait_registered` 会命中上一轮的 `msg=registered`，当场报"成功"，而节点其实还没入网
+#     （"假的 ✓"比没有 ✓ 更坏 —— 它会掩盖真正的失败）；
+#   · 更要命的是第 ③ 步要从 relay.log 里读中继自己的 NodeID：读到上一轮的，就会把
+#     leaf-beta 的 parents[].id 写成**上一轮中继**的 ID。中继 NodeID 是每轮新生成的
+#     UUIDv7，于是叶子之后一直以
+#     `peer identity "<本轮>" != expected "<上一轮>"` 入网失败 —— 而且 demo/ 与 logs/ 都
+#     清干净了也一样，因为污染来自 logs/ 里上一轮留下的**文件内容**，不是目录结构。
+#     （在 openEuler aarch64 上实测踩到过。）
+# 父进程先 `: >` 清空、子进程 `>>` 追加，这个窗口就不存在了。
+start_node() {
+  local name="$1" dir="$2"; shift 2
+  : > "${LOGS}/${name}.log"
+  "$(run_bin "${dir}")" "$@" -config "${dir}/node.yaml" >> "${LOGS}/${name}.log" 2>&1 &
   echo "${name}:$!" >> "${PIDFILE}"
 }
-start_one_debug() {  # 名字 目录 —— 带 debug 级（控制台里看后台任务用）
-  local name="$1" dir="$2"
-  "$(run_bin "${dir}")" -log-level debug -config "${dir}/node.yaml" > "${LOGS}/${name}.log" 2>&1 &
-  echo "${name}:$!" >> "${PIDFILE}"
-}
-wait_registered() {  # $1=日志文件 $2=超时秒 $3=说明
+start_one()       { start_node "$1" "$2"; }                  # 普通级
+start_one_debug() { start_node "$1" "$2" -log-level debug; } # debug 级（控制台里看后台任务用）
+
+# wait_registered <日志文件> <超时秒> <说明> —— 等到了返回 0，超时返回**非零**。
+#
+# 失败**必须**能被调用方看见：这里出问题时后面的每一步都没有意义（树都不完整），
+# 而"报个 warn 然后继续跑"会让真正的失败在下游以完全不相干的样子冒出来（踩过）。
+wait_registered() {
   local f="$1" t="${2:-20}" what="${3:-注册}"
   for _ in $(seq 1 $((t * 2))); do
     grep -q 'msg=registered' "$f" 2>/dev/null && { ok "${what}成功"; return 0; }
     sleep 0.5
   done
   warn "${what}超时（${t}s）—— 看 ${f}"
-  return 0
+  return 1
 }
 
 cmd_start() {
@@ -188,28 +206,40 @@ cmd_start() {
   prepare_child "${DEMO}/leaf1" no
   write_config "${DEMO}/leaf1" "leaf-alpha" "根的直接子" "" "${ROOT_LISTEN}"
   start_one leaf1 "${DEMO}/leaf1"
-  wait_registered "${LOGS}/leaf1.log" 20 "leaf-alpha 入网并注册"
+  wait_registered "${LOGS}/leaf1.log" 20 "leaf-alpha 入网并注册" \
+    || die "leaf-alpha 没入网/没注册 —— 树不完整，后面的断言没有意义（看 ${LOGS}/leaf1.log）"
 
   echo "③ 中继（自带 listen，会向根申请自己的 CA 证书）"
   prepare_child "${DEMO}/relay" yes
   write_config "${DEMO}/relay" "relay-mid" "中间层，有下级" "${RELAY_LISTEN}" "${ROOT_LISTEN}"
   start_one relay "${DEMO}/relay"
-  wait_registered "${LOGS}/relay.log" 20 "relay-mid 入网并注册"
+  wait_registered "${LOGS}/relay.log" 20 "relay-mid 入网并注册" \
+    || die "relay-mid 没入网/没注册 —— 树不完整（看 ${LOGS}/relay.log）"
   # 中继的 node.id 是它自己生成的（UUIDv7），下级要把这个 ID 写进 parents[].id。
-  # 取日志里**第一个** node_id=（它一定是本节点自己的：启动第一件事就是打印 node.id 的来源）
-  RELAY_ID="$(grep -o 'node_id=[0-9a-f-]\{36\}' "${LOGS}/relay.log" | head -1 | cut -d= -f2)"
+  #
+  # 【取法】优先问中继自己的 API：`/v1/healthz` 是**唯一免 token 的端点**（存活探针），
+  # 回的正是它自己的 node_id —— 这是权威来源，不受任何日志内容影响。日志只做兜底。
+  # 曾经这里只从 relay.log 里 grep 第一个 `node_id=`；而那份文件在本轮子进程完成截断
+  # 之前还留着上一轮的内容，于是读到了**上一轮中继**的 ID（见 start_node 的注释）。
+  RELAY_ID="$(curl -s --noproxy '*' --max-time 3 "http://${RELAY_API}/v1/healthz" 2>/dev/null \
+              | sed -n 's/.*"node_id":"\([0-9a-f-]\{36\}\)".*/\1/p')"
   if [ -z "${RELAY_ID}" ]; then
-    # 兜底：从运行期状态文件里读（state.dat 的 self.id）
+    # 兜底一：日志里**第一个** node_id=（启动第一件事就是打印 node.id 的来源；此时已确认注册过）
+    RELAY_ID="$(grep -o 'node_id=[0-9a-f-]\{36\}' "${LOGS}/relay.log" 2>/dev/null | head -1 | cut -d= -f2)"
+  fi
+  if [ -z "${RELAY_ID}" ]; then
+    # 兜底二：从运行期状态文件里读（state.dat 的 self.id）
     RELAY_ID="$(grep -o '"id":"[0-9a-f-]\{36\}"' "${DEMO}/relay/state.dat" 2>/dev/null | head -1 | sed 's/.*"id":"//;s/"//')"
   fi
-  [ -n "${RELAY_ID}" ] || die "读不到中继的 node_id（看 ${LOGS}/relay.log）"
+  [ -n "${RELAY_ID}" ] || die "读不到中继的 node_id（看 http://${RELAY_API}/v1/healthz 与 ${LOGS}/relay.log）"
   ok "中继 NodeID = ${RELAY_ID}"
 
   echo "④ 中继下的叶子（凑出 3 层，健康扫描才有意义）"
   prepare_child "${DEMO}/leaf2" no
   write_config "${DEMO}/leaf2" "leaf-beta" "挂在中继下面" "" "${RELAY_LISTEN}" "${RELAY_ID}"
   start_one leaf2 "${DEMO}/leaf2"
-  wait_registered "${LOGS}/leaf2.log" 20 "leaf-beta 入网并注册"
+  wait_registered "${LOGS}/leaf2.log" 20 "leaf-beta 入网并注册" \
+    || die "leaf-beta 没入网/没注册（3 层树不完整）—— 看 ${LOGS}/leaf2.log 里的 enroll 失败原因"
 
   echo "⑤ 控制台"
   # 控制台是"从本机代理到本机 API"的通道，而端点**没有免签来源**（含回环）——
@@ -262,14 +292,32 @@ cmd_start() {
 
 cmd_stop() {
   if [ ! -f "${PIDFILE}" ]; then info "没有在跑的演示（${PIDFILE} 不存在）"; return 0; fi
+  local name pid
   while IFS=: read -r name pid; do
+    [ -n "${pid}" ] || continue
     if kill -0 "${pid}" 2>/dev/null; then
-      kill -TERM "${pid}" 2>/dev/null && ok "已停止 ${name} (pid ${pid})"
+      if kill -TERM "${pid}" 2>/dev/null; then ok "已停止 ${name} (pid ${pid})"; fi
     else
       info "${name} 早已退出"
     fi
   done < "${PIDFILE}"
+
+  # 【等它们真的退出，再返回】TERM 只是"请求"：进程还要走优雅收尾（断 gRPC、落盘 state.dat）。
+  # 不等的话，`demo.sh stop` 一返回，上一轮节点可能还在跑：它仍然占着 19493/19494，
+  # 也还握着 logs/*.log 的 fd。紧接着的一轮 `rm -rf demo` + `demo.sh start` 就会和它对撞 ——
+  # 表现为端口被占、日志被旧进程写花，而验收脚本报出来的失败全是噪声（根因藏在别处）。
+  # 收不住就 KILL 兜底：这里要的是"确定性地把地清干净"，不是"客气地告别"。
+  while IFS=: read -r name pid; do
+    [ -n "${pid}" ] || continue
+    for _ in $(seq 1 60); do kill -0 "${pid}" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "${pid}" 2>/dev/null; then
+      warn "${name} 不响应 TERM，已 KILL (pid ${pid})"
+      kill -KILL "${pid}" 2>/dev/null || true
+      for _ in $(seq 1 20); do kill -0 "${pid}" 2>/dev/null || break; sleep 0.1; done
+    fi
+  done < "${PIDFILE}"
   rm -f "${PIDFILE}"
+  return 0   # 上面几条 `kill -0 ... && ...` 在进程刚消失时可能返回非零，别让 set -e 借此引爆
 }
 
 cmd_status() {
