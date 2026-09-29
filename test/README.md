@@ -62,6 +62,46 @@ Python 3（系统自带的 3.9 就能跑）与一个能访问到的 treecmd 根�
 目标机上没有 Go 工具链也能跑 —— 前提是 `bin/` 下有开发机交叉编译好的产物，
 详见下面《目标机不装 Go 怎么跑（`lib/prebuilt.sh`）》。
 
+## 一条命令跑完全部验收（`run_all.sh`）
+
+```bash
+cd test
+
+./run_all.sh                # 跑全部 12 套，逐个存日志
+./run_all.sh --list         # 只列名字（api_manual uuid_v4 script … selfupdate）
+./run_all.sh enroll-policy api-auth    # 只跑指定几套
+```
+
+产物落在 `${RUNLOG_DIR}`（默认 `test/.runlogs`，已被 gitignore）：
+
+| 文件 | 是什么 |
+|---|---|
+| `<名字>.log` | 每套的完整输出（带 ANSI 色；`perl -pe 's/\e\[[0-9;]*m//g'` 可去色） |
+| `SUMMARY.txt` | 环境指纹（主机 / 系统 / 架构 / 四份产物的哈希）+ **逐套 rc、耗时、断言条数** |
+| `${RUNLOG_TARBALL}` | 上面整个目录的 `tar.gz`（默认 `/tmp/treecmd-runlogs.tar.gz`；传回开发机复盘用） |
+
+**退出码可以直接当门禁**：全部 rc=0 时退 0，任一套非 0 时退 1。
+
+跑之前会做一次**只读**的产物检查（不代编 —— "产物从哪来"是各套脚本通过 `lib/prebuilt.sh`
+自己决定的事），把 `bin/treecmd-node` / `.v1` / `.v2` / `ca-rotate` 的在否与哈希打出来。
+缺产物**当场就说**，而不是等某一套红了才发现 —— 后者看起来像"功能坏了"。
+
+> **为什么值得单独有一个驱动脚本**：各套脚本自己都是自包含的（各自起树、自己收尾），
+> 但**串起来跑**时会出现只在"上一套刚跑完"这一刻才有的问题，最要紧的是
+> `demo/root/state.dat` —— 它记着"这个根历史上注册过哪些子节点"，而 `demo.sh start`
+> 每次都会给子节点换一批 NodeID（`prepare_child` 重新 genkey）⇒ 上一轮那批变成
+> **永远不上报的死人**。指令要等**所有登记过的子**都落终态，死人会把每条指令一路拖到期限：
+> 第一次串起来跑时 `api_manual` 的 4 条聚合指令各等了 40 秒（`wait_done` 超时），
+> 而程序完全正常 —— **"跑得慢"于是被误读成"功能坏了"**。
+>
+> 所以每套开跑前把 `demo/`、`logs/`、`.demo.pids` 一起挪走。用 `mv` 挪到
+> `${TMPDIR:-/tmp}/tc-run-trash-<SECONDS>-<pid>/` 而不是 `rm`：**现场留下来便于回查**，
+> 每次挪到带后缀的目录，反复跑也不互相覆盖。Ctrl-C 时会先停树再退出
+> （否则残留的节点占着 18493/19493，下一套起不来，表现成"端口被占"的假失败）。
+
+> SUMMARY 里刻意**同时记 rc 和断言条数**：只看 rc 的话，"跑了但一条断言都没执行"和
+> "全过"是同一个 0 —— 没测到伪装成测过了，正是本目录最想避免的事。
+
 ## 可执行文件自同步怎么验（`selfupdate.sh`）
 
 控制台看的是"树跑得对不对"；`selfupdate.sh` 看的是另一件事：**子节点跑的是不是父那一份镜像**。
@@ -391,6 +431,9 @@ treecmd 的实际部署形态是**只拷运行时**：目标机上只有预编�
 | `bin/treecmd-node` | 主镜像 | 所有脚本（`ensure_node_bin` / `require_node_bin`） |
 | `bin/treecmd-node.v1` / `.v2` | 两份**字节不同**的镜像（只差 `-ldflags -X …Version=`） | `selfupdate.sh`（`ensure_variant`） |
 | `bin/ca-rotate` | CA 证书做旧工具 | `ca-rotate.sh`（`ca_rotate_helper`） |
+
+`run_all.sh` 开跑前会拿这份清单做一次**只读**检查（只验在否与哈希，不代编）——
+缺哪份、谁会用到它，都在开跑之前说清楚。
 
 在开发机上交叉编译（**目标机零编译**）：
 

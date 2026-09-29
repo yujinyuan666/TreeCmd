@@ -133,6 +133,9 @@ test/.enroll-policy.pids
 # 一个根节点（api 刻意绑 0.0.0.0）、它的共享密钥与日志、pid 表。
 test/apiauth/
 test/.apiauth.pids
+# test/run_all.sh（把上面这些串起来跑一遍的驱动）的运行产物：
+# 每套一份完整日志 + SUMMARY.txt（环境指纹与逐套 rc）+ 打包用的 .idem.json。
+test/.runlogs/
 
 
 # ---------------------------------------------------------------------------
