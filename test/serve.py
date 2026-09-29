@@ -10,10 +10,17 @@
 并把 `__target` 从转发出去的请求里剥掉。默认**只允许转发到本机**
 （127.0.0.1 / localhost / ::1），确需指向远程节点时加 `--allow-any-host`。
 
+【必须给 token】节点的对外 HTTP 端点**没有免签来源**（见 internal/node/usertoken.go），
+所以这个代理也得替浏览器出示凭据：用 `--token-file` 指一份 token（节点目录里的
+`user/<用户名>`，用 `treecmd-node -config node.yaml -adduser <用户名>` 签发），
+代理会给每个转发出去的请求加上 `X-Treecmd-Token`。
+页面自己不做鉴权 —— 凭据留在服务端，浏览器里看不到它。
+
 用法：
     python3 serve.py                                  # 端口 8899，默认目标 127.0.0.1:18443
     python3 serve.py --port 9000 --target 127.0.0.1:18493
     python3 serve.py --allow-any-host                 # 允许把 /api 转发到任意主机
+    python3 serve.py --token-file demo/root/user/alice # 带上凭据（不带则页面全是 401）
 """
 
 # 让所有注解都延迟求值：这样 `dict | None` 这种 3.10+ 写法在 3.7~3.9 上也能跑
@@ -46,6 +53,8 @@ LOOPBACK = {"127.0.0.1", "localhost", "::1", "[::1]"}
 
 DEFAULT_TARGET = "127.0.0.1:18443"
 ALLOW_ANY_HOST = False
+# API_TOKEN 转发时附上的凭据（`user/<用户名>` 文件内容）；空 = 不带（页面会收到 401）
+API_TOKEN = ""
 # 健康扫描可能很慢（depth=-1 全树逐跳），给足超时
 PROXY_TIMEOUT = 90.0
 
@@ -134,6 +143,9 @@ class Handler(BaseHTTPRequestHandler):
         ct = self.headers.get("Content-Type")
         if ct:
             req.add_header("Content-Type", ct)
+        # 端点没有免签来源：凭据由服务端代出示（页面 / 浏览器不需要知道 token）
+        if API_TOKEN:
+            req.add_header("X-Treecmd-Token", API_TOKEN)
         try:
             with urllib.request.urlopen(req, timeout=PROXY_TIMEOUT) as resp:
                 self._send(resp.status, resp.read(),
@@ -184,10 +196,22 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8899)
     ap.add_argument("--target", default=DEFAULT_TARGET, help="默认的 treecmd 根节点 API 地址 host:port")
     ap.add_argument("--allow-any-host", action="store_true", help="允许把 /api 转发到非本机地址")
+    ap.add_argument("--token-file", default=None,
+                    help="user token 文件（节点目录里的 user/<用户名>）；不带则页面请求会被 401 拒绝")
     args = ap.parse_args()
 
+    global API_TOKEN
     DEFAULT_TARGET = args.target
     ALLOW_ANY_HOST = args.allow_any_host
+    if args.token_file:
+        try:
+            with open(args.token_file, "r", encoding="utf-8") as fh:
+                API_TOKEN = fh.read().strip()
+        except OSError as exc:
+            raise SystemExit(f"读不到 token 文件 {args.token_file}：{exc}\n"
+                             f"签发：treecmd-node -config <节点>/node.yaml -adduser <用户名>")
+        if not API_TOKEN:
+            raise SystemExit(f"token 文件 {args.token_file} 是空的")
     port = pick_port(args.port)
 
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
@@ -197,6 +221,7 @@ def main() -> None:
     print(f"  控制台   http://127.0.0.1:{port}/")
     print(f"  默认目标 {DEFAULT_TARGET}（页面上可随时改）")
     print(f"  转发限制 {'任意主机' if ALLOW_ANY_HOST else '仅本机（需要就加 --allow-any-host）'}")
+    print(f"  凭据     {'已带上（--token-file）' if API_TOKEN else '**没带** —— 页面请求会被 401 拒绝，加 --token-file'}")
     print("  Ctrl-C 退出")
     try:
         srv.serve_forever()

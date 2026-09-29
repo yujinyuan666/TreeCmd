@@ -212,10 +212,31 @@ cmd_start() {
   wait_registered "${LOGS}/leaf2.log" 20 "leaf-beta 入网并注册"
 
   echo "⑤ 控制台"
+  # 控制台是"从本机代理到本机 API"的通道，而端点**没有免签来源**（含回环）——
+  # 所以先给控制台签一份自己的凭据（用户名 demo-console），让代理转发出示它。
+  # 用 -force：demo 会反复 start，已存在就换一份，保证和当前这棵树的 CA 匹配。
+  if [ -f "${DEMO}/root/node.yaml" ]; then
+    if "${BIN}" -config "${DEMO}/root/node.yaml" -adduser demo-console -force >/dev/null 2>&1; then
+      CONSOLE_TOKEN_FILE="${DEMO}/root/user/demo-console"
+      ok "已为控制台签发凭据（${CONSOLE_TOKEN_FILE}）"
+    else
+      warn "为控制台签发凭据失败 —— 页面上的请求会收到 401（可手动 -adduser demo-console）"
+      CONSOLE_TOKEN_FILE=""
+    fi
+  else
+    CONSOLE_TOKEN_FILE=""
+  fi
   if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:${CONSOLE_PORT}/" 2>/dev/null; then
     ok "控制台已在 :${CONSOLE_PORT} 上跑着，不再重复启动"
   else
-    nohup /usr/bin/python3 "${HERE}/serve.py" --port "${CONSOLE_PORT}" --target "${ROOT_API}" \
+    # 参数用数组拼（别用 ${VAR:+--token-file "$VAR"} 那种写法：展开里的引号不是引号，
+    # 会被当字面量；而且 macOS 自带 bash 3.2 上空数组配 set -u 会报未绑定）。
+    CONSOLE_ARGS=(--port "${CONSOLE_PORT}" --target "${ROOT_API}")
+    # 用 if 而不是 `[ ... ] && ...`：后者在条件为假时返回非零，会被 set -e 当场引爆。
+    if [ -n "${CONSOLE_TOKEN_FILE}" ]; then
+      CONSOLE_ARGS+=(--token-file "${CONSOLE_TOKEN_FILE}")
+    fi
+    nohup /usr/bin/python3 "${HERE}/serve.py" "${CONSOLE_ARGS[@]}" \
       > "${LOGS}/console.log" 2>&1 &
     echo "console:$!" >> "${PIDFILE}"
     sleep 1.2
