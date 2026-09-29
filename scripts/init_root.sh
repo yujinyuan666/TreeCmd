@@ -201,20 +201,36 @@ ok "CA 密钥对 keys/ca 和 keys/ca.pub"
 # ── ② 自签 CA 证书：全树信任锚 ──
 echo
 echo "② 自签 CA 证书（certs/ca.crt）"
+TMP="$(mktemp -d)"
+trap 'rm -rf "${TMP}"' EXIT
 # CN 只需"包含" nodeID（程序校验 CA 证书时用的是 strings.Contains）
-openssl req -new -x509 -key "${DIR}/keys/ca" -sha512 \
+#
+# 这里刻意走"CSR + x509 -req -extfile"，而不是 `openssl req -new -x509 -addext …`：
+# `-addext` 是把扩展**追加**到系统 openssl.cnf 里 `[req] x509_extensions` 指向的那一节
+# （RHEL 系发行版——RHEL/CentOS/Fedora/openEuler——配置里就是 `[v3_ca]`，自带
+# basicConstraints/SKID/AKID），于是 basicConstraints 被写进去两次。macOS 的 openssl 配置
+# 没有 x509_extensions，所以本地一直没暴露。而 **Go 的 crypto/x509 对重复扩展是硬报错**：
+#     REFUSE TO START: … x509: certificate contains duplicate extension with OID "2.5.29.19"
+# 显式给 -extfile 就与系统配置完全无关，扩展严格等于下面这份清单（叶子走的是同一套路）。
+cat > "${TMP}/ca.cnf" <<EOF
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer
+EOF
+openssl req -new -key "${DIR}/keys/ca" -out "${TMP}/ca.csr" \
+  -subj "/O=treecmd/CN=${NODE_ID}-root-ca" 2>/dev/null
+# 不给 -sha512：Ed25519 的摘要算法是固定的（内部就是 SHA-512），显式指定反而有害 ——
+# OpenSSL 1.1.1 上 `x509 -req -signkey <ed25519> -sha512` 会报
+# `elliptic curve routines:pkey_ecd_ctrl:invalid digest type` 并以非零码退出（RHEL 系默认就是 1.1.1）。
+openssl x509 -req -in "${TMP}/ca.csr" -signkey "${DIR}/keys/ca" \
   -out "${DIR}/certs/ca.crt" -days "${CA_DAYS}" \
-  -subj "/O=treecmd/CN=${NODE_ID}-root-ca" \
-  -addext "basicConstraints=critical,CA:TRUE" \
-  -addext "keyUsage=critical,keyCertSign,cRLSign" \
-  -addext "subjectKeyIdentifier=hash" 2>/dev/null
+  -extfile "${TMP}/ca.cnf" 2>/dev/null
 ok "CA 证书 certs/ca.crt（CA:TRUE + keyCertSign，有效期 ${CA_DAYS} 天）"
 
 # ── ③ 用 CA 给根自己的身份公钥签身份证书 ──
 echo
 echo "③ 签发根的身份证书（certs/node.crt）"
-TMP="$(mktemp -d)"
-trap 'rm -rf "${TMP}"' EXIT
 # CN 必须"恰好等于" nodeID：程序取证书身份时优先取 CN（CN 空才回退 SAN 的 spiffe:// 末段）
 openssl req -new -key "${KEY}" -out "${TMP}/leaf.csr" -subj "/O=treecmd/CN=${NODE_ID}" 2>/dev/null
 cat > "${TMP}/leaf.cnf" <<EOF
