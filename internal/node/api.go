@@ -69,7 +69,7 @@ func (n *Node) StartAPI() error {
 			MinVersion:         t.MinTLSVersion(),
 			GetConfigForClient: rel.ConfigFor,
 		})
-		n.apiTLS = rel // 通道绑定要读它的叶子证书哈希
+		n.apiTLS = rel // 供 SIGUSR1 触发的证书重载与状态展示
 		scheme = "https"
 	}
 	n.apiSrv = srv

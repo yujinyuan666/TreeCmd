@@ -3,13 +3,11 @@
 package config
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -679,24 +677,28 @@ type PersistSection struct {
 }
 
 // APISection 对外 HTTP 端点（只有中继 / 根才开）。
+//
+// 【访问控制】这个端点**不设免签路径**（历史上有过"回环免签 + HMAC 共享密钥"，已废弃：
+// 反向代理 / 端口转发会把所有请求的对端改写成 127.0.0.1，免签等于对全网放行）。现在的唯一
+// 凭据是 **CA 签名的 user token**：`treecmd-node -adduser <用户名> -config node.yaml` 用
+// 本节点 CA（security.ca_key_path）签发，落盘在节点目录的 `user/<用户名>`（文件内容即
+// token，权限 600）。请求必须带 `X-Treecmd-Token: <token>`，服务端在 user 目录里找、
+// 找到就缓存、找不到一律 403 —— 详见 internal/node/usertoken.go 与 internal/node/apiauth.go。
 type APISection struct {
-	HTTPAddr string         `yaml:"http_addr"`
-	Auth     APIAuthSection `yaml:"auth"`
-	TLS      APITLSSection  `yaml:"tls"`
+	HTTPAddr string        `yaml:"http_addr"`
+	TLS      APITLSSection `yaml:"tls"`
 }
 
 // APITLSSection 对外 HTTP 端点的 TLS 配置（**默认明文**，与历史行为一致）。
 //
-// 【为什么要有它】HMAC 签名只解决"谁有权动手"，解决不了三个问题：
+// 【为什么要有它】user token 只解决"谁有权动手"，解决不了三个问题：
 //
-//  1. **没有保密性** —— 指令内容、结果、拓扑在链路上是明文；
-//  2. **没有服务器认证** —— 客户端不知道自己连的是不是真节点，响应也可以被伪造 / 篡改
-//     （签名只覆盖请求，响应是裸的）；
-//  3. **挡不住链路内中继** —— 中间人可以把在途请求原样转发给别的节点再执行一次
-//     （防重放的 nonce 表是**每节点**一份，跨节点不共享）。
+//  1. **没有保密性** —— token 本身随每个请求上线，指令内容、结果、拓扑在链路上是明文；
+//  2. **没有服务器认证** —— 客户端不知道自己连的是不是真节点，响应也可以被伪造 / 篡改；
+//  3. **挡不住窃听重放** —— token 是长期凭据，明文链路上被抄走即可原样重放。
 //
-// 这三条里有两条只能靠 TLS 解决。开了它之后，`api.auth` 的 HMAC 仍然照常工作（身份 +
-// 请求完整性 + 防重放），两者是叠加而不是替代。
+// 这三条都得靠 TLS 解决。对外（跨不可信网络）暴露这个端口时，请配 cert_path / key_path，
+// 建议叠加 require: true（明文请求一律拒绝，含回环来源）。
 //
 // 【热重载】证书 / 密钥 / 客户端 CA 每次握手前按文件 mtime 检查一次，变了就重新加载 ⇒
 // 换证书不必重启进程（与 security.cert_reload 同一口径）。
@@ -706,12 +708,9 @@ type APITLSSection struct {
 	// CAPath 校验**客户端**证书的 CA（文件或目录，目录扫 *.crt/*.pem）。client_auth 不为 off 时必需。
 	CAPath string `yaml:"ca_path"`
 	// ClientAuth 客户端证书策略：off（默认，不要求）| optional（要了就验）| require（必须有且必须验过）。
+	// 注意：客户端证书只作为**传输层**加固（mTLS），不替代 user token —— 授权判据始终是
+	// X-Treecmd-Token（"出示了证书就免 token"这种隐式放宽是不允许的）。
 	ClientAuth string `yaml:"client_auth"`
-	// TrustClientCert true = 出示了被 CAPath 验过的客户端证书即视为已认证（**免 HMAC**）。
-	//
-	// 默认 false（不隐式放宽）：证书再叠加 HMAC，两者都要。改成 true 的理由是" TLS 已经把
-	// 客户端身份钉死了，再让运维机保管一份共享密钥是纯负担" —— 那是**显式**的取舍，不该是默认值。
-	TrustClientCert bool `yaml:"trust_client_cert"`
 	// Require true = 这个端点**只以 HTTPS 提供**：明文请求一律拒绝（**含回环来源**）。
 	//
 	// 为什么连回环也要管：TLS 终止型反向代理（代理对外 HTTPS、回源走明文 HTTP）会把远程请求
@@ -765,196 +764,6 @@ func (t *APITLSSection) MinTLSVersion() uint16 {
 	return tls.VersionTLS12
 }
 
-// APIAuthSection 对外 HTTP 端点的访问控制（只作用于**写操作**，见 internal/node/apiauth.go）。
-//
-// 【为什么要它】`api.http_addr` 可以写成 `0.0.0.0`，而写接口里有几个**不可逆**的运维动作：
-// `POST /v1/crl` 吊销节点、`POST /v1/forget` 一条事务删注册表 / 水位 / 驱逐归档 / 结果副本、
-// `POST /v1/commands` 让整棵子树执行指令。没有访问控制时，任何能连上这个端口的人都能执行它们。
-//
-// 【口径】两条规则，前一条命中就不再往下判：
-//
-//  1. **来自回环地址**（127.0.0.1 / ::1）的请求一律放行 —— 本机运维脚本、控制台代理、
-//     `curl localhost:...` 全部零改动；
-//  2. **其它来源的写请求必须带 HMAC 签名**，密钥就是本段配的共享密钥。
-//     **没配密钥 ⇒ 非回环的写请求一律拒绝**（fail-closed，不是"没配就放行"）。
-//
-// 为什么不做成"一律要密钥"：本项目的 HTTP 端点没有 TLS（明文，除非配了 api.tls），共享密钥
-// 只解决"谁有权动手"，解决不了窃听；而本机运维是绝对主路径，给它免签可以避免"把密钥投放到
-// 每台机器"这种纯负担。要远程运维就配密钥（推荐 secret_path，权限 600）+ 用 scripts/api_call.py 签。
-//
-// 【回环免签为什么还要收紧】"来自回环"的判据是 **TCP 对端地址**，而它会被部署形态改写：
-// API 端口前面一旦挂了反向代理 / 端口转发（nginx、ssh -L、frpc、`kubectl port-forward`…），
-// 所有远程请求的对端都变成 127.0.0.1，第 1 条豁免就等于对全网放行。所以免签要同时满足：
-//
-//	· `loopback_bypass` 没被显式关掉；
-//	· 请求**没有转发特征头**（带了 Forwarded / X-Forwarded-For / X-Real-IP / Via 的对端
-//	  若不在 `trusted_proxies` 里，就不算"本机"—— 本机 curl 不会带这些头）；
-//	· 剥掉可信代理跳之后得到的真实来源仍是回环（见 `trusted_proxies`）。
-//
-// 密钥**不进 config_hash**（`api.*` 本来就不在 6.1 白名单里），且请求时现读文件 ⇒
-// 换密钥既不用重启、也不用 SIGHUP。
-type APIAuthSection struct {
-	Secret       string `yaml:"secret"`        // 共享密钥（与 secret_path 二选一）
-	SecretPath   string `yaml:"secret_path"`   // 从文件读；**优先于 secret**（便于脚本投放与轮换）
-	ProtectReads bool   `yaml:"protect_reads"` // true = 读接口（/v1/tree、/v1/health、结果查询、/metrics）也要签名
-
-	// LoopbackBypass 回环免签开关：**nil（没写）= true**，保持历史行为；显式写 false 时
-	// 回环来源也照常走签名（"本机"不再是一种授权）。
-	//
-	// 为什么用指针：**默认值必须是 true**（存量部署的 `curl localhost` 不能因为升级就 401），
-	// 而 bool 的零值是 false —— 用 nil 表示"没写"才能把"没写"与"写了 false"区分开。
-	LoopbackBypass *bool `yaml:"loopback_bypass"`
-
-	// TrustedProxies 可信代理白名单（CIDR 或裸 IP）。**默认空 = 一个都不信**：此时任何
-	// X-Forwarded-For / Forwarded 头都被忽略（既能防伪造，也能让"回环 + 转发头"这一
-	// 反代特征直接失去免签资格）。
-	//
-	// 配了之后（如 `["127.0.0.1/32", "::1/128"]`）：只有**对端**落在白名单里，才按 RFC 7239
-	// 从右往左剥掉可信跳，取第一个不可信的作为真实来源。于是"API 前面挂了本地反代"这种
-	// 部署既能继续用，又不会把远程请求误判成本机请求。
-	TrustedProxies []string `yaml:"trusted_proxies"`
-
-	// ChannelBinding 通道绑定策略（防"中间人把在途请求转发到别的连接 / 别的节点再执行一次"）：
-	//
-	//   · auto（默认）—— 走 TLS 时**要求**请求声明并匹配通道绑定值；明文时无法计算，不要求；
-	//   · require    —— 一律要求 ⇒ 明文请求根本拿不到绑定值，等于"签名只在 HTTPS 上可用"；
-	//   · off        —— 不校验（客户端不会算 / 前面是 TLS 终止代理时）。
-	ChannelBinding string `yaml:"channel_binding"`
-
-	// BindHost 是否把 Host 头纳入签名：**nil（没写）= true**。
-	//
-	// 作用：同一份签名换个主机名投出去就失效（挡"把签好的请求投到别的虚拟主机 / 别的入口"）。
-	// 前面是**会改写 Host 的反向代理**时要显式写 false —— 那时代理看到的目标名与客户端签的不同。
-	BindHost *bool `yaml:"bind_host"`
-}
-
-// ChannelBindingMode 归一化通道绑定策略。
-//
-// 接收者 a 是 api.auth 段的配置。
-//
-// 返回：
-//
-//	string — "off" / "auto" / "require"；没写按 "auto"。**写成别的（含拼错）按 "require"**：
-//	        配置文件里的拼错不该悄悄退化成"不校验"，宁可让调用方立刻收到 401 去查配置。
-func (a *APIAuthSection) ChannelBindingMode() string {
-	switch strings.ToLower(strings.TrimSpace(a.ChannelBinding)) {
-	case "", "auto":
-		return "auto"
-	case "off":
-		return "off"
-	default:
-		return "require"
-	}
-}
-
-// HostBound 报告 Host 头是否参与签名。
-//
-// 接收者 a 是 api.auth 段的配置。
-//
-// 返回：
-//
-//	bool — 没写（nil）或显式写 true 时为 true
-func (a *APIAuthSection) HostBound() bool {
-	return a.BindHost == nil || *a.BindHost
-}
-
-// LoopbackBypassEnabled 报告回环免签是否开启。
-//
-// 接收者 a 是 api.auth 段的配置。
-//
-// 返回：
-//
-//	bool — 没写（nil）或显式写 true 时为 true；显式写 false 时为 false
-func (a *APIAuthSection) LoopbackBypassEnabled() bool {
-	return a.LoopbackBypass == nil || *a.LoopbackBypass
-}
-
-// TrustsProxy 判断某个对端地址是否在可信代理白名单内。
-//
-// 接收者 a 是 api.auth 段的配置。**每次调用重新解析 CIDR**：白名单通常只有一两条，
-// 这点开销可以忽略，换来的是不必在配置对象上维护"解析后的副本"（避免 SIGHUP 重载时的
-// 状态同步问题）。
-//
-// 参数：
-//
-//	host — 裸主机（"127.0.0.1" / "::1"），带端口或方括号也认
-//
-// 返回：
-//
-//	bool — 命中白名单时 true；白名单为空、host 解析不出 IP、或 CIDR 写错时一律 false（宁严不宽）
-func (a *APIAuthSection) TrustsProxy(host string) bool {
-	ip := parseIPHost(host)
-	if ip == nil {
-		return false
-	}
-	for _, cidr := range a.TrustedProxies {
-		_, netw, err := net.ParseCIDR(strings.TrimSpace(cidr))
-		if err != nil {
-			// 裸 IP 也接受：补成单地址网段（IPv4 /32、IPv6 /128）
-			if single := net.ParseIP(strings.TrimSpace(cidr)); single != nil {
-				if single.Equal(ip) {
-					return true
-				}
-			}
-			continue
-		}
-		if netw.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
-
-// parseIPHost 把一个主机字段解析成 IP（兼容带端口 / 带方括号的写法）。
-//
-// 参数：
-//
-//	host — 形如 "127.0.0.1"、"127.0.0.1:54321"、"[::1]:54321" 的字段
-//
-// 返回：
-//
-//	net.IP — 解析结果；解析不出来时返回 nil
-func parseIPHost(host string) net.IP {
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-	host = strings.Trim(host, "[]")
-	return net.ParseIP(host)
-}
-
-// Configured 报告是否配了共享密钥（两个来源有一个非空即算配了）。
-//
-// 接收者 a 是 api.auth 段的配置。
-//
-// 返回：
-//
-//	bool — secret 或 secret_path 非空时为 true
-func (a *APIAuthSection) Configured() bool {
-	return a.Secret != "" || a.SecretPath != ""
-}
-
-// SecretBytes 取共享密钥的原始内容（不做任何解析，去掉首尾空白）。
-//
-// 接收者 a 是 api.auth 段的配置。`secret_path`（文件）优先于 `secret`（直接写在配置里）——
-// 优先文件是为了让脚本能投放与轮换它（权限 600，别进 shell 历史、也别进配置备份）。
-//
-// 参数：无。
-//
-// 返回：
-//
-//	[]byte — 密钥内容；两个来源都没配时返回 nil
-//	error  — 配了 secret_path 但文件读不到时返回
-func (a *APIAuthSection) SecretBytes() ([]byte, error) {
-	if a.SecretPath != "" {
-		b, err := os.ReadFile(a.SecretPath)
-		if err != nil {
-			return nil, fmt.Errorf("read api.auth.secret_path: %w", err)
-		}
-		return bytes.TrimSpace(b), nil
-	}
-	return []byte(strings.TrimSpace(a.Secret)), nil
-}
-
 // Config 完整配置。
 type Config struct {
 	Version      int                 `yaml:"version"`
@@ -976,6 +785,10 @@ type Config struct {
 	NodeIDSource    NodeIDSource `yaml:"-"` // config | cert | state | generated
 	NodeIDWarning   string       `yaml:"-"`
 	NodeIDStatePath string       `yaml:"-"`
+
+	// UserDir 是 user token 目录（对外 HTTP 端点的唯一授权凭据所在），由 Load 填充为
+	// 节点目录下的 user/；不来自 node.yaml、不进 config_hash（跟上面三个字段同类：运行时字段）。
+	UserDir string `yaml:"-"`
 
 	// Build 本节点**可执行文件**的身份快照（启动时算一次，见 README「可执行文件一致性」）。
 	// 它和上面三个字段是同一类东西：**程序填的运行时字段** —— 不来自 node.yaml、不进
@@ -1275,15 +1088,10 @@ func (c *Config) applyDefaults(baseDir string) {
 			sec.Enrollment.TokenPath = "enroll.token"
 		}
 	}
-	if c.HasAPI() && c.API.Auth.Secret == "" && c.API.Auth.SecretPath == "" {
-		// 对外 HTTP 的共享密钥：约定文件 api.secret（脚本投放，权限 600）。
-		// **只在文件确实存在时才补** —— 没有它时写接口退化成"只接受本机请求"（见 APIAuthSection），
-		// 那是合法状态，不是配置错误。
-		tp := filepath.Join(baseDir, "api.secret")
-		if _, err := os.Stat(tp); err == nil {
-			c.API.Auth.SecretPath = "api.secret"
-		}
-	}
+	// user token 目录：对外 HTTP 端点的唯一授权凭据都放在这里（-adduser 写、API 验）。
+	// 固定在节点目录下的 user/，不做配置 —— 授权材料的落点越少一个自由度，运维越不容易
+	// 把它指到一个权限宽松的地方去。
+	c.UserDir = filepath.Join(baseDir, "user")
 	if c.Persist.StatePath == "" {
 		c.Persist.StatePath = "state.dat"
 	}
@@ -1306,7 +1114,6 @@ func (c *Config) applyDefaults(baseDir string) {
 		c.Security.CertReload.Paths[i] = resolve(c.Security.CertReload.Paths[i])
 	}
 	c.Security.Enrollment.TokenPath = resolve(c.Security.Enrollment.TokenPath)
-	c.API.Auth.SecretPath = resolve(c.API.Auth.SecretPath)
 	c.SelfUpdate.Dir = resolve(c.SelfUpdate.Dir)
 	c.Persist.StatePath = resolve(c.Persist.StatePath)
 }
@@ -1397,26 +1204,6 @@ func (c *Config) Validate() error {
 		if _, err := os.Stat(c.Security.Enrollment.TokenPath); err != nil {
 			return fmt.Errorf("security.enrollment.token_path: %w", err)
 		}
-	}
-	// 对外 HTTP 的共享密钥：同样只校验"配了路径就必须能读到"。**没配是合法状态**
-	// （写接口退化成只接受本机请求），所以这里绝不能写成"没配就拒绝启动"。
-	if c.API.Auth.SecretPath != "" {
-		if _, err := os.Stat(c.API.Auth.SecretPath); err != nil {
-			return fmt.Errorf("api.auth.secret_path: %w（配了就要能读到：脚本投放、权限 600）", err)
-		}
-	}
-	// 可信代理白名单：写错的 CIDR 必须**启动时就暴露**，不能等到"某个请求突然被当成远程"
-	// 才被发现 —— 那时它要么静默拒绝合法的本机运维，要么（更糟）把远程请求当本机放行。
-	for _, p := range c.API.Auth.TrustedProxies {
-		s := strings.TrimSpace(p)
-		if _, _, err := net.ParseCIDR(s); err != nil && net.ParseIP(s) == nil {
-			return fmt.Errorf("api.auth.trusted_proxies: %q 不是合法的 CIDR 或 IP（例：127.0.0.1/32、::1/128）", p)
-		}
-	}
-	switch strings.ToLower(strings.TrimSpace(c.API.Auth.ChannelBinding)) {
-	case "", "off", "auto", "require":
-	default:
-		return fmt.Errorf("invalid api.auth.channel_binding %q (auto|off|require)", c.API.Auth.ChannelBinding)
 	}
 	// 对外 HTTP 的 TLS：只写一半（有证书没密钥）是配置错误，必须拒绝启动 ——
 	// 否则它会静默退化成明文，而 operator 以为自己已经开了 HTTPS。

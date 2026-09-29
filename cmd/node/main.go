@@ -45,7 +45,8 @@ func main() {
 		genkey   = flag.Bool("genkey", false, "一次性生成本节点密钥对（程序启动路径绝不生成密钥，这是显式的部署工具）")
 		keyDir   = flag.String("keydir", "keys", "-genkey 的输出目录")
 		withCA   = flag.Bool("with-ca", false, "-genkey 时一并生成 CA 密钥对（有子节点的节点才需要）")
-		force    = flag.Bool("force", false, "-genkey 时覆盖已存在的密钥文件")
+		addUser  = flag.String("adduser", "", "为某个用户名签发一个 API 访问 token（用本节点 CA 签，写入 <节点目录>/user/<用户名>），然后退出")
+		force    = flag.Bool("force", false, "-genkey 覆盖已存在的密钥文件；-adduser 覆盖已存在的 token 文件")
 	)
 	flag.Parse()
 
@@ -56,10 +57,18 @@ func main() {
 		}
 		return
 	}
+	if *addUser != "" {
+		if err := addUserToken(*cfgPath, *addUser, *force); err != nil {
+			fmt.Fprintln(os.Stderr, "adduser FAILED:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if *cfgPath == "" {
 		fmt.Fprintln(os.Stderr, "usage: treecmd-node -config <path/to/node.yaml> [flags]")
 		fmt.Fprintln(os.Stderr, "       treecmd-node -enroll -config node.yaml")
 		fmt.Fprintln(os.Stderr, "       treecmd-node -genkey -keydir keys [-with-ca]")
+		fmt.Fprintln(os.Stderr, "       treecmd-node -config node.yaml -adduser <用户名>")
 		flag.PrintDefaults()
 		os.Exit(2)
 	}
@@ -153,8 +162,40 @@ func newLogger(level string) *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
 }
 
-// generateKeys 一次性生成本节点的 Ed25519 密钥对，并写成私钥与 .pub 公钥两个文件。
+// addUserToken 为某个用户名签发 API 访问 token，并落盘到 <节点目录>/user/<用户名>。
 //
+// 这是 `-adduser` 的实现入口：**不启动节点**，只读配置（拿 CA 私钥路径与 user 目录），
+// 于是"发凭据"和"跑节点"在时间上解耦 —— 而且发完不用重启节点：API 侧按 user 目录的 mtime
+// 自动重扫（见 internal/node/usertoken.go）。
+//
+// 参数：
+//
+//	cfgPath  — node.yaml 路径；为空时报错（没有配置就找不到 CA 私钥与 user 目录）
+//	username — 用户名，同时是 token 文件名
+//	force    — false 时目标文件已存在即拒绝（不悄悄换掉在用的 token）
+//
+// 返回：出错返回 error（用户名非法 / 没配 CA / 文件已存在等）。
+func addUserToken(cfgPath, username string, force bool) error {
+	if cfgPath == "" {
+		return fmt.Errorf("需要 -config <node.yaml>：token 由本节点 CA 签发，用户名与 CA 材料都从配置里定")
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return fmt.Errorf("加载配置 %s: %w", cfgPath, err)
+	}
+	path, err := node.AddUser(cfg, username, force)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("已为用户 %s 签发 token：\n  %s\n", username, path)
+	fmt.Printf("\n用法（把该文件内容作为请求头带上）：\n")
+	fmt.Printf("  curl -H \"X-Treecmd-Token: $(cat %s)\" http://%s/v1/tree\n", path, cfg.API.HTTPAddr)
+	fmt.Printf("  scripts/api_call.py --host %s --token-file %s GET /v1/tree\n", cfg.API.HTTPAddr, path)
+	fmt.Printf("\n收回权限：rm %s（节点下次请求即失效，无需重启）\n", path)
+	return nil
+}
+
+// generateKeys 一次性生成本节点的 Ed25519 密钥对，并写成私钥与 .pub 公钥两个文件。
 // 注意与"启动路径"的区别：**启动时缺密钥一律拒绝启动**，程序绝不隐式生成；
 // 这个子命令是显式的部署工具，只在你想用它的时候才生成。
 //

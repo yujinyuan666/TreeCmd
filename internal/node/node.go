@@ -120,13 +120,15 @@ type Node struct {
 	querySess map[string]*querySession
 
 	apiSrv *http.Server
-	// apiTLS 对外 HTTP 的 TLS 重载器（apitls.go）。开了 api.tls 才非 nil；除了供给握手用的
-	// *tls.Config，它还持有**服务端叶子证书的哈希** —— 签名校验要用它做通道绑定。
+	// apiTLS 对外 HTTP 的 TLS 重载器（apitls.go）。开了 api.tls 才非 nil。
 	apiTLS *apiTLSReloader
-	// 对外 HTTP 的访问控制（apiauth.go）：只缓存"已经用过的 nonce"，用于挡时间窗内的重放。
-	// 密钥本身不进内存 —— 每次请求现读，于是换密钥既不用重启也不用 SIGHUP。
-	authMu     sync.Mutex
-	authNonces map[string]time.Time
+	// 对外 HTTP 的授权缓存（usertoken.go）：token → 用户名，来自 `user/` 目录的扫描结果。
+	// 目录 mtime 变了就重扫（`-adduser` 之后立即生效，不用重启）；未命中且有节流时直接 403。
+	userMu       sync.Mutex
+	userTokens   map[string]string
+	userStamp    time.Time // 上次扫描时 user/ 目录的 mtime
+	userLastScan time.Time // 上次扫描的时刻（节流用）
+	userScanned  bool      // 是否已经扫过（区分"没扫过"与"扫过但目录不存在"）
 
 	// 计数器（可观测性）
 	statCmdTerminal map[string]int64
