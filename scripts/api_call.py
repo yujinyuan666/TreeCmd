@@ -1,54 +1,42 @@
 #!/usr/bin/env python3
-"""treecmd 对外 HTTP 的签名调用工具（零依赖，只用标准库）。
+"""treecmd 对外 HTTP 的调用工具（零依赖，只用标准库）。
 
 【什么时候需要它】
-节点的对外 HTTP 端点（api.http_addr）有一层访问控制，口径是：
+节点的对外 HTTP 端点（api.http_addr）有一层访问控制：**任何来源（含本机）都要出示 user token**，
+没有免签入口。凭据由节点用**它自己的 CA 私钥**签发，落盘在节点目录的 `user/<用户名>` 里：
 
-  · 来自**本机**（回环地址）的请求一律放行 —— 直接 curl localhost:18443/... 就行，不必用本工具；
-  · 从**别的机器**发来的写请求（POST），必须带共享密钥的 HMAC 签名 —— 那正是本工具干的事。
+    treecmd-node -config node.yaml -adduser alice     # 生成 user/alice，里面就是 token
 
-密钥就是节点目录里的 `api.secret`（或 node.yaml 里 api.auth.secret / secret_path 指定的那份），
-把它拷到运维机上，用本工具发请求即可。
+把 `user/alice` 拷到运维机上，用本工具（或直接 curl）发请求即可。本工具只是把
+"读 token 文件 → 放进 X-Treecmd-Token 头 → 发请求 → 打印状态码" 这几步包了一下，
+顺带支持 HTTPS（--tls）与 mTLS（--cert）。
 
-【签名格式】与 internal/node/apiauth.go 一一对应（**两边必须逐字节一致**，test/api-auth.sh 在证这件事）：
+【请求头】只有一项，与 internal/node/apiauth.go 的 headerAPIToken 一致：
 
-  头：
-    X-Treecmd-Timestamp: <Unix 秒>
-    X-Treecmd-Nonce:     <一次性随机串，32 位十六进制>
-    X-Treecmd-Signature: base64(HMAC-SHA256(secret, payload))
-    X-Treecmd-Audience:  <目标节点的 node_id>        ← **必填**：签名只认"签给谁"
-    X-Treecmd-Channel-Binding: <base64(通道绑定值)>   ← 走 HTTPS（--tls）时自动带上
-  payload（按 internal/canon 的帧格式拼接）：
-    Str(域) Str(方法) Str(路径) Str(原始 query) Bytes(sha256(body)) I64(时间戳) Str(nonce)
-    Str(接收方) Str(Host) Str(通道绑定值的 base64)
-    其中 Str/Bytes = 8 字节大端长度前缀 + 内容；I64 = 8 字节大端补码（无长度前缀）。
+    X-Treecmd-Token: <user/<用户名> 文件的全部内容>
 
-时间戳必须在服务端时钟的 ±60s 内，nonce 不能重复（防重放）。所以**两端时钟要对齐**，
-以及**别把一次调用重放出去**（重放会拿到 401，而不是又执行一遍 —— 这正是我们要的）。
+token 的格式是 `<16 位随机串>.<base64(CA 对 域‖用户名‖随机串 的 Ed25519 签名)>` ——
+那是服务端 `-adduser` 写出来的东西，本工具**不生成也不校验**它，照抄文件内容即可。
 
-【为什么要有 audience 与通道绑定】HMAC 只证明"请求内容没被改"，证明不了"它是签给谁的、
-从哪条链路进来的"。防重放的 nonce 表是**每节点一份**，所以中间人把签好的请求转发给另一个
-共享同一密钥的节点，就能让 `/v1/crl`（吊销）、`/v1/forget`（删数据）、`/v1/commands`
-（整棵子树执行指令）这些不可逆动作**再执行一次**。把"接收方 node_id"和"服务端证书哈希"
-写进签名后，这类中继在验签时就断了 —— 所以这两个字段不是可选项。
+【明文链路要配 TLS】token 是长期凭据，明文 HTTP 上被抄走即可原样重放 —— 跨不可信网络请用
+`--tls --cafile <节点证书的 CA>`（节点侧配 api.tls，建议再开 require）。
 
 【用法】
-  # 本机也能用（照签，服务端会正常校验）
-  scripts/api_call.py --host 127.0.0.1:18443 --secret-file root/api.secret \
-      --audience 0198f0c0-0000-7000-8000-0000abc00002 POST '/v1/crl?node=<GUID>'
+  # 本机（同样要 token，本机不再免签）
+  scripts/api_call.py --host 127.0.0.1:18443 --token-file root/user/alice GET /v1/tree
 
-  # 远程 + HTTPS：把 api.secret 拷过去，指向节点对外地址（通道绑定自动带上）
-  scripts/api_call.py --host 192.168.1.10:18443 --secret-file ./api.secret --tls \
-      --audience 0198f0c0-0000-7000-8000-0000abc00002 \
+  # 远程 + HTTPS：客户端证书校验服务端身份
+  scripts/api_call.py --host 192.168.1.10:18443 --token-file ./alice --tls --cafile ./ca.crt \\
       POST '/v1/forget?node=<GUID>&mode=stale'
 
-  # audience / 密钥也能从环境变量给，省得每条命令都写一遍
-  export TREECMD_API_AUDIENCE=0198f0c0-0000-7000-8000-0000abc00002
+  # 节点开了 mTLS 时再带上客户端证书（它只加固传输层，不替代 token）
+  scripts/api_call.py --host 192.168.1.10:18443 --token-file ./alice --tls --cafile ./ca.crt \\
+      --cert ./client.pem --key ./client.key GET /v1/tree
 
-  # 带 body 的提交（body 原样发送、原样参与签名；- 表示从 stdin 读）
-  echo '{"type":"remote_time","aggregate":"TREE"}' | \
-      scripts/api_call.py --host 127.0.0.1:18443 --audience "$TREECMD_API_AUDIENCE" \
-      POST /v1/commands --data -
+  # token 也能从环境变量给，省得每条命令都写；带 body 的提交用 --data（'-' = 从 stdin 读）
+  export TREECMD_API_TOKEN=$(cat ./alice)
+  echo '{"type":"remote_time","aggregate":"TREE"}' | \\
+      scripts/api_call.py --host 127.0.0.1:18443 POST /v1/commands --data -
 
 【输出与退出码】
   stdout = 响应体原文；stderr = "HTTP <状态码> <原因>"。
@@ -59,112 +47,15 @@
 from __future__ import annotations
 
 import argparse
-import base64
-import hashlib
-import hmac
 import http.client
 import os
-import secrets as pysecrets
 import ssl
-import struct
 import sys
-import time
 
-# 与 internal/node/apiauth.go 的 apiAuthDomain 保持一致：域分隔，避免这对密钥被复用到别处
-DOMAIN = "treecmd/api/v1"
-# 与 internal/node/apiauth.go 的 apiAuthCBLabel 保持一致：通道绑定的用途标签
-CB_LABEL = "treecmd/api/v1 channel binding"
-# 与 internal/node/apiauth.go 的 apiRespAuthDomain 保持一致
-RESP_DOMAIN = "treecmd/api/v1/response"
-# 时间戳允许偏差（秒），与服务端 apiAuthSkew 一致
-SKEW = 60
-# 默认目标与密钥文件名（与节点目录里的约定一致）
+# 与 internal/node/apiauth.go 的 headerAPIToken 保持一致：token 的请求头名。
+TOKEN_HEADER = "X-Treecmd-Token"
+# 默认目标（与节点目录里的约定一致）
 DEFAULT_HOST = "127.0.0.1:18443"
-DEFAULT_SECRET_FILE = "api.secret"
-
-
-def field(part: bytes) -> bytes:
-    """按 internal/canon 的 Writer.Str / Bytes 帧格式拼一段：8 字节大端长度前缀 + 内容。"""
-    return struct.pack(">Q", len(part)) + part
-
-
-def i64(v: int) -> bytes:
-    """按 internal/canon 的 Writer.I64 拼一个定长整数：8 字节大端补码，不写长度前缀。"""
-    return struct.pack(">q", v)
-
-
-def canonical(method: str, path: str, raw_query: str, body: bytes, ts: int, nonce: str,
-              audience: str, host: str, channel_binding: str) -> bytes:
-    """拼出"待签名内容"（字段顺序必须与 apiauth.go 的 apiAuthPayload 一致）。
-
-    后三个字段是防中继用的：audience 钉住"签给谁"，host 钉住"投到哪个入口"，
-    channel_binding 钉住"哪个服务端"。缺一个就等于把签名交给了中间人去挑地方投。
-    """
-    return (field(DOMAIN.encode())
-            + field(method.encode())
-            + field(path.encode())
-            + field(raw_query.encode())
-            + field(hashlib.sha256(body).digest())
-            + i64(ts)
-            + field(nonce.encode())
-            + field(audience.encode())
-            + field(host.encode())
-            + field(channel_binding.encode()))
-
-
-def response_payload(method: str, path: str, status: int, body: bytes, nonce: str, ts: int) -> bytes:
-    """拼出响应签名的"待签内容"（字段顺序必须与 apiauth.go 的 apiRespAuthPayload 一致）。"""
-    return (field(RESP_DOMAIN.encode())
-            + field(method.encode())
-            + field(path.encode())
-            + i64(status)
-            + field(hashlib.sha256(body).digest())
-            + field(nonce.encode())
-            + i64(ts))
-
-
-def verify_response(secret: bytes, resp, body: bytes, method: str, path: str, nonce: str) -> None:
-    """校验响应签名；**校验不过就直接退出**（拿到一份来路不明的响应比拿不到更危险）。
-
-    服务端配了共享密钥时会在响应上带 X-Treecmd-Response-Timestamp / -Signature。明文链路上
-    中间人可以随手编一个假的 200，让运维以为指令已经执行 —— 校完这个签名才知道它确实是
-    那个节点、针对这一次请求回的（nonce 被回显进签名）。
-    """
-    sig = resp.getheader("X-Treecmd-Response-Signature")
-    if not sig:
-        return  # 服务端没配密钥 / body 太大降级了 —— 不签名是合法状态，不阻塞
-    ts_raw = resp.getheader("X-Treecmd-Response-Timestamp") or ""
-    try:
-        ts = int(ts_raw)
-    except ValueError:
-        sys.exit(f"响应签名的时间戳不是整数：{ts_raw!r}")
-    if abs(ts - int(time.time())) > SKEW:
-        sys.exit(f"响应签名的时间戳超出 ±{SKEW}s（偏差 {ts - int(time.time())}s）—— 两端时钟要对齐")
-    want = base64.b64encode(hmac.new(secret, response_payload(method, path, resp.status, body, nonce, ts),
-                                     hashlib.sha256).digest()).decode()
-    if not hmac.compare_digest(want, sig.strip()):
-        sys.exit("响应签名校验失败 —— 这份响应不是目标节点用共享密钥签的（中间人？），拒绝采信")
-
-
-def channel_binding_of(sock) -> str:
-    """算通道绑定值：base64(SHA256(用途标签 + 服务端叶子证书 DER))。
-
-    对应 apiauth.go 的 channelBindingOf —— 服务端拿自己的证书算，客户端拿**它看到的那张**
-    证书算。中间人若换了自己的证书（或把请求转发到另一个节点），两边就对不上。
-    拿不到证书（明文连接）时返回空串。
-    """
-    try:
-        der = sock.getpeercert(binary_form=True)
-    except (AttributeError, OSError, ValueError):
-        return ""
-    if not der:
-        return ""
-    return base64.b64encode(hashlib.sha256(CB_LABEL.encode() + der).digest()).decode()
-
-
-def sign(secret: bytes, payload: bytes) -> str:
-    """对 payload 取 HMAC-SHA256 并 base64（这就是 X-Treecmd-Signature 的值）。"""
-    return base64.b64encode(hmac.new(secret, payload, hashlib.sha256).digest()).decode()
 
 
 def split_hostport(host: str) -> tuple[str, int]:
@@ -178,22 +69,27 @@ def split_hostport(host: str) -> tuple[str, int]:
     return host, 18443
 
 
-def load_secret(args) -> bytes:
-    """取共享密钥：--secret > --secret-file > 环境变量 TREECMD_API_SECRET > ./api.secret。"""
-    if args.secret:
-        return args.secret.strip().encode()
-    path = args.secret_file
-    if not path:
-        env = os.environ.get("TREECMD_API_SECRET", "").strip()
-        if env:
-            return env.encode()
-        path = DEFAULT_SECRET_FILE
-    try:
-        with open(path, "rb") as fh:
-            return fh.read().strip()
-    except OSError as exc:
-        sys.exit(f"读不到密钥文件 {path}：{exc}\n"
-                 f"（节点目录里生成：head -c 32 /dev/urandom | base64 > api.secret && chmod 600 api.secret）")
+def load_token(args) -> str:
+    """取 token：--token > --token-file > 环境变量 TREECMD_API_TOKEN。
+
+    没有任何来源时**直接退出并给出签发命令** —— 与其发一个注定 401 的请求，不如把
+    "token 从哪来"讲清楚（这是这个工具最常见的误用）。
+    """
+    if args.token:
+        token = args.token.strip()
+    elif args.token_file:
+        try:
+            with open(args.token_file, "r", encoding="utf-8") as fh:
+                token = fh.read().strip()
+        except OSError as exc:
+            sys.exit(f"读不到 token 文件 {args.token_file}：{exc}")
+    else:
+        token = os.environ.get("TREECMD_API_TOKEN", "").strip()
+    if not token:
+        sys.exit("没有 token —— 本端点不设免签来源，任何请求都要带 " + TOKEN_HEADER + "。\n"
+                 "签发：treecmd-node -config node.yaml -adduser <用户名>\n"
+                 "然后： --token-file <节点目录>/user/<用户名>（或设 TREECMD_API_TOKEN）")
+    return token
 
 
 def read_body(args) -> bytes:
@@ -211,7 +107,7 @@ def parse_target(first: str, second: str) -> tuple[str, str]:
     两种写法都收：`<方法> <路径>`（如 `POST /v1/crl?node=X`）与只给 `<路径>`。
     判据是"哪一个以 / 开头" —— 于是 `POST /v1/crl` 与 `/v1/crl POST` 都不会被弄反
     （**踩过**：位置参数按声明顺序绑定，把方法当成了路径发出去，服务端只会回一个光秃秃的
-    400 Bad Request，看着像"签名不对"，其实是请求行本身是垃圾）。
+    400 Bad Request，看着像"鉴权不对"，其实是请求行本身是垃圾）。
     """
     if first.startswith("/"):
         path, method = first, second
@@ -228,7 +124,7 @@ def make_connection(args, host: str, port: int):
         return http.client.HTTPConnection(host, port, timeout=args.timeout)
     ctx = ssl.create_default_context(cafile=args.cafile)
     if args.insecure:
-        # 不校验证书会让"通道绑定"退化成"绑定了一张不知是谁的证书" —— 只在自测时用。
+        # 不校验证书等于放弃了"我连的是不是真节点" —— 只在自测时用。
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     elif args.cafile:
@@ -239,91 +135,45 @@ def make_connection(args, host: str, port: int):
     return http.client.HTTPSConnection(host, port, timeout=args.timeout, context=ctx)
 
 
-def resolve_audience(args) -> str:
-    """取接收方 node_id：--audience > 环境变量 TREECMD_API_AUDIENCE；都没有就报错退出。
-
-    为什么**不自动去 /v1/healthz 问**：那个响应在明文链路上是可以被伪造的 —— 中间人回一个
-    别的 node_id，本工具就会把签名"签给"那个节点，audience 这道防线等于自己拆了。
-    node_id 是部署时就该知道的东西（node.yaml 的 node.id），让它显式给。
-    """
-    aud = (args.audience or os.environ.get("TREECMD_API_AUDIENCE", "")).strip()
-    if not aud:
-        sys.exit("缺少 --audience（或环境变量 TREECMD_API_AUDIENCE）："
-                 "签名必须声明接收方 node_id，否则服务端会以 ERR_API_AUTH_AUDIENCE 拒绝")
-    return aud
-
-
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
     ap = argparse.ArgumentParser(
-        description="treecmd 对外 HTTP 的签名调用工具",
-        epilog="路径与 query 会**原样**发送并原样签名：需要转义请自己先转义。")
+        description="treecmd 对外 HTTP 调用工具（携带 user token）",
+        epilog="路径与 query 会**原样**发送：需要转义请自己先转义。")
     ap.add_argument("first", metavar="[方法] 路径", help="如 'POST /v1/crl?node=<GUID>'，或只给 '/v1/tree'")
     ap.add_argument("second", nargs="?", default="", help="配合上面那种两段写法时的第二段")
     ap.add_argument("--host", default=DEFAULT_HOST, help=f"目标 host:port，默认 {DEFAULT_HOST}")
     ap.add_argument("--data", default=None, help="请求体；'-' 表示从 stdin 读")
-    ap.add_argument("--secret-file", default=None, help=f"密钥文件，默认 {DEFAULT_SECRET_FILE}（或环境变量 TREECMD_API_SECRET）")
-    ap.add_argument("--secret", default=None, help="直接给密钥（不推荐：会留在 shell 历史里）")
-    ap.add_argument("--audience", default=None, help="目标节点的 node_id（或环境变量 TREECMD_API_AUDIENCE）；**必填**")
-    ap.add_argument("--tls", action="store_true", help="走 HTTPS（节点开了 api.tls 时用；会自动带通道绑定）")
+    ap.add_argument("--token-file", default=None, help="token 文件（即节点目录里的 user/<用户名>）")
+    ap.add_argument("--token", default=None, help="直接给 token 原文（不推荐：会留在 shell 历史里）")
+    ap.add_argument("--tls", action="store_true", help="走 HTTPS（节点开了 api.tls 时用）")
     ap.add_argument("--cafile", default=None, help="校验服务端证书用的 CA 文件（--tls 时强烈建议给）")
-    ap.add_argument("--insecure", action="store_true", help="--tls 时不校验证书（仅自测用：会削弱通道绑定的意义）")
+    ap.add_argument("--insecure", action="store_true", help="--tls 时不校验证书（仅自测用）")
     ap.add_argument("--cert", default=None, help="客户端证书（PEM，含私钥也行）；节点开了 mTLS 时用")
     ap.add_argument("--key", default=None, help="客户端私钥（证书与私钥分开时用）")
-    ap.add_argument("--no-bind-host", action="store_true", help="不把 Host 头纳入签名（前面是改写 Host 的反向代理时才用）")
-    ap.add_argument("--no-verify-response", action="store_true", help="不校验响应签名（默认会校验：拿到来路不明的响应比拿不到更危险）")
     ap.add_argument("--timeout", type=float, default=30.0, help="超时秒数，默认 30")
     return ap
 
 
 def main() -> int:
-    """入口：拼签名 → 发请求 → 输出状态码与响应体，返回进程退出码。"""
+    """入口：读 token → 发请求 → 输出状态码与响应体，返回进程退出码。"""
     args = build_parser().parse_args()
     method, target = parse_target(args.first, args.second)
     method = (method or ("POST" if args.data is not None else "GET")).upper()
-    path, _, raw_query = target.partition("?")
     body = read_body(args)
-    secret = load_secret(args)
-    if not secret:
-        sys.exit("密钥为空 —— 拒绝发出请求（空密钥等于没有访问控制）")
+    token = load_token(args)
 
     host, port = split_hostport(args.host)
-    audience = resolve_audience(args)
-    # Host 头必须与**真正发出去的那个**逐字节一致，否则服务端拼出的 payload 与本端不同。
-    host_header = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
-    if args.no_bind_host:
-        host_header = ""
+    headers = {TOKEN_HEADER: token}
+    if body:
+        headers["Content-Type"] = "application/json"
 
     conn = make_connection(args, host, port)
     try:
-        # 通道绑定要**先握手再签名**：证书只有连上之后才拿得到（明文连接拿不到，留空）。
-        cb = ""
-        if args.tls:
-            conn.connect()
-            cb = channel_binding_of(getattr(conn, "sock", None))
-            if not cb:
-                sys.exit("走 HTTPS 却拿不到服务端证书 —— 通道绑定值算不出来，拒绝发出请求")
-        ts = int(time.time())
-        nonce = pysecrets.token_hex(16)
-        payload = canonical(method, path, raw_query, body, ts, nonce, audience, host_header, cb)
-
-        headers = {
-            "X-Treecmd-Timestamp": str(ts),
-            "X-Treecmd-Nonce": nonce,
-            "X-Treecmd-Signature": sign(secret, payload),
-            "X-Treecmd-Audience": audience,
-        }
-        if cb:
-            headers["X-Treecmd-Channel-Binding"] = cb
-        if body:
-            headers["Content-Type"] = "application/json"
-
-        # 请求行用的是**原样**的 target（查询串不做重排），发出去的与签名的必须是同一串。
+        # 请求行用的是**原样**的 target（查询串不做重排）。
         conn.request(method, target, body=body or None, headers=headers)
         resp = conn.getresponse()
         data = resp.read()
-        if not args.no_verify_response:
-            verify_response(secret, resp, data, method, path, nonce)
     except OSError as exc:
         sys.exit(f"连不上 {args.host}：{exc}")
     finally:
