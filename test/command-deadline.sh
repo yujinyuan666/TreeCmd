@@ -39,7 +39,10 @@
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# API 没有免签来源（含本机）：所有请求都要带 user token —— 见 lib/apitoken.sh
+. "${HERE}/lib/apitoken.sh"   # 对外 API 一律要 user token：装好后所有 curl 自动带上
 DEMO="${HERE}/demo"
+API_TOKEN_DIR="${DEMO}/root"      # token 签在哪个节点目录下（下面所有 curl 自动带上）
 LOGS="${HERE}/logs"
 PIDFILE="${HERE}/.demo.pids"
 ROOT_API="127.0.0.1:18493"

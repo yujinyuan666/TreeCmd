@@ -30,6 +30,8 @@
 
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# API 没有免签来源（含本机）：所有请求都要带 user token —— 见 lib/apitoken.sh
+. "${HERE}/lib/apitoken.sh"   # 对外 API 一律要 user token：装好后所有 curl 自动带上
 cd "${HERE}" || exit 1
 
 KEEP="${1:-}"
@@ -37,6 +39,7 @@ REPO="${TREECMD_REPO:-$(cd "${HERE}/.." && pwd)}"
 BIN="${REPO}/bin/treecmd-node"
 API="127.0.0.1:18493"
 DEMO="${HERE}/demo"
+API_TOKEN_DIR="${DEMO}/root"      # token 签在哪个节点目录下（下面所有 curl 自动带上）
 SCRIPT_NAME="hello.sh"
 # 本机可能配了 HTTP_PROXY，而它通常不管 127.0.0.1 —— 不加 --noproxy 会拿到 Connection refused
 CURL=(curl -s --noproxy '*' --max-time 5)

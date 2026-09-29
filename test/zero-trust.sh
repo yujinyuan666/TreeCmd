@@ -28,10 +28,13 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# API 没有免签来源（含本机）：所有请求都要带 user token —— 见 lib/apitoken.sh
+. "${HERE}/lib/apitoken.sh"   # 对外 API 一律要 user token：装好后所有 curl 自动带上
 REPO="${TREECMD_REPO:-$(cd "${HERE}/.." && pwd)}"
 BIN="${REPO}/bin/treecmd-node"
 INIT_ROOT="${REPO}/scripts/init_root.sh"
 WORK="${HERE}/zerotrust"
+API_TOKEN_DIR="${WORK}/root"      # token 签在哪个节点目录下（下面所有 curl 自动带上）
 LOGS="${WORK}/logs"
 PIDFILE="${HERE}/.zerotrust.pids"
 

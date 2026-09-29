@@ -25,6 +25,8 @@
 
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# API 没有免签来源（含本机）：所有请求都要带 user token —— 见 lib/apitoken.sh
+. "${HERE}/lib/apitoken.sh"   # 对外 API 一律要 user token：装好后所有 curl 自动带上
 cd "${HERE}" || exit 1
 
 KEEP="${1:-}"
@@ -33,6 +35,7 @@ BIN="${REPO}/bin/treecmd-node"
 ROOT_API="127.0.0.1:18493"
 RELAY_API="127.0.0.1:18494"
 DEMO="${HERE}/demo"
+API_TOKEN_DIR="${DEMO}/root"      # token 签在哪个节点目录下（下面所有 curl 自动带上）
 SCRIPT_NAME="local.sh"
 PARAMS='{"scope":"本子树"}'
 
@@ -116,8 +119,11 @@ fi
 
 # ③ 从**中继**提交
 printf '\n③ 从中继提交（发起者 = 中继）\n'
+# token 是按节点签的：打中继的 API 要出示**中继的** token（根的那份在中继上不认）。
+RELAY_TOKEN="$(mint_api_token "${BIN}" "${DEMO}/relay")" || { bad "中继 token 签发失败"; exit 1; }
 PAYLOAD="$(printf '{"script":"%s","params":%s}' "${SCRIPT_NAME}" "${PARAMS}" | base64 | tr -d '\n')"
-R="$("${CURL[@]}" -H 'Content-Type: application/json' -XPOST "http://${RELAY_API}/v1/commands" \
+R="$("${CURL[@]}" -H 'Content-Type: application/json' -H "X-Treecmd-Token: ${RELAY_TOKEN}" \
+    -XPOST "http://${RELAY_API}/v1/commands" \
     -d "{\"type\":\"script\",\"aggregate\":\"TREE\",\"on_failure\":\"ALL_MUST_SUCCEED\",\"max_duration\":\"60s\",\"attest_depth\":0,\"payload\":\"${PAYLOAD}\"}")"
 info "提交 → ${R}"
 ID="$(printf '%s' "${R}" | sed -n 's/.*"command_id":"\([^"]*\)".*/\1/p')"
@@ -126,7 +132,7 @@ if [ -z "${ID}" ]; then bad "从中继提交失败"; exit 1; fi
 # ④ 轮询中继的 API 到终态（NOT_FOUND = "还没收敛"，是正常中间态）
 OUT=""
 for _ in $(seq 1 40); do
-  OUT="$("${CURL[@]}" "http://${RELAY_API}/v1/commands/${ID}")"
+  OUT="$("${CURL[@]}" -H "X-Treecmd-Token: ${RELAY_TOKEN}" "http://${RELAY_API}/v1/commands/${ID}")"
   case "${OUT}" in *'"result"'*|*COMMAND_STATUS_FAILED*) break ;; esac
   sleep 1
 done

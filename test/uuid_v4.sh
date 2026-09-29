@@ -22,6 +22,8 @@ KEEP="${1:-}"
 REPO="${TREECMD_REPO:-$(cd "${HERE}/.." && pwd)}"
 BIN="${REPO}/bin/treecmd-node"
 API="127.0.0.1:18493"
+DEMO="${HERE}/demo"
+API_TOKEN_DIR="${DEMO}/root"      # token 签在哪个节点目录下（下面所有 curl 自动带上）
 # 本机可能配了 HTTP_PROXY，而它通常不管 127.0.0.1 —— 不加 --noproxy 会拿到 Connection refused
 CURL=(curl -s --noproxy '*' --max-time 5)
 
