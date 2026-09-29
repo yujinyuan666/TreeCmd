@@ -125,7 +125,7 @@ type Node struct {
 	// 对外 HTTP 的授权缓存（usertoken.go）：token → 用户名，来自 `user/` 目录的扫描结果。
 	// 目录 mtime（或"目录在不在"）一变就重扫，于是 `-adduser` 与 `rm user/<用户名>` 都立刻生效。
 	userMu         sync.Mutex
-	userTokens     map[string]string
+	userTokens     map[string]userToken
 	userStamp      time.Time // 上次扫描时 user/ 目录的 mtime
 	userScanned    bool      // 是否已经扫过（区分"没扫过"与"扫过但目录不存在"）
 	userDirMissing bool      // 上次扫描时 user/ 目录还不存在

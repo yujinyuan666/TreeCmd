@@ -68,6 +68,16 @@ const (
 	userTokenMaxNameLen = 64
 )
 
+// userToken 是缓存里的一条授权记录：谁是它的主人、以及**它对应的文件当时长什么样**。
+//
+// 为什么带上文件指纹：缓存要能发现"同名文件被改写 / 被替换"。目录 mtime 只在"条目增删 + rename"
+// 时变化，直接覆盖写文件内容是**不动目录 mtime** 的（见 refreshUserTokensIfChanged 的注释）。
+type userToken struct {
+	Username string    // 用户名（= 文件名）
+	ModTime  time.Time // 扫描时该文件的 mtime
+	Size     int64     // 扫描时该文件的大小
+}
+
 // ValidAPIUsername 判断用户名能否作为 token 文件名。
 //
 // 为什么校验而不是直接拼路径：用户名会变成 `user/<用户名>` 这个**路径**，放任 `../` 之类
@@ -272,12 +282,34 @@ func AddUser(cfg *config.Config, username string, force bool) (string, error) {
 	if err := os.MkdirAll(cfg.UserDir, 0o700); err != nil {
 		return "", fmt.Errorf("建 user 目录 %s: %w", cfg.UserDir, err)
 	}
-	if err := os.WriteFile(path, []byte(token+"\n"), 0o600); err != nil {
-		return "", fmt.Errorf("写 token 文件 %s: %w", path, err)
+	// **原子替换**：先写同目录的临时文件再 rename。
+	//
+	// 两个理由：① 目录里绝不会出现"读到一半"的 token 文件（并发扫描时会读到截断内容，
+	// 白记一条"验签不过"的告警）；② rename 会更新**目录 mtime**，这是节点侧缓存失效的
+	// 依据之一 —— 直接改文件内容不会动目录 mtime（踩过：重新签发同一用户后，节点还在用旧
+	// 缓存，表现为"新 token 打不通、旧 token 还能用"）。
+	tmp, err := os.CreateTemp(cfg.UserDir, "."+username+".tmp*")
+	if err != nil {
+		return "", fmt.Errorf("建临时 token 文件: %w", err)
 	}
-	// MkdirAll 不会收紧已存在目录的权限，显式再chmod一次（目录已存在且权限宽松时收敛它）。
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }() // rename 成功后这次 Remove 是空操作
+	if _, err := tmp.WriteString(token + "\n"); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("写临时 token 文件 %s: %w", tmpName, err)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("设临时 token 文件权限 %s: %w", tmpName, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return "", fmt.Errorf("关闭临时 token 文件 %s: %w", tmpName, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return "", fmt.Errorf("落盘 token 文件 %s: %w", path, err)
+	}
+	// MkdirAll 不会收紧已存在目录的权限，显式再 chmod 一次（目录已存在且权限宽松时收敛它）。
 	_ = os.Chmod(cfg.UserDir, 0o700)
-	_ = os.Chmod(path, 0o600)
 	return path, nil
 }
 
@@ -337,6 +369,14 @@ func (n *Node) userTokenUsername(raw string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if err := n.refreshUserTokensIfChanged(caPub); err != nil {
+		return "", err
+	}
+	if name, ok := n.cachedUserToken(raw); ok {
+		return name, nil
+	}
+	// 未命中：可能是"刚签发但目录 mtime 没变（同名文件被原子替换）"或"刚被删掉"。
+	// 重扫一次再判 —— 这次是强制的（不看目录 mtime），否则新签的 token 会打不通。
 	if err := n.refreshUserTokens(caPub); err != nil {
 		return "", err
 	}
@@ -364,6 +404,41 @@ func (n *Node) userTokenUsername(raw string) (string, error) {
 //
 // 返回：目录读不了（除"不存在"外）时返回错误；其余情况（含目录不存在）返回 nil 并更新缓存。
 func (n *Node) refreshUserTokens(caPub ed25519.PublicKey) error {
+	return n.syncUserTokens(caPub, true)
+}
+
+// refreshUserTokensIfChanged 只在 user/ 目录"变了"时重扫，没变就只做一次 stat。
+//
+// 接收者 n 是本节点实例。这是请求路径上的**常规**入口（只有未命中时才会强制重扫）。
+//
+// 参数：
+//
+//	caPub — 用于验签的 CA 公钥
+//
+// 返回：目录读不了（除"不存在"外）时返回错误。
+func (n *Node) refreshUserTokensIfChanged(caPub ed25519.PublicKey) error {
+	return n.syncUserTokens(caPub, false)
+}
+
+// syncUserTokens 同步一次 user/ 目录：目录"变了"或 force 为真时才真的读盘，然后重建缓存。
+//
+// 接收者 n 是本节点实例。
+//
+// 【"变了"的判据】目录在不在 + 目录 mtime。它只能发现**条目增删与 rename** ——
+// 直接覆盖写一个已存在文件的内容是不动目录 mtime 的。所以命中路径还额外 stat 命中的那个
+// 文件（见 cachedUserToken）：两层合起来才能覆盖"换一份 token / 删掉一份 token"两种操作。
+//
+// 【为什么未命中时也不必强扫】目录没变说明"这份 token 本来就不在目录里"，再读一遍盘只是
+// 给攻击者一个免费的内存 / 磁盘放大器。真正需要强扫的是"条目被原子替换但目录 mtime 没变"
+// 这类极少见情形 —— 那由调用方在未命中后再调一次 refreshUserTokens（force=true）兜住。
+//
+// 参数：
+//
+//	caPub — 用于验签的 CA 公钥
+//	force — true = 不看目录状态，直接扫
+//
+// 返回：目录读不了（除"不存在"外）时返回错误；其余情况更新缓存并返回 nil。
+func (n *Node) syncUserTokens(caPub ed25519.PublicKey, force bool) error {
 	dir := n.C().UserDir
 	st, statErr := os.Stat(dir)
 	missing := statErr != nil
@@ -376,9 +451,9 @@ func (n *Node) refreshUserTokens(caPub ed25519.PublicKey) error {
 	}
 
 	n.userMu.Lock()
-	uptodate := n.userScanned && n.userDirMissing == missing && (missing || stamp.Equal(n.userStamp))
+	changed := !n.userScanned || n.userDirMissing != missing || (!missing && !stamp.Equal(n.userStamp))
 	n.userMu.Unlock()
-	if uptodate {
+	if !force && !changed {
 		return nil
 	}
 
@@ -390,22 +465,27 @@ func (n *Node) refreshUserTokens(caPub ed25519.PublicKey) error {
 		entries = nil // 还没有 user/ 目录 = 一个用户都没签发；不是错误
 	}
 
-	fresh := make(map[string]string, len(entries))
+	fresh := make(map[string]userToken, len(entries))
 	var skipped []string
-	for _, e := range entries {
-		if e.IsDir() || !ValidAPIUsername(e.Name()) {
+	for _, de := range entries {
+		if de.IsDir() || !ValidAPIUsername(de.Name()) {
 			continue
 		}
-		raw, err := readUserTokenFile(filepath.Join(dir, e.Name()))
+		info, err := de.Info()
 		if err != nil {
-			skipped = append(skipped, e.Name())
+			skipped = append(skipped, de.Name())
 			continue
 		}
-		if !VerifyUserToken(caPub, e.Name(), raw) {
-			skipped = append(skipped, e.Name())
+		raw, err := readUserTokenFile(filepath.Join(dir, de.Name()))
+		if err != nil {
+			skipped = append(skipped, de.Name())
 			continue
 		}
-		fresh[strings.TrimSpace(raw)] = e.Name()
+		if !VerifyUserToken(caPub, de.Name(), raw) {
+			skipped = append(skipped, de.Name())
+			continue
+		}
+		fresh[strings.TrimSpace(raw)] = userToken{Username: de.Name(), ModTime: info.ModTime(), Size: info.Size()}
 	}
 	if len(skipped) > 0 {
 		sort.Strings(skipped)
@@ -440,20 +520,32 @@ func (n *Node) userTokenCAPub() (ed25519.PublicKey, error) {
 	return id.CAKey.Public().(ed25519.PublicKey), nil
 }
 
-// cachedUserToken 在缓存里查一份 token。
+// cachedUserToken 在缓存里查一份 token，并确认它对应的文件**没被改过**。
 //
-// 接收者 n 是本节点实例。
+// 接收者 n 是本节点实例。命中时多花一次 stat：只认"文件还是那一份"（mtime 与大小都对得上），
+// 变了就当作未命中（调用方会重扫）。这一步是"删了就失效 / 换了就生效"的保证 ——
+// 光看目录 mtime 会漏掉"同名文件被覆盖"这件事。
 //
 // 参数：
 //
 //	raw — token 原文
 //
-// 返回：命中时返回用户名与 true。
+// 返回：
+//
+//	string — 命中的用户名
+//	bool   — 命中且文件未被改动时为 true
 func (n *Node) cachedUserToken(raw string) (string, bool) {
 	n.userMu.Lock()
-	defer n.userMu.Unlock()
-	name, ok := n.userTokens[raw]
-	return name, ok
+	e, ok := n.userTokens[raw]
+	n.userMu.Unlock()
+	if !ok {
+		return "", false
+	}
+	st, err := os.Stat(filepath.Join(n.C().UserDir, e.Username))
+	if err != nil || !st.ModTime().Equal(e.ModTime) || st.Size() != e.Size {
+		return "", false
+	}
+	return e.Username, true
 }
 
 // readUserTokenFile 读一份 token 文件（去空白、封顶 userTokenMaxFileBytes）。
