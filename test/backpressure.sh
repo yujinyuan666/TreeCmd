@@ -109,8 +109,19 @@ except Exception:
 # $1=标签；结果写进全局 $PROBE_OUT（供调用方断言，不回显 —— 见脚本末尾的说明）
 run_probe() {
   local tag="$1"
+  # 探针是 python 直接发请求的，**绕过了本文件 source 的那个"自动带 token"的 curl 包装器**，
+  # 所以凭据要显式传进去：/v1/commands、/v1/commands/{id}、/metrics 都在访问控制射程内。
+  #
+  # 这里的 ensure 不是"防止拿不到"，而是**防止拿到一份旧的**：它会把 $API_TOKEN 对齐到
+  # `<节点目录>/user/tester` 此刻的内容（见 lib/apitoken.sh）。这一点在本脚本里尤其要紧 ——
+  # 阶段③ 上面那行 `WINDOW_NOW="$(window_now)"` 是一次 `$( )` 子壳，子壳里那次 curl 可能刚
+  # 现签了一份新 token（token 文件更新了，但赋值回不到本壳）；不对齐就会把**已被替换掉的旧
+  # token** 发给探针，换回一个 401，而 401 正是"访问控制生效"的正常表现 —— 假失败会伪装成
+  # 正确答案。
+  api_token_ensure || die "签不出 API token（看 ${API_TOKEN_DIR}/node.yaml 与 CA 私钥）"
+  [ -n "${API_TOKEN}" ] || die "API_TOKEN 为空 —— 探针会吃 401（假失败会伪装成「访问控制生效」）"
   PROBE_OUT="$("${PY}" "${PROBE}" --api "${ROOT_API}" --count "${COUNT}" \
-      --sleep-ms "${SLEEP_MS}" --tag "${tag}" 2>&1)" || {
+      --sleep-ms "${SLEEP_MS}" --tag "${tag}" --token "${API_TOKEN}" 2>&1)" || {
     echo "${PROBE_OUT}" >&2
     die "探针（${tag}）执行失败"
   }

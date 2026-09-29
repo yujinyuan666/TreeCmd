@@ -13,7 +13,14 @@
 
 用法：
 
-    python3 probe.py --api 127.0.0.1:18493 --count 20 --sleep-ms 2500 [--timeout 90] [--tag 阶段A]
+    python3 probe.py --api 127.0.0.1:18493 --count 20 --sleep-ms 2500 \
+        [--timeout 90] [--tag 阶段A] [--token "$(cat demo/root/user/tester)"]
+
+**每个请求都要带 user token**：对外端点没有免签来源（含回环），只有 `/v1/healthz` 例外 ——
+`/v1/commands`、`/v1/commands/{id}`、`/metrics` 全都在访问控制的射程内。探针是用
+python 直接发请求的，绕过了 shell 侧那个"自动带 token"的 curl 包装器（lib/apitoken.sh），
+所以凭据必须显式传进来；不传就是 401（ERR_API_AUTH_REQUIRED），而 401 在这个项目里正是
+"访问控制生效"的正常表现 —— **假失败会伪装成正确答案**，所以这里出错时必须把话说明白。
 
 成功时在 stdout 打印**一行 JSON**（别的什么都不打印，方便 shell 直接读）：
 
@@ -40,7 +47,22 @@ TERMINAL = {
 }
 
 
-def http_json(url, payload=None, timeout=10):
+def headers_for(token=""):
+    """构造请求头：token 非空时带上 X-Treecmd-Token。
+
+    参数：
+
+        token — user token 原文（token 文件的全部内容）；空字符串表示"不带"
+                （只有 /v1/healthz 不需要它）
+
+    返回：
+
+        dict — 可直接交给 urllib 的请求头
+    """
+    return {"X-Treecmd-Token": token} if token else {}
+
+
+def http_json(url, payload=None, timeout=10, token=""):
     """发一次 HTTP 请求并把响应体解析成 JSON。
 
     payload 为 None 时发 GET，否则发 POST（body 是 JSON）。
@@ -50,13 +72,14 @@ def http_json(url, payload=None, timeout=10):
         url     — 完整 URL
         payload — 要 POST 的 dict；None 表示 GET
         timeout — 单次请求超时（秒）
+        token   — user token；除 /v1/healthz 外的端点都必须带
 
     返回：
 
         (status_code, 解析后的 dict 或 None)
     """
     data = None
-    headers = {}
+    headers = headers_for(token)
     if payload is not None:
         data = json.dumps(payload).encode()
         headers["Content-Type"] = "application/json"
@@ -144,6 +167,8 @@ def main():
     ap.add_argument("--timeout", type=float, default=90.0, help="等全部终态的总超时（秒）")
     ap.add_argument("--tag", default="", help="给这次观测起个名字，会原样回显在结果里")
     ap.add_argument("--interval", type=float, default=0.2, help="采样间隔（秒）")
+    ap.add_argument("--token", default="",
+                    help="user token 原文（X-Treecmd-Token）；除 /v1/healthz 外所有端点都要带")
     args = ap.parse_args()
 
     base = "http://" + args.api
@@ -155,10 +180,14 @@ def main():
             "type": "sleep",
             "payload": payload_b64,
             "target": {"mode": "SUBTREE"},
-        })
+        }, token=args.token)
         # 提交接口回的是 202 Accepted（"已收下，去轮询结果"），不是 200 —— 别写死 200。
         if not (200 <= code < 300) or not isinstance(body, dict) or "command_id" not in body:
-            print("提交第 %d 条失败：HTTP %s %s" % (i + 1, code, body), file=sys.stderr)
+            hint = ""
+            if code in (401, 403):
+                hint = ("：这多半是没带/带错了 user token（端点没有免签来源，含回环）——"
+                        "用 --token 传一份（shell 侧可用 lib/apitoken.sh 的 mint_api_token 现签）")
+            print("提交第 %d 条失败：HTTP %s %s%s" % (i + 1, code, body, hint), file=sys.stderr)
             return 1
         ids.append(body["command_id"])
 
@@ -170,9 +199,10 @@ def main():
     pending = len(ids)
 
     while True:
-        # 采样指标
+        # 采样指标（/metrics 也在访问控制射程内 —— 要带 token）
         try:
-            with urllib.request.urlopen(base + "/metrics", timeout=5) as resp:
+            req = urllib.request.Request(base + "/metrics", headers=headers_for(args.token))
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 per_child = parse_inflight(resp.read().decode("utf-8", "replace"))
             sampled += 1
             if per_child:
@@ -181,14 +211,18 @@ def main():
                 if v > max_by_child.get(child, 0):
                     max_by_child[child] = v
         except Exception as e:
-            print("拉 /metrics 失败：%s" % e, file=sys.stderr)
+            print("拉 /metrics 失败：%s%s" % (
+                e,
+                "（401/403 说明没带对 user token —— /metrics 不是免签端点）"
+                if "401" in str(e) or "403" in str(e) or "Forbidden" in str(e) else ""),
+                file=sys.stderr)
             return 1
 
         # 采样指令状态
         statuses = {}
         pending = 0
         for cid in ids:
-            _, detail = http_json(base + "/v1/commands/" + cid)
+            _, detail = http_json(base + "/v1/commands/" + cid, token=args.token)
             st = status_of(detail) if isinstance(detail, dict) and detail.get("error") is None else "UNKNOWN"
             statuses[st] = statuses.get(st, 0) + 1
             if st not in TERMINAL:

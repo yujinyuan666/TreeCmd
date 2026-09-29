@@ -17,6 +17,8 @@
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "${HERE}" || exit 1
+# API 没有免签来源（含本机）：所有请求都要带 user token —— 见 lib/apitoken.sh
+. "${HERE}/lib/apitoken.sh"   # 对外 API 一律要 user token：装好后所有 curl 自动带上
 
 KEEP="${1:-}"
 REPO="${TREECMD_REPO:-$(cd "${HERE}/.." && pwd)}"

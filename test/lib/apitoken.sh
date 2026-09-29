@@ -16,6 +16,11 @@
 # 数组写法 —— bash 的命令查找优先命中函数）。**healthz 不需要 token**（存活探针永远放行），
 # 带上也无害。
 #
+# 【凭据的唯一事实来源是磁盘】每次发请求之前，包装器都把 `user/<用户名>` 的**当前内容**取来用
+# （必要时才现签一份）。所以"另一个 shell 刚换过 token""某次 `$( )` 子壳里触发了签发"这类事
+# 都不会让脚本拿着一份**已经被替换掉的旧 token** 去打 API —— 那会得到一个 401，而 401 在这个
+# 项目里正是"访问控制生效"的正常表现，**假失败会伪装成正确答案**。详见 api_token_ensure 的注释。
+#
 # 【多节点的脚本】调用处自己写了 `-H "X-Treecmd-Token: ..."` 时，包装器**尊重调用处**、
 # 不再注入（否则会出现两个同名头，服务端只看第一个）。所以"打中继的 API"这种场景直接写：
 #
@@ -24,11 +29,14 @@
 # 【签发不走节点进程】`-adduser` 只读配置里的 CA 私钥，节点不跑也能签；重复跑用 `-force`
 # 覆盖，于是脚本多次执行是幂等的。
 
-# API_TOKEN 当前注入的 token；API_TOKEN_DIR 非空时，第一次用到 curl 才去现签（lazy）。
+# API_TOKEN 当前注入的 token；API_TOKEN_DIR 非空时，每次用到 curl 都与磁盘对齐（lazy）。
 API_TOKEN=""
 API_TOKEN_DIR=""
 # 测试用的默认用户名（同名文件会被 -force 覆盖，不积累）。
 API_TOKEN_USER="tester"
+
+# api_token_path —— 当前用户的 token 文件路径（= `<节点目录>/user/<用户名>`）。
+api_token_path() { printf '%s/user/%s' "${API_TOKEN_DIR}" "${API_TOKEN_USER}"; }
 
 # mint_api_token <二进制> <节点目录> [用户名] —— 现签一份 token 并打印到 stdout。
 #
@@ -60,25 +68,40 @@ api_token_bin() {
   printf '%s' "${REPO:-${HERE}/..}/bin/treecmd-node"
 }
 
-# ensure_api_token —— 没有 token（或那份已经过期作废）时现签一份。
+# api_token_ensure —— 让 $API_TOKEN 等于"磁盘上现在那一份 token"；没有就现签一份。
 #
-# 三种情况都要重新签：
-#   · 还没签过；
-#   · `<节点目录>/node.yaml` 还没有 —— 树还没建出来，不签（脚本早期那些"等端口起来"的
-#     healthz 探测会跑在这里，不能因为签不出 token 就把脚本弄挂）；
-#   · **node.yaml 比 token 文件新** —— 树被重建过（`rm -rf demo` 之类），此时 CA 换了，
-#     旧 token 已经不被认（服务端会当"不是本节点 CA 签的"直接忽略）。
+# 【口径：以磁盘为准】每次要发请求之前，都把 $API_TOKEN 对齐到 `<节点目录>/user/<用户名>`。
 #
-# 为什么值得多这两次 stat：这几条断言失真的代价很高 —— 拿旧 token 去打，看到的是 401，
-# 而 401 在这个项目里正是"访问控制生效"的正常表现，**假失败会伪装成正确答案**。
+# 为什么不是"签过一次就记住它"：这里踩过一个很隐蔽的坑 ——
+#
+#   脚本里任何一次 `FOO="$(some_func)"` 都是一次**子壳**。如果 some_func 内部打了 API，
+#   那么"现签 token"这件事会在子壳里发生：**token 落到磁盘上了，但 `API_TOKEN=...` 这个
+#   赋值回不到父壳**。父壳手里仍是上一份、而它的事实依据（目录/文件 mtime）已经变成新的，
+#   于是它理直气壮地认为"手里这份就是文件里那份"，把**一份已经被替换掉的旧 token** 发出去
+#   ⇒ 服务端 401 `ERR_API_AUTH_TOKEN_INVALID`。
+#
+#   而 401 在这个项目里恰恰是"访问控制生效"的正常表现 —— **假失败会伪装成正确答案**。
+#   backpressure.sh 的 ③ 就是这么被咬的：`WINDOW_NOW="$(window_now)"` 里那次 curl 现签了
+#   一份新的，紧接着 `run_probe` 又把旧的那份塞给了探针。
+#
+# 代价是每次 curl 多一次 stat 加读一个 ~105 字节的文件 —— 对验收脚本可以忽略；换来的是
+# **脚本侧永远不会拿着一份磁盘上不存在的凭据去打 API**。
+#
+# 只有两种情况真的去签发（-adduser -force，会覆盖同名文件、于是旧的那份确定性失效）：
+#   · token 文件不存在（或读不出来）—— 树刚建出来，还没给这个用户发过凭据；
+#   · `node.yaml` 比 token 文件新 —— 树被重建过，CA 换了，旧 token 已经不被认。
+# 另：`<节点目录>/node.yaml` 都还没有时**什么都不做**（树还没建），脚本早期那些"等端口起来"
+# 的 healthz 探测会跑在这里，不能因为签不出 token 就把整个脚本弄挂。
 api_token_ensure() {
   local cfg tokfile
   [ -n "${API_TOKEN_DIR}" ] || return 0
   cfg="${API_TOKEN_DIR}/node.yaml"
   [ -f "${cfg}" ] || return 0
-  tokfile="${API_TOKEN_DIR}/user/${API_TOKEN_USER}"
-  if [ -n "${API_TOKEN}" ] && [ -f "${tokfile}" ] && [ ! "${cfg}" -nt "${tokfile}" ]; then
-    return 0
+  tokfile="$(api_token_path)"
+  if [ -s "${tokfile}" ] && [ ! "${cfg}" -nt "${tokfile}" ]; then
+    if API_TOKEN="$(cat "${tokfile}" 2>/dev/null)" && [ -n "${API_TOKEN}" ]; then
+      return 0
+    fi
   fi
   API_TOKEN="$(mint_api_token "$(api_token_bin)" "${API_TOKEN_DIR}")" || return 1
   return 0
