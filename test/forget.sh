@@ -58,7 +58,7 @@ for c in d.get("children") or []:
 # field <json> <字段表达式>：取一个字段（表达式里用 d 指代顶层对象）。
 field() { printf '%s' "$1" | py "import json,sys; d=json.load(sys.stdin); print(d${2})"; }
 
-[ -x "${REPO}/bin/treecmd-node" ] || die "找不到 ${REPO}/bin/treecmd-node；先 go build -o bin/treecmd-node ./cmd/node"
+[ -x "${REPO}/bin/treecmd-node" ] || die "找不到 ${REPO}/bin/treecmd-node；请放入预编译好的二进制（开发机上：go build -o bin/treecmd-node ./cmd/node）"
 
 cleanup
 "${HERE}/demo.sh" start >/tmp/treecmd-forget-demo.log 2>&1 || { tail -20 /tmp/treecmd-forget-demo.log; exit 1; }

@@ -187,7 +187,7 @@ case "${1:-all}" in
   *)    die "用法：$0 [all|stop]" ;;
 esac
 
-[ -x "${BIN}" ] || die "找不到 ${BIN}；先在仓库里 go build -o bin/treecmd-node ./cmd/node"
+[ -x "${BIN}" ] || die "找不到 ${BIN}；请放入预编译好的 bin/treecmd-node（开发机上：go build -o bin/treecmd-node ./cmd/node）"
 [ -f "${PROBE}" ] || die "找不到探针 ${PROBE}"
 
 step "〇 清场并起树（复用 demo.sh：根 + 直接叶子 + 中继 + 中继下的叶子）"

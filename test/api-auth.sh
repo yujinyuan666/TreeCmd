@@ -215,7 +215,7 @@ wait_api() { # 等端口可用（启动是后台的，别用固定 sleep 赌）
 }
 
 # ── 前置 ────────────────────────────────────────────────────────────────────
-[ -x "${BIN}" ] || die "找不到 ${BIN}；先 go build -o bin/treecmd-node ./cmd/node"
+[ -x "${BIN}" ] || die "找不到 ${BIN}；请放入预编译好的 bin/treecmd-node（开发机上：go build -o bin/treecmd-node ./cmd/node）"
 [ -x "${INIT_ROOT}" ] || die "找不到 ${INIT_ROOT}"
 
 stop_root

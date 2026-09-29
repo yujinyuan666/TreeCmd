@@ -177,7 +177,7 @@ expect_refuse() {
 
 # ── 主流程 ──────────────────────────────────────────────────────────────────
 cmd_run() {
-  [ -x "${BIN}" ] || die "找不到 ${BIN}；先在仓库里 go build -o bin/treecmd-node ./cmd/node"
+  [ -x "${BIN}" ] || die "找不到 ${BIN}；请放入预编译好的 bin/treecmd-node（开发机上：go build -o bin/treecmd-node ./cmd/node）"
   [ -x "${INIT_ROOT}" ] || die "找不到 ${INIT_ROOT}"
 
   cmd_stop >/dev/null 2>&1 || true

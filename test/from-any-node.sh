@@ -29,6 +29,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # API 没有免签来源（含本机）：所有请求都要带 user token —— 见 lib/apitoken.sh
 . "${HERE}/lib/apitoken.sh"   # 对外 API 一律要 user token：装好后所有 curl 自动带上
 . "${HERE}/lib/platform.sh"   # 跨平台：文件摘要（GNU 上是 sha256sum，BSD 上是 shasum）
+. "${HERE}/lib/prebuilt.sh"   # 产物从哪来：有 Go 就现编，只拷运行时的目标机就用带来的预编译产物
 cd "${HERE}" || exit 1
 
 KEEP="${1:-}"
@@ -53,13 +54,11 @@ fail() { bad "$*"; FAILED=1; }
 
 trap '[ "${KEEP}" = "keep" ] || ./demo.sh stop >/dev/null 2>&1 || true' EXIT
 
-# ⓪ 二进制：改了代码没重建是最容易踩的坑（跑出来是旧行为），所以这里自动补上
+# ⓪ 二进制：改了代码没重建是最容易踩的坑（跑出来是旧行为），所以这里自动补上。
+# "产物从哪来"交给 lib/prebuilt.sh 收口：有 Go 就现编；目标机只拷了运行时（没有 Go、也没有
+# 源码目录）时就用带来的预编译产物，缺产物时**响亮报错** —— 免得"没测到"伪装成"测过了"。
 mkdir -p logs
-if [ ! -x "${BIN}" ] ||
-   [ -n "$(find "${REPO}/cmd" "${REPO}/internal" -name '*.go' -newer "${BIN}" -print -quit 2>/dev/null)" ]; then
-  info "重建 bin/treecmd-node（缺失或比源码旧）"
-  (cd "${REPO}" && go build -o bin/treecmd-node ./cmd/node) || { bad "编译失败"; exit 1; }
-fi
+ensure_node_bin "${REPO}" "${BIN}" || { bad "主镜像不可用，无法继续"; exit 1; }
 ok "镜像已是最新"
 
 # ① 起树。必须 DEMO_PER_NODE_BIN=1：每节点一份自己的二进制，脚本目录才各自独立

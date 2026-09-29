@@ -129,7 +129,7 @@ case "${1:-all}" in
   *)    die "用法：$0 [all|stop]" ;;
 esac
 
-[ -x "${BIN}" ] || die "找不到 ${BIN}；先在仓库里 go build -o bin/treecmd-node ./cmd/node"
+[ -x "${BIN}" ] || die "找不到 ${BIN}；请放入预编译好的 bin/treecmd-node（开发机上：go build -o bin/treecmd-node ./cmd/node）"
 
 step "〇 阶段一：起一次完整树，让根的 state.dat 记下两个直接子的身份，然后全停"
 stop_tree

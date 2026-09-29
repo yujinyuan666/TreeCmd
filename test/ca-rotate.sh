@@ -24,6 +24,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # API 没有免签来源（含本机）：所有请求都要带 user token —— 见 lib/apitoken.sh
 . "${HERE}/lib/apitoken.sh"   # 对外 API 一律要 user token：装好后所有 curl 自动带上
 . "${HERE}/lib/platform.sh"   # 跨平台：文件摘要（GNU 上是 sha256sum，BSD 上是 shasum）
+. "${HERE}/lib/prebuilt.sh"   # 产物从哪来：有 Go 就现编，只拷运行时的目标机就用带来的预编译产物
 REPO="${TREECMD_REPO:-$(cd "${HERE}/.." && pwd)}"
 DEMO="${HERE}/demo"
 API_TOKEN_DIR="${DEMO}/root"      # token 签在哪个节点目录下（下面所有 curl 自动带上）
@@ -76,7 +77,11 @@ info "原始 CA 公钥指纹   = ${ORIG_PUB}"
 info "信任锚 ca.crt 指纹 = ${ANCHOR_FP_BEFORE}"
 
 step "② 把根的 CA 证书做旧（NotBefore 往前挪 20h，生命期 22h ⇒ 落在续签窗口里）"
-( cd "${REPO}" && go run test/ca-rotate/main.go -dir "${DEMO}/root" -life 22h -age 20h ) \
+# 做旧工具原本是 `go run test/ca-rotate/main.go …` —— 也就是"必须现场有 Go"。
+# 改成优先用随包带来的 bin/ca-rotate（见 lib/prebuilt.sh）：**做旧这个动作仍然发生在目标环境**
+# （它操作的就是 ${DEMO}/root 里的证书），只是工具本身不必在那里编译。
+CA_HELPER="$(ca_rotate_helper "${REPO}")" || die "拿不到 CA 做旧工具"
+( cd "${REPO}" && "${CA_HELPER}" -dir "${DEMO}/root" -life 22h -age 20h ) \
   || die "做旧失败"
 AGED_FP="$(fp "${CA}")"
 [ "$(pubkey "${CA}")" = "${ORIG_PUB}" ] && ok "做旧后公钥不变（只动有效期）" \

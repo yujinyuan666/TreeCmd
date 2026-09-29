@@ -22,6 +22,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # API 没有免签来源（含本机）：所有请求都要带 user token —— 见 lib/apitoken.sh
 . "${HERE}/lib/apitoken.sh"   # 对外 API 一律要 user token：装好后所有 curl 自动带上
 . "${HERE}/lib/platform.sh"   # 跨平台：文件摘要 / 字节数（GNU 与 BSD 的 stat、shasum 写法不同）
+. "${HERE}/lib/prebuilt.sh"   # 产物从哪来：有 Go 就现编，只拷运行时的目标机就用带来的预编译产物
 REPO="${TREECMD_REPO:-$(cd "${HERE}/.." && pwd)}"
 BIN="${REPO}/bin/treecmd-node"
 DEMO="${HERE}/demo"
@@ -43,12 +44,12 @@ step() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 
 short_hash() { sha256_of "$1" | cut -c1-12; }
 
-# build_variant <版本标记> <输出路径>：只改 buildinfo.Version 注入值 —— 字节变了哈希就变了。
-# 已存在时复用（prepare 用 REBUILD=1 强制重造）。
-build_variant() {
-  [ -x "$2" ] && [ -z "${REBUILD:-}" ] && return 0
-  ( cd "${REPO}" && go build -ldflags "-X treecmd/internal/buildinfo.Version=$1" -o "$2" ./cmd/node )
-}
+# 变体「从哪来」收口到 lib/prebuilt.sh 的 ensure_variant：
+#   · 有 Go → 现编（prepare 传 force 强制重造，确保两份确实是当前源码的产物）；
+#   · 没有 Go（目标机只拷了运行时）→ 用随包带来的 bin/treecmd-node.v1 / .v2，缺了才报错。
+#
+# 原来这里是无条件 `go build`，在没装 Go 的机器上会让整套用例直接崩，而崩的原因看起来像
+# "可执行文件自同步坏了"—— 其实只是那台机器上没有编译器。**测试手段不该由被测环境提供。**
 
 pid_of() { [ -f "${PIDFILE}" ] || return 1; awk -F: -v n="$1" '$1==n{print $2}' "${PIDFILE}"; }
 
@@ -79,8 +80,8 @@ wait_child_converged() {
 
 cmd_prepare() {
   step "预生成两个变体（v1 / v2）"
-  REBUILD=1 build_variant v1 "${BIN}.v1"
-  REBUILD=1 build_variant v2 "${BIN}.v2"
+  ensure_variant "${REPO}" "${BIN}" v1 force || die "缺 v1 变体（预编译产物没带全？见 lib/prebuilt.sh 的文件头）"
+  ensure_variant "${REPO}" "${BIN}" v2 force || die "缺 v2 变体（预编译产物没带全？见 lib/prebuilt.sh 的文件头）"
   ok "v1 = $(short_hash "${BIN}.v1")（$(file_size "${BIN}.v1") 字节）"
   ok "v2 = $(short_hash "${BIN}.v2")（$(file_size "${BIN}.v2") 字节）"
 }
@@ -157,7 +158,8 @@ EOF
 # ---------- 主验证 ----------
 
 cmd_all() {
-  [ -x "${BIN}.v1" ] && [ -x "${BIN}.v2" ] || die "缺变体，先跑 ./selfupdate.sh prepare"
+  ensure_variant "${REPO}" "${BIN}" v1 || die "缺 v1 变体，先跑 ./selfupdate.sh prepare"
+  ensure_variant "${REPO}" "${BIN}" v2 || die "缺 v2 变体，先跑 ./selfupdate.sh prepare"
   local h1 h2; h1="$(short_hash "${BIN}.v1")"; h2="$(short_hash "${BIN}.v2")"
   [ "${h1}" != "${h2}" ] || die "两个变体哈希相同，测试无效"
 
@@ -284,13 +286,13 @@ cmd_all() {
 readonly_case() {
   mkdir -p "${WORK}/bin" "${LOGS}"
   [ -f "${PIDFILE}" ] || : > "${PIDFILE}"
-  [ -x "${BIN}.v1" ] || die "缺 v1 变体，先跑 ./selfupdate.sh prepare"
+  ensure_variant "${REPO}" "${BIN}" v1 || die "缺 v1 变体，先跑 ./selfupdate.sh prepare"
 
   # 单独跑 readonly 时父可能没在跑（cmd_all 退出时 trap 会把根一起停掉）—— 没有父就永远
   # 没有"不一致"，叶子根本不会去拉镜像，这个负向用例会以"没有预期的失败降级"**假失败**。
   # 所以按需补起一个根（材料 / 入网许可靠 demo.sh 那套约定补齐）。
   if ! curl -s --max-time 3 "http://${ROOT_API}/v1/healthz" >/dev/null 2>&1; then
-    [ -x "${BIN}.v2" ] || die "缺 v2 变体，先跑 ./selfupdate.sh prepare"
+    ensure_variant "${REPO}" "${BIN}" v2 || die "缺 v2 变体，先跑 ./selfupdate.sh prepare"
     info "父没在跑 → 现起一个（负向用例需要一个父，否则叶子不会去拉镜像）"
     if [ ! -f "${DEMO}/root/certs/node.crt" ]; then
       "${REPO}/scripts/init_root.sh" "${DEMO}/root" "${ROOT_ID}" >/dev/null || die "init_root.sh 失败"
