@@ -59,6 +59,9 @@ Python 3（系统自带的 3.9 就能跑）与一个能访问到的 treecmd 根�
 和 `scripts/init_root.sh`；仓库根默认由脚本位置推导（`test/` 的上一级），
 确实要指别处时用环境变量 `TREECMD_REPO` 覆盖。
 
+目标机上没有 Go 工具链也能跑 —— 前提是 `bin/` 下有开发机交叉编译好的产物，
+详见下面《目标机不装 Go 怎么跑（`lib/prebuilt.sh`）》。
+
 ## 可执行文件自同步怎么验（`selfupdate.sh`）
 
 控制台看的是"树跑得对不对"；`selfupdate.sh` 看的是另一件事：**子节点跑的是不是父那一份镜像**。
@@ -116,6 +119,9 @@ go run test/ca-rotate/main.go -dir test/demo/root -life 22h -age 20h
 # 判链：用**产品代码里那个** ChainVerifier 判"某条链能不能接到某个锚"，并打印 SKI/AKI
 go run test/ca-rotate/main.go -verify-anchor <锚文件> -verify-chain <链文件>
 ```
+
+> `ca-rotate.sh` 自己已经不用 `go run` 了：它优先用 `bin/ca-rotate`（由同一个 main.go 编译而来），
+> 于是**在没装 Go 的目标机上也能跑**。上面那三条命令是给开发机手动排查用的，参数完全一样。
 
 > `-verify` 这个模式是排查"链为什么验不过"的第一现场：证书的 `SubjectKeyId` 由**生成方式**
 > 决定（Go 与 openssl 算出来的不一样），而 Go 的链构建会先按 AKI→SKI 找签发者。
@@ -360,6 +366,59 @@ API_AUTH_LAN_IP=10.0.0.5 ./api-auth.sh    # 自动探测不到本机非回环地
 
 > 仍按平台硬编码、但两边都存在的：`/usr/bin/python3`（macOS 与 openEuler 都自带）。
 > 要移植到没有该路径的发行版时，改 `PYTHON` 环境变量或那几处硬编码。
+
+## 目标机不装 Go 怎么跑（`lib/prebuilt.sh`）
+
+treecmd 的实际部署形态是**只拷运行时**：目标机上只有预编译好的二进制，**没有 Go 工具链，
+也不该在那里编译**（实测环境：openEuler 24.03 x86_64，`command -v go` 为空）。
+而验收脚本原先默认「仓库里有源码，缺什么现编什么」，在这类机器上会得到两种都不该出现的结果：
+
+- `go: command not found` —— 报错长得像"功能坏了"，其实只是环境里没有编译器；
+- 更糟的是：某个断言因为"产物没造出来"而根本没跑到，报告里却不显眼 ⇒ **没测到伪装成测过了**。
+
+所以把"产物从哪来"收口到 `test/lib/prebuilt.sh`，口径写死成三条：
+
+| 情况 | 行为 |
+|---|---|
+| 有 Go 且源码在 | 照旧现编（开发机上的行为一个字不变） |
+| 没有 Go | 用随包带来的预编译产物，**不因为「源码比二进制新」重建** |
+| 没有 Go 又缺产物 | 响亮报错，说清缺哪一份、该在哪儿编 |
+
+约定位置（都相对仓库根，都在 `.gitignore` 里）：
+
+| 路径 | 是什么 | 谁在用 |
+|---|---|---|
+| `bin/treecmd-node` | 主镜像 | 所有脚本（`ensure_node_bin` / `require_node_bin`） |
+| `bin/treecmd-node.v1` / `.v2` | 两份**字节不同**的镜像（只差 `-ldflags -X …Version=`） | `selfupdate.sh`（`ensure_variant`） |
+| `bin/ca-rotate` | CA 证书做旧工具 | `ca-rotate.sh`（`ca_rotate_helper`） |
+
+在开发机上交叉编译（**目标机零编译**）：
+
+```bash
+export CGO_ENABLED=0 GOOS=linux GOARCH=amd64          # 目标架构按实际机器改
+go build -trimpath -o bin/treecmd-node ./cmd/node
+go build -trimpath -ldflags "-X treecmd/internal/buildinfo.Version=v1" -o bin/treecmd-node.v1 ./cmd/node
+go build -trimpath -ldflags "-X treecmd/internal/buildinfo.Version=v2" -o bin/treecmd-node.v2 ./cmd/node
+go build -trimpath -o bin/ca-rotate test/ca-rotate/main.go
+```
+
+两处值得单独说清楚：
+
+- **`selfupdate.sh` 的"测试手段本身就是编译"** —— 它需要两份字节不同的镜像，才能验
+  "哈希不一致 ⇒ 自同步"。口径因此是"有 Go 就现编、`prepare` 传 `force` 强制重造；
+  没有就用带来的 v1/v2"。原来那句无条件 `go build` 在没装 Go 的机器上会让整套崩，
+  而崩的原因看起来像"可执行文件自同步坏了" —— **测试手段不该由被测环境提供。**
+- **`ca-rotate.sh` 的"做旧"动作仍然发生在目标环境** —— 它操作的就是 `${DEMO}/root` 里的证书；
+  不必在目标机上编译的只是那个**工具本身**（原本是 `go run test/ca-rotate/main.go …`）。
+
+> 只拷运行时的包里**没有** `cmd/`、`internal/`、`vendor/`，也没有 Go 工具链。
+> `_pb_src_newer` 只在源码目录存在时才判"源码比二进制新"，所以这种包里天然不会触发重建 ——
+> 这正是想要的：**没有源码，"源码比二进制新"就无从谈起**。
+>
+> 写这套东西时踩了一个 bash 的坑，值得记一笔：`local repo="$1" helper="${repo}/bin/ca-rotate"`
+> 里，两个字**都在赋值之前展开**，所以 `${repo}` 拿到的是外层（未定义的）变量，
+> 路径会拼成 `/bin/ca-rotate` —— 然后在"文件不存在"的分支上炸掉，看起来像"预编译产物没带"。
+> 必须拆成两句写。
 
 ## 三个"测试脚手架自己骗自己"的坑（都踩过，已在脚本里堵上）
 
