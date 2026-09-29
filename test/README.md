@@ -66,13 +66,17 @@ Python 3（系统自带的 3.9 就能跑）与一个能访问到的 treecmd 根�
 ```bash
 ./selfupdate.sh prepare    # 预生成 v1 / v2 两个"内容不同"的可执行文件（编译吃内存，单独跑更稳）
 ./selfupdate.sh all        # 起根(v2) + 三个子节点各自以 v1 启动 → 断言它们自己跟上并原地重启
-./selfupdate.sh readonly   # 负向用例：暂存目录只读 → 断言 fail-safe（继续服务、不重启循环）
+./selfupdate.sh readonly   # 负向用例：暂存路径不可写 → 断言 fail-safe（继续服务、不重启循环）
 ./selfupdate.sh stop
 ```
 
 它断言的是四件硬事实：① 子节点确实向父申请了镜像；② 校验通过后**原地重启**（PID 必须不变）；
 ③ 磁盘上它自己那份文件真的变成了 v2 的内容；④ 整棵树收敛（根视角 `lagging_children=0`）。
-另外还跑两条对照：**同版本时不得有任何同步动作**，以及**暂存目录只读时必须继续服务**。
+另外还跑两条对照：**同版本时不得有任何同步动作**，以及**暂存路径不可写时必须继续服务**。
+
+> `readonly` 单独跑时会**按需起一个父**（它需要"子与父不一致"这个前提）；`all` 里已经带过这个负向用例。
+> "只读"的造法对 root 无效（`chmod 0555` 会被 `CAP_DAC_OVERRIDE` 绕过），脚本会自动改成 ENOTDIR ——
+> 详见下面《三个"测试脚手架自己骗自己"的坑》。
 
 > 脚本刻意**不**做"替换正在运行的可执行文件"这个动作。原因见 `internal/node/build.go` 的
 > `commit()`：替换必须走"写暂存文件 + rename"，而 macOS 上"原地覆盖某个可执行文件之后立刻
@@ -325,11 +329,19 @@ API_AUTH_LAN_IP=10.0.0.5 ./api-auth.sh    # 自动探测不到本机非回环地
 > 的 mtime/大小校验新鲜度，并把签发改成原子替换（覆盖写文件**不会**改变目录 mtime，
 > 这也是"`-adduser -force` 换 token 后打不通"的根因）。
 
-> 其余打 API 的测试脚本（`forget.sh`、`script.sh`、`from-any-node.sh`…）统一用
-> `test/lib/apitoken.sh`：source 之后所有 `curl` 自动带上 `X-Treecmd-Token`，token 现签一次并缓存；
-> 树被重建（`node.yaml` 比 token 文件新）时会自动重签，避免拿旧凭据跑出"看起来像访问控制生效"的假失败。
+> 其余打 API 的测试脚本（`forget.sh`、`script.sh`、`from-any-node.sh`、`uuid_v4.sh`…）统一用
+> `test/lib/apitoken.sh`：source 之后所有 `curl` 自动带上 `X-Treecmd-Token`。凭据以**磁盘上的
+> `user/<用户名>` 为准**（每次请求前对齐那份内容），文件不存在或树被重建（`node.yaml` 比它新）时才现签
+> —— 这样既不会拿旧凭据跑出"看起来像访问控制生效"的假失败，也不会出现"子壳里刚签了一份、父壳还用旧的"
+> （见下面《三个"测试脚手架自己骗自己"的坑》第 ③ 条）。
 > 多节点的脚本（如 `from-any-node.sh` 要打中继的 API）自己写 `-H "X-Treecmd-Token: ..."` 覆盖，
 > 包装器会尊重调用处给的头。
+
+> **用 python 直接发请求的工具不走这条通路**：`backpressure/probe.py` 绕过了 curl 包装器，
+> 所以凭据要显式传（`--token`，由 `backpressure.sh` 从 `lib/apitoken.sh` 取）。
+> 忘传的表现是 401 —— 而 401 在这个项目里正是"访问控制生效"的正常样子，**假失败会伪装成正确答案**，
+> 所以探针在 401/403 时会额外提示"这多半是 token 的问题"。`test/backpressure/inject.py` 只改本地
+> `node.yaml`，不碰 HTTP，不需要 token。
 
 ## 跨平台：`lib/platform.sh`（macOS / Linux 都能跑）
 
@@ -348,6 +360,79 @@ API_AUTH_LAN_IP=10.0.0.5 ./api-auth.sh    # 自动探测不到本机非回环地
 
 > 仍按平台硬编码、但两边都存在的：`/usr/bin/python3`（macOS 与 openEuler 都自带）。
 > 要移植到没有该路径的发行版时，改 `PYTHON` 环境变量或那几处硬编码。
+
+## 三个"测试脚手架自己骗自己"的坑（都踩过，已在脚本里堵上）
+
+验收脚本报的 ✓ 必须能当证据用。下面三处曾经让 ✓ 变成噪声，值得单独记一笔 ——
+它们的共同点都是**失败被伪装成了成功**，比直接报错难查得多。
+
+### ① 日志由**父进程**先清空，别让子进程去 `>` 截断
+
+`demo.sh` 里起节点的写法曾经是：
+
+```bash
+"$(run_bin "${dir}")" -config "${dir}/node.yaml" > "${LOGS}/${name}.log" 2>&1 &
+wait_registered "${LOGS}/${name}.log"   # ← 紧接着就读这份日志
+```
+
+`>` 是在 fork 出来的**子进程**里做的（exec 之前），而父进程 `start_one` 一返回就 `grep` 了 ——
+两者在竞速。这个二进制 20MB，子进程被调度到、并把文件截断之前有一段窗口（openEuler aarch64 上
+实测能命中），窗口里文件还是**上一轮**的内容，于是：
+
+* `wait_registered` 命中上一轮的 `msg=registered`，当场报"入网并注册成功"，而节点其实还没入网；
+* 更要命的是第 ③ 步要从 `relay.log` 里读中继自己的 NodeID。读到上一轮的，`leaf-beta` 的
+  `parents[].id` 就成了**上一轮中继**的 ID；中继 NodeID 是每轮新生成的 UUIDv7，于是叶子之后
+  一直以 `peer identity "<本轮>" != expected "<上一轮>"` 入网失败。
+  `script.sh` / `from-any-node.sh` 的失败就是这个，而且 `rm -rf demo` + 清空 `logs/` 都**治不好** ——
+  污染来自 `logs/` 里上一轮留下的**文件内容**，不是目录结构。
+
+现在的写法是父进程先 `: > "${LOGS}/${name}.log"`、子进程只 `>>` 追加，窗口直接不存在。
+`wait_registered` 同时改成**超时返回非零**、`cmd_start` 用 `die` 收口：树不完整时在正确的位置响亮地失败，
+而不是让不相干的断言在下游莫名其妙地红。中继 NodeID 也改成**优先问中继自己的 `/v1/healthz`**
+（唯一免 token 的端点，回的就是它自己的 `node_id`，是权威来源），日志只做兜底。
+
+> 同一个道理：`demo.sh stop` 现在**等进程真的退出**（收不住就 KILL）再返回。TERM 只是"请求"，
+> 不等的话上一轮节点可能还占着 19493/19494、还握着 `logs/*.log` 的 fd，紧接着的
+> `rm -rf demo` + `start` 就会和它对撞，报出来的全是噪声。
+
+### ② `chmod 0555` 挡不住 root（`selfupdate.sh` 的负向用例）
+
+`selfupdate.sh readonly` 的负向用例是"暂存目录只读 → 拉取必然写不进去 → 必须继续服务"。
+造"只读目录"用的是 `chmod 0555` —— 而 **root 有 `CAP_DAC_OVERRIDE`，直接绕过权限位**，
+目录照样可写，前提不成立。此时拉取会**成功**，错误后移到替换环节（`/tmp` 是 tmpfs 时还会
+`EXDEV: invalid cross-device link`），日志里是「**替换**可执行文件失败」而不是用例要验的
+「**拉取**失败」→ 断言假失败（以 root 跑验收就会碰到，容器 / CI 里很常见）。
+
+现在脚本先探一次"还写得进去吗"，写得进去就改用 **ENOTDIR**：把暂存路径指向一个普通文件，
+用它当目录用 `MkdirAll` 必然报 `not a directory`，root 也一样建不出来。两条路都落在
+`pullBinary` 的同一个失败返回值上，所以断言口径不变。`readonly` 还补了"按需起一个父"——
+它单独跑时父可能没在跑（`cmd_all` 退出会 trap 掉），没有父就没有"不一致"，叶子永远不会去拉镜像。
+
+### ③ `$( )` 子壳里签的 token，父壳拿不到（`lib/apitoken.sh`）
+
+`apitoken.sh` 最早的口径是"签过一次就把凭据记在 `$API_TOKEN` 里"，之后只用"`node.yaml` 是否比
+token 文件新"判断要不要重签。它漏了一件事：**脚本里任何一次 `FOO="$(some_func)"` 都是一次子壳**,
+如果 `some_func` 内部打了 API，那么"现签 token"就发生在子壳里 —— **token 落到了磁盘上，但
+`API_TOKEN=...` 这个赋值回不到父壳**。父壳手里仍是上一份，而它的事实依据（文件 mtime）已经翻新，
+于是它合理地认为"手里这份就是文件里那份"，把一份**已经被替换掉的旧 token** 发出去
+⇒ 401 `ERR_API_AUTH_TOKEN_INVALID`。
+
+`backpressure.sh` 的 ③ 就是这么被咬的（现场日志：同一秒内 `/metrics` 200、紧接着探针提交 401）：
+
+```bash
+WINDOW_NOW="$(window_now)"    # ← 子壳；里面那次 curl 现签了一份新 token 写进 user/tester
+run_probe "阶段B-窗口不限"      # ← 父壳还攥着上一阶段那份旧 token
+```
+
+改法（即现在的口径）：**凭据的唯一事实来源是磁盘** —— 每次要发请求之前，`api_token_ensure`
+都把 `$API_TOKEN` 对齐到 `<节点目录>/user/<用户名>` 的**当前内容**；只有"文件不存在 / 读不出来"
+或"`node.yaml` 比它新（树被重建过，CA 换了）"才真的去 `-adduser -force` 现签一份。
+代价是每次 curl 多一次 stat 加读 ~105 字节的文件，对验收脚本可以忽略；换来的是
+**脚本侧永远不会拿着一份磁盘上不存在的凭据去打 API** —— 而 401 在这个项目里正是"访问控制生效"
+的正常表现，**假失败会伪装成正确答案**。
+
+> 同一个陷阱还有个更朴素的形态：**`$( )` 里对变量的赋值（含 `export`）本来就是一次性的**。
+> 判断标准很简单 —— 只要那个函数会改"后面还要用到的全局量"，就别把它放进 `$( )`。
 
 ## 入网授权策略怎么验（`enroll-policy.sh`）
 
