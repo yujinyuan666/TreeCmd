@@ -57,8 +57,10 @@ id_ed25519.pub
 enroll.token
 enroll.token.*
 
-# 对外 HTTP 的共享密钥（api.auth.secret_path 指向的那份，见 internal/node/apiauth.go）
-# 它等价于"能执行 HTTP 写接口的凭据"，泄露 = 别人可以吊销节点、清注册状态
+# 对外 HTTP 的 user token（`-adduser` 写出来的凭据，见 internal/node/usertoken.go）
+# 它等价于"能调这个 HTTP 端点的凭据"，泄露 = 别人可以吊销节点、清注册状态、让整棵子树干活
+user/
+# 旧版本（共享密钥 api.secret）留下的痕迹：已废弃，留着这条是为了别让它哪天又被提交进来
 api.secret
 api.secret.*
 

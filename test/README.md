@@ -292,9 +292,9 @@ COUNT=50 ./backpressure.sh # 改批量
 ## 对外 HTTP 的访问控制怎么验（`api-auth.sh`）
 
 前面那些脚本验的都是"树内部"的事；`api-auth.sh` 验的是**对外的门锁**：
-写接口（`POST /v1/crl`、`POST /v1/forget`、`POST /v1/commands`…）**不能被"能连上这个端口的人"执行** ——
-本机（回环）免签放行；其它来源必须带共享密钥的 HMAC 签名；**没配密钥 ⇒ 非本机写请求一律拒绝**
-（fail-closed，而不是"没配就放行"）。口径见 README 的「访问控制：写接口的本机豁免与远程签名」。
+这个端口**没有免签来源** —— 不管请求从哪来（回环、网卡地址、局域网），只要拿不出本节点 CA 签发的
+user token 就一律拒绝；读接口同样在射程内，唯一例外是 `/v1/healthz` 存活探针。
+口径见 README 的「访问控制：一律凭 user token，没有免签来源」。
 
 ```bash
 ./api-auth.sh          # 跑完整验证，结束后自动清场
@@ -302,32 +302,34 @@ COUNT=50 ./backpressure.sh # 改批量
 API_AUTH_LAN_IP=10.0.0.5 ./api-auth.sh    # 自动探测不到本机非回环地址时手动指定
 ```
 
-它**刻意把节点的 api 绑在 `0.0.0.0`**，再从**本机自己的非回环地址**打过去 —— 那条路走的是网卡，
-对端就是网卡地址，与"局域网里另一台机器"完全等价。绑 `127.0.0.1` 是验不了这件事的：
-所有请求都是回环，整条规则永远不会触发。
+它**刻意把节点的 api 绑在 `0.0.0.0`**，再从**本机自己的非回环地址**也打一遍 —— 那条路走的是网卡，
+对端就是网卡地址，与"局域网里另一台机器"完全等价。现在的判据是凭据而不是来源，所以两边**结论必须一样**：
+这是"从哪来已经不影响判定"的直接证据。
 
-五个阶段，每阶段重启一次（按"启动前把日志挪走"的规矩重来）：
+六个阶段：
 
 | 阶段 | 断言 |
 |---|---|
-| ① 对外监听、**没有密钥** | 本机写请求 200 且真的写进去了；远程**读**请求仍 200；远程**写**请求 403 `ERR_API_AUTH_NOT_CONFIGURED`；**签了名也没用**（判据是节点有没有密钥）；被拒的 GUID 一个都没进 CRL |
-| ② 目录里放 `api.secret`（`node.yaml` 一个字没改 ⇒ 验**约定补全**） | 本机写请求放行；远程无签名 401 `ERR_API_AUTH_REQUIRED`；`scripts/api_call.py` 签名的请求 200 **且真的执行了**；**audience 不是本节点** 401 `ERR_API_AUTH_AUDIENCE`；错密钥 / 过期时间戳（1 小时前）/ 原样重放（同 ts+nonce）/ 签名换目标 全部 401；响应带 `X-Treecmd-Response-Signature`；被拒的 GUID 都没进 CRL |
-| ③ 显式 `secret_path` + `protect_reads: true` | 远程**读**请求也要签名（401），本机读请求仍放行；**重启后吊销列表还在** |
-| ④ **本地反向代理绕过**：回环 + 转发特征头 | 带 `X-Forwarded-For` / `Via` 的本机写请求 401（免签资格没了）；不带任何转发头的本机请求照常 200（主路径没被误伤）；配 `trusted_proxies` 后按转发链还原：XFF=127.0.0.1 → 200，XFF=网卡地址 / `外网, 127.0.0.1` → 401 |
-| ⑤ `api.tls`：端点改以 HTTPS 提供 | 明文打 TLS 端口被拒（400：请求发给了 HTTPS 服务端）；HTTPS 存活探针 200；`api_call.py --tls` 带通道绑定 + 校验响应签名 → 200 且真的执行了；**签名对但不带通道绑定** → 401 `ERR_API_AUTH_CHANNEL_BINDING` |
+| ① **还没有任何 token** | 本机写请求 401 `ERR_API_AUTH_REQUIRED`（文案点明"没有免签来源"）；网卡地址写请求同样 401；**读**请求（`/v1/tree`、`/v1/crl`）也 401；`/v1/healthz` 仍 200；审计日志里留下 AUDIT-REJECT |
+| ② `-adduser alice` | 文件落在 `user/alice`（目录 700 / 文件 600），形态是 `<16 位随机串>.<64 字节签名>`；重复签发被拒（不悄悄换掉在用的凭据）；**本机**与**网卡地址**各写一次都 200 且真的写进 CRL；错 token / 格式不对 / 手写的伪造文件（格式合法但签名对不上）全部 401；**① 阶段被拒的请求一条都没进 CRL** |
+| ③ **签了就生效、删了就失效**（全程不重启节点） | 新签 bob 立刻能写；`rm user/bob` 后 bob 立刻 401，alice 不受影响（缓存按目录变化 / 文件指纹失效，见 `usertoken.go`） |
+| ④ 反代 / 端口转发**不再有特殊含义** | 带 `X-Forwarded-For` + 有效 token → 200；带 `X-Forwarded-For` 冒充本机但没 token → 401（**这条就是历史漏洞的入口**）；`X-Real-IP` + `Via` 同理 |
+| ⑤ `api.tls`：端点改以 HTTPS 提供 | 明文打 TLS 端口被拒（400：请求发给了 HTTPS 服务端）；HTTPS 存活探针 200；HTTPS 不带 token → 401；`api_call.py --tls --token-file` → 200 且真的执行了 |
+| ⑥ token 只能由 CA 签 | 把 `keys/ca` 挪走后 `-adduser` 失败（文案点明"必须由本节点 CA 签发"）；用户名带路径穿越（`../evil`）被拒，且不在 `user/` 之外落任何文件 |
 
-> 阶段 ④⑤ 断言 `local_hit` / `remote_hit` 用的基址是**变量**（`LOCAL_BASE` / `REMOTE_BASE`），
+> 阶段 ⑤ 断言 `local_hit` / `remote_hit` 用的基址是**变量**（`LOCAL_BASE` / `REMOTE_BASE`），
 > 端点改成 HTTPS 后只需把基址与 `CURL_TLS_OPT=-k` 换掉，下面的断言一行都不用动。
 
-> 顺带说一句：第 ③ 阶段那条"重启后吊销列表还在"的断言，第一次跑就抓到了一个**既有缺陷** ——
-> `loadCRL()` 没有任何调用点（函数在、调用点漏了），于是 CRL 只写盘不读回，**父重启一次被吊销的
-> 节点就复活了**。修复是启动时（`store.Open` 之后、任何服务起来之前）调用它。
+> 顺带说一句：有一条断言第一次跑就抓到了**真实缺陷** —— "删除 token 文件后立刻失效"曾经不成立
+> （缓存只在未命中时重扫，被删掉的 token 一直留在缓存里）；修法是命中路径也按目录 mtime + 命中文件
+> 的 mtime/大小校验新鲜度，并把签发改成原子替换（覆盖写文件**不会**改变目录 mtime，
+> 这也是"`-adduser -force` 换 token 后打不通"的根因）。
 
-> 签名工具与测试**共用同一份实现**（`scripts/api_call.py`，测试用 `importlib` 按路径加载它），
-> 所以"服务端认了这个签名"本身就是"两边 canonical 编码逐字节一致"的证据 —— 测试里不要自己重写签名算法。
-
-> ⚠️ 重放用例需要**同一个 ts + nonce 发两次**，所以那两个值由测试自己生成再喂给签名函数
-> （`api_call.py` 每次调用都会新造 nonce，这是它的正常行为，也是我们想要的）。
+> 其余打 API 的测试脚本（`forget.sh`、`script.sh`、`from-any-node.sh`…）统一用
+> `test/lib/apitoken.sh`：source 之后所有 `curl` 自动带上 `X-Treecmd-Token`，token 现签一次并缓存；
+> 树被重建（`node.yaml` 比 token 文件新）时会自动重签，避免拿旧凭据跑出"看起来像访问控制生效"的假失败。
+> 多节点的脚本（如 `from-any-node.sh` 要打中继的 API）自己写 `-H "X-Treecmd-Token: ..."` 覆盖，
+> 包装器会尊重调用处给的头。
 
 ## 入网授权策略怎么验（`enroll-policy.sh`）
 
@@ -369,7 +371,7 @@ API_AUTH_LAN_IP=10.0.0.5 ./api-auth.sh    # 自动探测不到本机非回环地
 | `.selfupdate/` | `selfupdate.sh` 的工作区：各节点的二进制副本与节点目录 |
 | `zerotrust/` + `.zerotrust.pids` | `zero-trust.sh` 的工作区：一棵三层小树的节点目录、日志与 pid 表 |
 | `enroll-policy/` + `.enroll-policy.pids` | `enroll-policy.sh` 的工作区：一个根 + 一个反复重入网的子节点 |
-| `apiauth/` + `.apiauth.pids` | `api-auth.sh` 的工作区：一个 api 绑 `0.0.0.0` 的根节点、它的共享密钥（`api.secret`）与日志 |
+| `apiauth/` + `.apiauth.pids` | `api-auth.sh` 的工作区：一个 api 绑 `0.0.0.0` 的根节点、它的 user token（`user/`）与日志 |
 
 想彻底清干净：`./demo.sh stop && ./selfupdate.sh stop && ./zero-trust.sh stop && ./enroll-policy.sh stop && ./api-auth.sh stop && rm -rf demo zerotrust enroll-policy apiauth logs .demo.pids .selfupdate .zerotrust.pids .enroll-policy.pids .apiauth.pids`。
 

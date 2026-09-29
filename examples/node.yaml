@@ -139,59 +139,41 @@ node:
 api:
   http_addr: 127.0.0.1:18443
 
-  # ===== 访问控制：只保护**写操作**（见 internal/node/apiauth.go）=====
+  # ===== 访问控制：一律要 user token，没有免签来源 =====
   # 写接口里有几个**不可逆**的动作：POST /v1/crl 吊销节点、POST /v1/forget 清注册状态、
-  # POST /v1/commands 让整棵子树干活。所以非本机来源的写请求必须带共享密钥的 HMAC 签名。
+  # POST /v1/commands 让整棵子树干活；读接口也暴露拓扑与结果。所以**除存活探针外**
+  # 一切请求都要出示凭据 —— 不管从哪来（本机 / 局域网 / 外网）。
   #
   # 口径（前一条命中就不再往下判）：
-  #   ① /v1/healthz 永远放行（存活探针）；
-  #   ② 读请求（GET/HEAD/OPTIONS）默认放行，protect_reads: true 时才要签名；
-  #   ③ 出示了被 CA 验过的客户端证书且 tls.trust_client_cert: true —— 放行（mTLS 身份）；
-  #   ④ 来自**回环地址**且不带转发特征头 —— 放行（本机脚本、控制台代理、curl localhost）；
-  #   ⑤ 其余（非回环的写请求）必须带签名；**没配密钥 ⇒ 一律拒绝**（fail-closed）。
+  #   ① api.tls.require 打开而请求是明文 —— 拒绝（含回环来源）；
+  #   ② /v1/healthz 永远放行（存活探针，只回 ok / node_id / path）；
+  #   ③ 其余一切请求必须带 X-Treecmd-Token，且能在本节点 user/ 目录里找到并验签通过；
+  #      找不到 ⇒ 401。**读接口也在内**。
   #
-  # 请求头（域分隔 treecmd/api/v1；canonical 编码见 internal/canon）：
-  #   X-Treecmd-Timestamp: <Unix 秒>（与服务端时钟差必须在 ±60s 内）
-  #   X-Treecmd-Nonce:     <一次性随机串>（防时间窗内重放）
-  #   X-Treecmd-Audience:  <目标 node_id>        ← **必填**：签名只认"签给谁"
-  #   X-Treecmd-Channel-Binding: <base64>        ← 走 HTTPS 时由客户端自动带上
-  #   X-Treecmd-Signature: base64(HMAC-SHA256(secret, payload))
-  #   payload = 域 ‖ 方法 ‖ 路径 ‖ 原始 query ‖ sha256(body) ‖ 时间戳 ‖ nonce
-  #            ‖ 接收方 ‖ Host ‖ 通道绑定值
+  # 凭据怎么来（见 internal/node/usertoken.go）：
+  #   treecmd-node -config node.yaml -adduser <用户名>
+  #     → 用本节点 CA 私钥（security.ca_key_path）签一份 token，写进 user/<用户名>
+  #       （目录 0700、文件 0600），**文件内容就是要出示的凭据**：
+  #       <16 位随机串>.<base64(CA 对 域+用户名+随机串 的 Ed25519 签名)>
   #
-  # 后三个字段是防中继用的：audience 挡"把签好的请求转发给共享同一密钥的另一个节点
-  # **再执行一次**"（nonce 表是每节点一份的），Host 挡换入口投递，通道绑定挡中间人换证书。
-  # 配了密钥时**响应也签名**（X-Treecmd-Response-Signature），客户端可验"这真是那个节点回的"。
+  # 请求头只有一项：
+  #   X-Treecmd-Token: <user/<用户名> 文件的全部内容>
   #
-  # 远程运维**别手搓签名**：用 scripts/api_call.py（--audience 必填）。
-  # 生成密钥：head -c 32 /dev/urandom | base64 > api.secret && chmod 600 api.secret
+  # 特性：
+  #   · **签了就生效、删了就失效**（节点按 user/ 目录变化自动重扫，不用重启、不用 SIGHUP）；
+  #     `rm user/<用户名>` 就是收回那个人的权限；
+  #   · 逐份验签 ⇒ 手动往 user/ 里塞一个自己编的文件**不算授权**；
+  #   · `-adduser` 默认拒绝覆盖已存在的用户名（不悄悄换掉在用的凭据），要换加 -force；
+  #   · user 目录固定在节点目录下，没有配置项（落点少一个自由度就少一次配歪的机会）。
   #
-  # ⚠️ 回环豁免看的是 **TCP 对端地址**，而这个地址会被部署形态改写：API 端口前面挂了
-  #    本地反向代理 / 端口转发时，所有请求的对端都会变成 127.0.0.1。对此有两道闸：
-  #      · 带 Forwarded / X-Forwarded-For / X-Real-IP / Via 的请求**不再免签**
-  #        （正常代理都会加这些头，本机 curl 不会）；
-  #      · 确需放行就把代理地址写进 trusted_proxies，之后按 RFC 7239 从右往左剥可信跳、
-  #        取真实来源 —— 不是回环就照常要签名。
-  # ⚠️ 密钥不进 config_hash，且每个请求现读文件 ⇒ 换密钥既不用重启、也不用 SIGHUP。
-  # 【可选】整段不写 = 不配密钥：写接口只接受本机请求（对外监听时启动会打 WARN）。
-  # （所以这里整段是注释掉的 —— 抄这份样例直接就能跑，不会因为缺密钥文件拒绝启动。）
-  # auth:
-  #   # 从文件读（推荐：脚本投放、权限 600）。相对路径按 data_dir 展开。
-  #   # 约定文件同 enroll.token：节点目录里存在 api.secret 时会被**自动采纳**，这一行可以不写。
-  #   secret_path: api.secret
-  #   # 或者直接写在配置里（不推荐：会进配置备份与 shell 历史）
-  #   # secret: <与运维机一致的随机串>
-  #   # 【可选·默认 false】true = 读接口（/v1/tree、/v1/health、结果查询、/metrics）也要签名
-  #   protect_reads: false
-  #   # 【可选·默认 true】false = 本机来源也必须签名（前面挂了反代时的正确选择）
-  #   loopback_bypass: true
-  #   # 【可选·默认空 = 不信任何转发头】可信代理的 CIDR / IP 列表。
-  #   # 只有**对端**落在里面，才按转发头还原真实来源（否则转发头一律不信）。
-  #   trusted_proxies: ["127.0.0.1/32", "::1/128"]
-  #   # 【可选·默认 true】Host 头参与签名；前面是改写 Host 的反向代理时改 false
-  #   bind_host: true
-  #   # 【可选·默认 auto】通道绑定策略：auto（有 TLS 就要求）| require（一律要求）| off（明确放弃）
-  #   channel_binding: auto
+  # ⚠️ **不要按来源地址区分身份**：判据只能是 TCP 对端地址，而它会被部署形态改写 ——
+  #    API 端口前面挂了反向代理 / 端口转发（nginx、ssh -L、frpc、kubectl port-forward）时，
+  #    所有请求的对端都变成 127.0.0.1。历史上这里就用过"回环免签"（后来还加过转发头检测 +
+  #    trusted_proxies 白名单），**已整套删除**：现在带不带 X-Forwarded-For 结论都一样。
+  # ⚠️ token 是长期凭据、每个请求都会上线：跨不可信网络请开下面的 api.tls（建议 require: true）。
+  # 【可选】整段只写 http_addr 是合法的：此时除 /v1/healthz 外都进不来，启动日志会 WARN 提示
+  # 怎么发凭据。所以这里**没有 auth 段**（旧版本的 api.secret / secret_path / protect_reads /
+  # loopback_bypass / trusted_proxies / bind_host / channel_binding 均已废弃，写了会被忽略）。
 
   # ===== TLS：让端点改以 HTTPS 提供（防窃听 / 防响应伪造）=====
   # 【可选】不写 = 明文 HTTP（与历史行为一致；对外监听时启动会打 WARN）。
@@ -201,14 +183,12 @@ api:
   #   key_path:  certs/api.key    # 私钥，权限 600
   #   # 【可选】true = 这个端点**只以 HTTPS 提供**：明文请求一律拒绝（**含回环来源**）。
   #   # 为什么连回环也要管：TLS 终止型反向代理（对外 HTTPS、回源走明文）会把远程请求
-  #   # 以"看起来像本机"的明文请求递进来 —— 那正是"本地反代绕过"的另一个入口。
+  #   # 以"看起来像本机"的明文请求递进来；而且明文链路上 token 本来就会被抓走。
   #   require: true
   #   # ===== 以下两项是 mTLS（客户端也出示证书）时才配 =====
   #   ca_path: certs/api-ca.crt   # 校验客户端证书的 CA（文件或目录）
   #   client_auth: require        # off（默认）| optional（要了就验）| require（必须有且验过）
-  #   # 【可选·默认 false】true = 出示了被 CA 验过的客户端证书即视为已认证（**免 HMAC**）。
-  #   # 默认 false 是刻意的：不能因为配了 mTLS 就悄悄免掉共享密钥这道。
-  #   trust_client_cert: false
+  #   # （没有"出示客户端证书就免 token"这种开关：mTLS 只加固传输层，授权判据始终是 token。）
   #   min_version: "1.2"          # 或 "1.3"
 
 # ---------------------------------------------------------------------------

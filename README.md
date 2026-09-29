@@ -272,83 +272,70 @@ curl -s "localhost:18443/v1/health?command_id=<ID>&depth=2&detail=true"
 **祖先对这条指令一无所知**（拿它的 ID 去父节点查是 `NOT_FOUND`）。所以"从中继提交一条只影响中继及其子树的
 指令"天然成立；要跑这件事见 `test/from-any-node.sh`。
 
-### 访问控制：写接口的本机豁免与远程签名
+### 访问控制：一律凭 user token，没有免签来源
 
-`api.http_addr` 可以写成 `0.0.0.0`，而写接口里躺着几个**不可逆**的动作：`POST /v1/crl` 吊销节点
+`api.http_addr` 可以写成 `0.0.0.0`，而这个端口上躺着几个**不可逆**的动作：`POST /v1/crl` 吊销节点
 （本节点不校验 `?node=` 与自己的关系，直接写 CRL 并推给所有直接子）、`POST /v1/forget` 一条事务
-删掉注册表 / 水位 / 驱逐归档 / 结果副本、`POST /v1/commands` 让整棵子树执行指令。
-所以非本机来源的写请求必须带**共享密钥的 HMAC 签名**（实现：`internal/node/apiauth.go`）。
+删掉注册表 / 水位 / 驱逐归档 / 结果副本、`POST /v1/commands` 让整棵子树执行指令；读接口也暴露拓扑与结果。
 
 判定顺序（前一条命中就不再往下判）：
 
 | # | 请求 | 结果 |
 |---|------|------|
-| ① | `GET /v1/healthz`（存活探针） | **永远放行** |
-| ② | 读请求（`GET`/`HEAD`/`OPTIONS`） | 默认放行；`api.auth.protect_reads: true` 时要签名 |
-| ③ | 出示了被 CA 验过的客户端证书，且 `api.tls.trust_client_cert: true` | 放行（mTLS 已把身份钉死） |
-| ④ | 来自**回环地址**且不像被代理转发过 | 放行 —— 本机脚本、控制台代理、`curl localhost` 全部零改动 |
-| ⑤ | 其余（非回环的写请求） | 必须带签名；**没配密钥 ⇒ 一律拒绝**（403，fail-closed） |
+| ① | `api.tls.require: true` 且请求是明文 | 拒绝（403 `ERR_API_TLS_REQUIRED`），**含回环来源** |
+| ② | `GET /v1/healthz`（存活探针） | **永远放行**（只回 ok / node_id / path，不触发跨节点调用） |
+| ③ | 其余**一切请求（读接口也在内）** | 必须带 `X-Treecmd-Token`，且该 token 能在本节点 `user/` 目录里找到并验签通过；找不到 ⇒ 401 |
+
+**为什么没有"本机免签"**：免签的判据只能是 TCP 对端地址，而这个地址会被**部署形态**改写 ——
+API 端口前面一旦挂了反向代理 / 端口转发（nginx、`ssh -L`、frpc、`kubectl port-forward`…），
+远程请求的对端全都变成 127.0.0.1，"本机"于是成了**所有人**的身份（历史上这里就是这么被绕过的，
+后来加过"转发头检测 + `trusted_proxies` 白名单"来收紧，现已整套删除）。按网络位置区分身份这条路
+本身就不成立，现在只看凭据：**回环、局域网、外网一视同仁**。
+
+凭据由节点的 CA 签发、按人一份，落盘在节点目录的 `user/<用户名>`（目录 0700、文件 0600）：
+
+```bash
+treecmd-node -config root/node.yaml -adduser alice     # 生成 root/user/alice，里面就是 token
+treecmd-node -config root/node.yaml -adduser bob       # 再给一个人
+```
+
+token 内容是一行 `<16 位随机串>.<base64(CA 对 域+用户名+随机串 的 Ed25519 签名)>`：
+文件内容**就是**要出示的凭据（可整份拷给运维机）。**发完不用重启节点** —— API 侧按 `user/` 目录的
+变化自动重扫，删掉文件即刻收回：
+
+```bash
+curl -H "X-Treecmd-Token: $(cat root/user/alice)" http://127.0.0.1:18443/v1/tree
+rm root/user/alice                                        # 收回 alice 的权限（下一次请求即失效）
+```
 
 ```yaml
 api:
-  http_addr: 0.0.0.0:18443
-  auth:
-    secret_path: api.secret     # 从文件读（推荐 600；约定文件 api.secret 存在时**不必写这行**）
-    protect_reads: false        # true = 读接口也要签名
-    loopback_bypass: true       # false = 本机也必须签名（前面挂了反代时的正确选择）
-    trusted_proxies: []         # 可信代理 CIDR；非空才按转发头还原真实来源
-    bind_host: true             # Host 头参与签名（前面是改写 Host 的反代时改 false）
-    channel_binding: auto       # auto|require|off：把签名钉死在这条 TLS 链路上
-  tls:
-    cert_path: certs/api.crt    # 配了 cert+key 就改以 HTTPS 提供
+  http_addr: 0.0.0.0:18443        # 端点只认 token，配置里**没有** auth 段
+  tls:                            # 【可选】不写=明文 HTTP（对外暴露时会打 WARN）
+    cert_path: certs/api.crt      # 配了 cert+key 就改以 HTTPS 提供
     key_path: certs/api.key
-    # ca_path / client_auth: require —— 走 mTLS
-    require: true               # true = 明文请求一律拒绝（**含回环来源**）
+    # ca_path + client_auth: require —— 走 mTLS（只加固传输层，不替代 token）
+    require: true                 # true = 明文请求一律拒绝（含回环来源）
 ```
 
-签名请求头（域分隔 `treecmd/api/v1`，canonical 编码见 `internal/canon`）：
-
-```
-X-Treecmd-Timestamp: <Unix 秒>          # 与服务端时钟差必须在 ±60s 内
-X-Treecmd-Nonce:     <一次性随机串>      # 防时间窗内的重放
-X-Treecmd-Audience:  <目标 node_id>     # **必填**：签名只认"签给谁"
-X-Treecmd-Channel-Binding: <base64>     # 走 HTTPS 时由客户端自动带上
-X-Treecmd-Signature: base64(HMAC-SHA256(secret, payload))
-payload = 域 ‖ 方法 ‖ 路径 ‖ 原始 query ‖ sha256(body) ‖ 时间戳 ‖ nonce
-          ‖ 接收方 ‖ Host ‖ 通道绑定值
-```
-
-响应也签名（`X-Treecmd-Response-Timestamp` / `-Signature`，覆盖状态码 / 路径 / body 摘要 /
-请求 nonce / 响应时间戳）—— 明文链路上中间人可以随手编一个假的 200 让运维以为指令执行了，
-校完这个签名才知道响应确实是那个节点、针对这一次请求回的。
-
-**别手搓签名，用 `scripts/api_call.py`**（零依赖，只用标准库；本机也照签，服务端照验）：
+**跨不可信网络请开 `api.tls`**：token 是长期凭据、每个请求都会上线，明文 HTTP 上被抄走即可原样重放
+（`api.tls.require: true` 能把明文这条路彻底关掉）。用 `scripts/api_call.py` 调（零依赖）：
 
 ```bash
-head -c 32 /dev/urandom | base64 > root/api.secret && chmod 600 root/api.secret   # 生成密钥
-# 本机运维（不配密钥也能跑，回环豁免）：
-curl -s -XPOST localhost:18443/v1/forget?node=<GUID>&mode=stale
-# 远程运维（把 api.secret 拷到运维机，用签名工具；--audience 必填）
-scripts/api_call.py --host 192.168.1.10:18443 --secret-file ./api.secret \
-    --tls --cafile ./ca.crt --audience 0198f0c0-0000-7000-8000-0000abc00002 \
-    POST '/v1/crl?node=<GUID>'
+scripts/api_call.py --host 192.168.1.10:18443 --token-file ./alice \
+    --tls --cafile ./ca.crt POST '/v1/forget?node=<GUID>&mode=stale'
 ```
 
 四条边界要知道：
 
-- **回环豁免看的是 TCP 对端地址**（`RemoteAddr`），而这个地址会被**部署形态**改写 ⇒ API 端口
-  前面挂了本地反向代理 / 端口转发时，所有请求的对端都变成 127.0.0.1。对此有两道闸：带
-  `Forwarded` / `X-Forwarded-For` / `X-Real-IP` / `Via` 的请求**不再免签**（本机 curl 不会带这些
-  头）；确需放行就把代理地址写进 `api.auth.trusted_proxies`，之后按 RFC 7239 从右往左剥可信跳、
-  取真实来源 —— 不是回环就照常要签名。
-- **签名要声明接收方**（`X-Treecmd-Audience`）。防重放的 nonce 表是**每节点一份**的，所以
-  "签给 A 的请求"被转发给共享同一密钥的 B 时，B 会把它当成全新请求**再执行一次**（吊销 / 删数据 /
-  下指令，全是不可逆动作）。把目标 node_id 写进签名后，这类跨节点中继在验签时就断了。
-- **密钥不进 `config_hash`**，而且**每个请求现读文件** ⇒ 换密钥既不用重启、也不用 SIGHUP。
-- **明文 HTTP 只解决"谁有权动手"**，解决不了窃听与响应伪造 ⇒ 跨不可信网络请开 `api.tls`
-  （再叠加通道绑定，中间人换张证书就签不上）。
-  验收这条不变量：`test/api-auth.sh`（本机放行 / 远程 403 / 签名 200 / 错签·过期·重放·audience
-  不符·伪造转发头·缺通道绑定 401）。
+- **token 只能由本节点 CA 签**（`security.ca_key_path`；没有 CA 材料的节点 `-adduser` 会直接失败）。
+  扫描 `user/` 目录时逐份验签，**手动往目录里塞一个自己编的文件不算授权**（目录权限只是第二道）。
+- **收回就删文件**：`rm user/<用户名>`，下一次请求即失效，不需要重启、也不需要碰别的用户。
+  `-adduser` 默认拒绝覆盖已存在的文件（不悄悄换掉在用的凭据），要换一份加 `-force`。
+- **`user/` 目录固定**在节点目录下（与 `state.dat` / `enroll.token` 同级），不进 `config_hash`，
+  也没有配置项 —— 凭据的落点越少一个自由度越不容易配歪。
+- **验收这条不变量**：`test/api-auth.sh`（无 token 401 · 伪造文件 401 · 签发即生效 · 删除即收回 ·
+  转发头不改变结论 · TLS 上仍要 token）。其余打 API 的测试脚本用 `test/lib/apitoken.sh` 现签凭据。
 
 ### 失效节点清理：`/v1/forget`
 
