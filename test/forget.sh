@@ -145,6 +145,27 @@ sleep 3
 chk "重启后仍不含被清的节点" "$(get "http://${ROOT_API}/v1/tree" | grep -c "${LEAF}")" "0"
 
 title '⑨ 批量：POST /v1/forget?all=1'
+# 批量清理的前提是"**确实存在**可清的对象"：在线的一律不删（① 已验过 force 也越不过这条护栏），
+# 所以这里必须先把还活着的那个直接子**真的停掉**、并等 /v1/tree 报 online=false（同 ③ 的手法）。
+#
+# 为什么不能省这一步：本步唯一的候选就是那个还活着的直接子，于是断言变成在赌"它在重启根之后的
+# 3 秒内还没来得及重连"—— 实测同一条用例在同一台机器上**前一次 1、后一次 0**：
+#   · 它先重连上了 → 唯一候选是在线的，被护栏拦住 → 已清=0 → 断言红（但什么都没验错）；
+#   · 它还没重连   → 候选是离线的，被清掉 → 已清=1 → 断言绿（绿得也莫名其妙）。
+kill "$(awk -F: '/^relay:/{print $2}' "${HERE}/.demo.pids")" 2>/dev/null || true
+online=unknown
+for _ in $(seq 1 20); do
+  TREE=$(get "http://${ROOT_API}/v1/tree")
+  online=$(printf '%s' "${TREE}" | py '
+import json,sys
+d=json.load(sys.stdin); want=sys.argv[1]
+print(next((str(c.get("online")).lower() for c in d.get("children") or [] if c.get("node_id")==want), "gone"))
+' "${RELAY}")
+  [ "${online}" = "false" ] && break
+  sleep 0.5
+done
+chk "已有一个真正离线的候选（否则这一条在赌重连速度）" "${online}" "false"
+
 D=$(get -X POST "http://${ROOT_API}/v1/forget?all=1&force=1")
 info "候选=$(field "${D}" '["candidates"]')  已清=$(field "${D}" '["forgotten"]')"
 chk "至少清掉 1 个" \

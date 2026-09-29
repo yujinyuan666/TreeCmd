@@ -139,9 +139,10 @@ wait_registered() {  # <日志> <超时秒> <说明>
   return 1
 }
 
-wait_api() {  # <超时秒>
+wait_api() {  # <超时秒> [地址] —— 地址默认 ${ROOT_API}（多数步骤打的是根），单参数调用处不受影响
+  local addr="${2:-${ROOT_API}}"
   for _ in $(seq 1 $((${1:-20} * 2))); do
-    curl -s -o /dev/null --max-time 1 "http://${ROOT_API}/v1/healthz" 2>/dev/null && return 0
+    curl -s -o /dev/null --max-time 1 "http://${addr}/v1/healthz" 2>/dev/null && return 0
     sleep 0.5
   done
   return 1
@@ -236,6 +237,12 @@ EOF
     sleep 0.25
   done
   [ "${FOUND}" = "1" ] || die "程序没有从证书里解析出 node.id（看 ${LOGS}/autoargs.log）"
+  # 等 HTTP 端点真的在监听再读身份。
+  #
+  # 不能"看到那行日志就立刻 curl"：`node.id 取自证书身份` 是**解析参数阶段**打的，早于绑定端口，
+  # 中间那段窗口里 curl 拿到的是空字符串 —— 于是断言报"运行时身份（空）≠ …"，而程序其实完全正确
+  # （实测在 openEuler aarch64 上命中过一次，整条用例 0 秒就红）。
+  wait_api 15 "${AUTO_API}" || die "零参数起的节点 HTTP API 没起来（看 ${LOGS}/autoargs.log）"
   AUTO_RUN="$(curl -s -m 2 "http://${AUTO_API}/v1/healthz" \
     | python3 -c 'import sys,json;print(json.load(sys.stdin).get("node_id",""))' 2>/dev/null || true)"
   [ "${AUTO_RUN}" = "${AUTO_ID}" ] || die "运行时身份（${AUTO_RUN:-空}）≠ 自动生成的 NodeID（${AUTO_ID}）"
