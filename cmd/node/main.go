@@ -5,6 +5,7 @@
 //	treecmd-node -genkey -keydir keys -with-ca        # 一次性：生成本节点的密钥对（程序启动路径绝不生成）
 //	treecmd-node          -config node.yaml           # 启动（证书暂缺时会先向父入网签发）
 //	treecmd-node -enroll  -config node.yaml           # 只做一次运行期入网（换取证书落盘）后退出
+//	sudo treecmd-node -service install -config node.yaml  # 注册为 systemd 服务并启动（Linux，需 root）
 //	kill -USR1 <pid>                                  # 证书脚本换证后：立刻重载，无需重启
 package main
 
@@ -47,6 +48,7 @@ func main() {
 		withCA   = flag.Bool("with-ca", false, "-genkey 时一并生成 CA 密钥对（有子节点的节点才需要）")
 		addUser  = flag.String("adduser", "", "为某个用户名签发一个 API 访问 token（用本节点 CA 签，写入 <节点目录>/user/<用户名>），然后退出")
 		force    = flag.Bool("force", false, "-genkey 覆盖已存在的密钥文件；-adduser 覆盖已存在的 token 文件")
+		svcFlag  = flag.String("service", "", "服务管理操作（Linux systemd）：install|uninstall|start|stop|restart|status")
 	)
 	flag.Parse()
 
@@ -64,11 +66,19 @@ func main() {
 		}
 		return
 	}
+	if *svcFlag != "" {
+		if err := runServiceCommand(*svcFlag, *cfgPath); err != nil {
+			fmt.Fprintln(os.Stderr, "service FAILED:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if *cfgPath == "" {
 		fmt.Fprintln(os.Stderr, "usage: treecmd-node -config <path/to/node.yaml> [flags]")
 		fmt.Fprintln(os.Stderr, "       treecmd-node -enroll -config node.yaml")
 		fmt.Fprintln(os.Stderr, "       treecmd-node -genkey -keydir keys [-with-ca]")
 		fmt.Fprintln(os.Stderr, "       treecmd-node -config node.yaml -adduser <用户名>")
+		fmt.Fprintln(os.Stderr, "       treecmd-node -config node.yaml -service install   # Linux systemd 服务管理")
 		flag.PrintDefaults()
 		os.Exit(2)
 	}
@@ -160,6 +170,32 @@ func newLogger(level string) *slog.Logger {
 		lvl = slog.LevelInfo
 	}
 	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
+}
+
+// runServiceCommand 分发 -service <操作>：服务管理的统一入口（Linux 上走 systemd）。
+//
+// install 必须带 -config（ExecStart 要落到具体配置文件）；其余操作不依赖配置文件，
+// 纯 systemctl 调用。操作名非法时直接报错并列出合法值。
+//
+// 参数：
+//
+//	action  — install / uninstall / start / stop / restart / status
+//	cfgPath — node.yaml 路径（只有 install 需要，可为空）
+//
+// 返回：
+//
+//	error — 操作未知或底层执行失败时返回
+func runServiceCommand(action, cfgPath string) error {
+	switch action {
+	case "install":
+		return installService(cfgPath)
+	case "uninstall":
+		return uninstallService()
+	case "start", "stop", "restart", "status":
+		return serviceAction(action)
+	default:
+		return fmt.Errorf("未知的 -service 操作 %q（合法值：install|uninstall|start|stop|restart|status）", action)
+	}
 }
 
 // addUserToken 为某个用户名签发 API 访问 token，并落盘到 <节点目录>/user/<用户名>。

@@ -83,6 +83,10 @@ cp examples/node.yaml node.yaml
 ./scripts/start_node.sh reload <node.yaml>     # = kill -USR1：证书脚本换证后立即重载
 ./scripts/start_node.sh conf   <node.yaml>     # = kill -HUP：配置热更
 ./scripts/start_node.sh stop   <node.yaml>
+
+# Linux 服务器也可注册为 systemd 服务（开机自启 + 崩溃自动拉起；uninstall 注销）
+sudo ./bin/treecmd-node -service install -config /opt/treecmd/root/node.yaml
+sudo ./bin/treecmd-node -service status      # start / stop / restart 同理
 ```
 
 > 配置或身份材料有问题时不用提前检查：**启动强校验就在启动路径上** ——
