@@ -107,7 +107,22 @@ api_token_ensure() {
   return 0
 }
 
-# curl —— 包装真正的 curl，自动带上 X-Treecmd-Token。
+# curl —— 包装真正的 curl：自动带上 X-Treecmd-Token，并且**绝不走 http_proxy**。
+#
+# 【为什么必须 --noproxy】本仓库全部请求都指向 127.0.0.1（或本机网卡地址），永远不该经过代理。
+# 但在设了 `http_proxy`/`HTTP_PROXY` 的机器上（开发机很常见，随手的容器/隧道工具都会设），
+# curl 会把**发给回环地址的请求也交给代理**，然后：
+#
+#     curl -s http://127.0.0.1:18493/v1/healthz   # 端口上其实什么都没有
+#     → 代理回 502 Bad Gateway，而 **curl 的退出码是 0**（它只在传输层失败时才非 0）
+#
+# 于是所有"靠退出码判断服务起没起"的写法全部被骗：等待循环立刻返回（其实压根没等到）、
+# `if ! curl … healthz; then 起一个父` 这类分支判断反过来走（父明明没在跑，却当成在跑）。
+# 实测就是这么让 selfupdate.sh 的 readonly 负向用例红的 —— 叶子连不上父，日志里一路
+# `dial tcp 127.0.0.1:19493: connect: connection refused`，而断言在说"没有预期的失败降级"。
+#
+# **读退出码之外还读响应体**的地方更直接：拿到的是 "502 Bad Gateway"，json 解析失败 → 空值。
+# 所以这一条统一收在这里，而不是让每个脚本各自记得写 `--noproxy '*'`（曾经只有 forget.sh 记得）。
 #
 # 调用处自己带了 X-Treecmd-Token 时原样透传（多节点场景靠这个换凭据）。
 curl() {
@@ -118,13 +133,13 @@ curl() {
     esac
   done
   if [ "${have}" = "1" ]; then
-    command curl "$@"
+    command curl --noproxy '*' "$@"
     return $?
   fi
   api_token_ensure || return 1
   if [ -n "${API_TOKEN}" ]; then
-    command curl -H "X-Treecmd-Token: ${API_TOKEN}" "$@"
+    command curl --noproxy '*' -H "X-Treecmd-Token: ${API_TOKEN}" "$@"
   else
-    command curl "$@"
+    command curl --noproxy '*' "$@"
   fi
 }

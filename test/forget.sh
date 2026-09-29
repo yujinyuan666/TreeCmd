@@ -33,8 +33,10 @@ die()   { printf '  \033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 cleanup() { "${HERE}/demo.sh" stop >/dev/null 2>&1 || true; }
 trap cleanup EXIT   # 节点进程只在本次运行的生命周期内存活，必须起树/验证/停树一气呵成
 
-# curl 加 --noproxy：本机 HTTP 不该被 http_proxy 环境变量劫持（那会得到 502）。
-get() { curl -s --noproxy '*' "$@"; }
+# get —— 打本机 API 的统一入口。
+# `--noproxy '*'` 现在由 lib/apitoken.sh 的 curl 包装器统一注入（曾经只有本文件记得写，
+# 于是在别的脚本里又踩了一次：代理接管回环请求、回 502 而 curl 退出码仍是 0）。
+get() { curl -s "$@"; }
 
 chk() { # chk <说明> <实际> <期望>
   if [ "$2" = "$3" ]; then ok "$1（$2）"; else bad "$1：实际=[$2] 期望=[$3]"; fi

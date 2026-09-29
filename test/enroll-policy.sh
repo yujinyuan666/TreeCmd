@@ -127,7 +127,9 @@ restart_root() {
   stop_one root
   start_one root "${WORK}/root"
   for _ in $(seq 1 40); do
-    curl -s -o /dev/null --max-time 1 "http://${ROOT_API}/v1/healthz" 2>/dev/null && return 0
+    # --noproxy 不能省：设了 http_proxy 的机器上，代理会把**发给回环地址的请求也接管**，
+    # 回一个 502 而 curl 退出码仍是 0 —— 这个等待循环会立刻"成功"返回，其实根还没起来。
+    curl -s --noproxy '*' -o /dev/null --max-time 1 "http://${ROOT_API}/v1/healthz" 2>/dev/null && return 0
     sleep 0.5
   done
   die "根没起来（看 ${LOGS}/root.log）"

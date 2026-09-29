@@ -256,7 +256,9 @@ cmd_start() {
   else
     CONSOLE_TOKEN_FILE=""
   fi
-  if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:${CONSOLE_PORT}/" 2>/dev/null; then
+  # --noproxy 不能省：设了 http_proxy 的机器上代理会把发给 127.0.0.1 的请求也接管，回 502
+  # 而 curl 退出码仍是 0 —— 这里会误判成"控制台已经在跑"，于是**不再启动它**。
+  if curl -s --noproxy '*' -o /dev/null --max-time 1 "http://127.0.0.1:${CONSOLE_PORT}/" 2>/dev/null; then
     ok "控制台已在 :${CONSOLE_PORT} 上跑着，不再重复启动"
   else
     # 参数用数组拼（别用 ${VAR:+--token-file "$VAR"} 那种写法：展开里的引号不是引号，

@@ -47,6 +47,16 @@ TERMINAL = {
 }
 
 
+# 探针只打本机（127.0.0.1:18493），**绝不该经过 http_proxy**。
+#
+# 【为什么必须显式关掉】`urllib` 会读 `http_proxy` / `HTTP_PROXY` 环境变量，而开发机上很常见
+# （随手的隧道/容器工具都会设）。此时请求被交给代理，在"端点其实没起来"时会拿到
+# **502 Bad Gateway** 而不是连接失败 —— 探针的报错就变成了 502 而不是"拒连"，排查时会往错方向走；
+# 而且采样 `/metrics` 的时序会被中间那一跳污染，而这个探针量的正是时序。
+# curl 那一侧由 lib/apitoken.sh 的包装器统一加 `--noproxy '*'`；这里绕过了 curl，所以自己关。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def headers_for(token=""):
     """构造请求头：token 非空时带上 X-Treecmd-Token。
 
@@ -85,7 +95,7 @@ def http_json(url, payload=None, timeout=10, token=""):
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             body = resp.read()
             code = resp.status
     except urllib.error.HTTPError as e:
@@ -202,7 +212,7 @@ def main():
         # 采样指标（/metrics 也在访问控制射程内 —— 要带 token）
         try:
             req = urllib.request.Request(base + "/metrics", headers=headers_for(args.token))
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with _OPENER.open(req, timeout=5) as resp:
                 per_child = parse_inflight(resp.read().decode("utf-8", "replace"))
             sampled += 1
             if per_child:
