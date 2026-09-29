@@ -280,43 +280,95 @@ cmd_all() {
   info "证据都在 ${LOGS}/ 下（每个节点一份日志），${WORK}/ 下是各节点目录与各自的二进制"
 }
 
-# readonly_case：叶子以 v1 启动、暂存目录只读 → 拉取必然写不进去 → 必须"继续服务"
+# readonly_case：叶子以 v1 启动、暂存路径写不进去 → 拉取必然失败 → 必须"继续服务"
 readonly_case() {
   mkdir -p "${WORK}/bin" "${LOGS}"
   [ -f "${PIDFILE}" ] || : > "${PIDFILE}"
   [ -x "${BIN}.v1" ] || die "缺 v1 变体，先跑 ./selfupdate.sh prepare"
-  local rook; rook="$(mktemp -d)"; chmod 0555 "${rook}"
+
+  # 单独跑 readonly 时父可能没在跑（cmd_all 退出时 trap 会把根一起停掉）—— 没有父就永远
+  # 没有"不一致"，叶子根本不会去拉镜像，这个负向用例会以"没有预期的失败降级"**假失败**。
+  # 所以按需补起一个根（材料 / 入网许可靠 demo.sh 那套约定补齐）。
+  if ! curl -s --max-time 3 "http://${ROOT_API}/v1/healthz" >/dev/null 2>&1; then
+    [ -x "${BIN}.v2" ] || die "缺 v2 变体，先跑 ./selfupdate.sh prepare"
+    info "父没在跑 → 现起一个（负向用例需要一个父，否则叶子不会去拉镜像）"
+    if [ ! -f "${DEMO}/root/certs/node.crt" ]; then
+      "${REPO}/scripts/init_root.sh" "${DEMO}/root" "${ROOT_ID}" >/dev/null || die "init_root.sh 失败"
+    fi
+    if [ ! -f "${DEMO}/root/enroll.token" ]; then
+      openssl rand -hex 24 > "${DEMO}/root/enroll.token"
+      chmod 600 "${DEMO}/root/enroll.token"
+    fi
+    start_root
+  fi
+
+  # 造一个"写不进去的暂存目录"。
+  #
+  # 【坑】`chmod 0555` 挡不住 root：CAP_DAC_OVERRIDE 让 root 绕过权限位，目录照样可写 ——
+  # 负向用例的前提直接不成立。此时拉取会**成功**，错误后移到替换环节（暂存目录与可执行
+  # 文件不在同一个文件系统时还会 EXDEV："invalid cross-device link"），日志里是
+  # 「替换可执行文件失败」而不是本用例要验的「拉取失败」→ 断言假失败。
+  # 所以先探一下：还写得进去就换成"路径上放一个普通文件"—— 把它当暂存目录用，MkdirAll
+  # 必然报 ENOTDIR，root 也一样建不出来。两条路都落在 pullBinary 的同一个失败返回值上：
+  # 「拉取父的可执行文件失败：继续用当前镜像服务」。
+  local rook
+  rook="$(mktemp -d "${WORK}/ro.XXXXXX")"; chmod 0555 "${rook}"
+  if ( : > "${rook}/probe" ) 2>/dev/null; then
+    info "暂存目录仍可写（程序以 root 运行，0555 挡不住）→ 改用 ENOTDIR 造不可写的暂存路径"
+    rm -f "${rook}/probe"; chmod 0755 "${rook}"; rmdir "${rook}"
+    rook="$(mktemp "${WORK}/ro.XXXXXX")"
+  fi
+
   local dir="${WORK}/leaf-ro"; rm -rf "${dir}"; mkdir -p "${dir}"
   cp "${BIN}.v1" "${WORK}/bin/leaf-ro"; chmod +x "${WORK}/bin/leaf-ro"
-  prepare_child_dir "${dir}" no "${ROOT_LISTEN}" "${ROOT_ID}" "t-leaf-ro" "暂存目录只读" "" \
+  prepare_child_dir "${dir}" no "${ROOT_LISTEN}" "${ROOT_ID}" "t-leaf-ro" "暂存路径不可写" "" \
 "selfupdate:
   enabled: true
   on_mismatch: sync
   dir: ${rook}"
+  # 日志先清空再起：start_bg 是**追加**写，上一轮（或 cmd_all 第 ⑧ 步）留下的
+  # 「拉取失败」行会把这次的断言直接骗过去 —— 正是"假通过"的样子。
+  : > "${LOGS}/leaf-ro.log"
   start_bg leaf-ro "${WORK}/bin/leaf-ro" "${dir}"
   sleep 12
   local p; p="$(pid_of leaf-ro)"
   kill -0 "${p}" 2>/dev/null || die "leaf-ro 死了（预期是继续服务）"
   ok "进程仍存活（pid ${p}）"
   grep -q '拉取父的可执行文件失败' "${LOGS}/leaf-ro.log" \
-    && ok "日志里有"拉取失败 → 继续用当前镜像服务"" || die "没有预期的失败降级（看 ${LOGS}/leaf-ro.log）"
+    && ok "日志里有「拉取失败 → 继续用当前镜像服务」" \
+    || die "没有预期的失败降级（看 ${LOGS}/leaf-ro.log）"
   [ "$(short_hash "${WORK}/bin/leaf-ro")" = "$(short_hash "${BIN}.v1")" ] \
     && ok "它自己的文件没被改动（仍是 v1）"
   grep -q '"target_hash"' "${dir}/state.dat" \
     && ok "state.dat 记下了这次尝试（防重启循环靠它跨 exec 存活）" || warn "state.dat 里没看到 target_hash"
   grep -o '拉取父的可执行文件失败.*' "${LOGS}/leaf-ro.log" | tail -1 || true
   chmod 0755 "${rook}" 2>/dev/null || true; rm -rf "${rook}"
+  return 0
 }
 
 cmd_stop() {
   if [ -f "${PIDFILE}" ]; then
     while IFS=: read -r name pid; do
-      [ -n "${pid}" ] && kill -TERM "${pid}" 2>/dev/null && printf '    已停止 %s (%s)\n' "${name}" "${pid}"
+      [ -n "${pid}" ] || continue
+      if kill -TERM "${pid}" 2>/dev/null; then printf '    已停止 %s (%s)\n' "${name}" "${pid}"; fi
+    done < "${PIDFILE}"
+    # 【等它们真的退出，再返回】TERM 只是"请求"。不等的话，紧接着的一次 `readonly`
+    # 会去 `cp "${BIN}.v1" "${WORK}/bin/leaf-ro"` —— 而上一轮的 leaf-ro 可能还在跑，
+    # 那个路径正好就是它的可执行文件：cp 报 ETXTBSY: Text file busy（踩过）。
+    while IFS=: read -r name pid; do
+      [ -n "${pid}" ] || continue
+      for _ in $(seq 1 60); do kill -0 "${pid}" 2>/dev/null || break; sleep 0.1; done
+      if kill -0 "${pid}" 2>/dev/null; then
+        printf '    %s 不响应 TERM，已 KILL (%s)\n' "${name}" "${pid}"
+        kill -KILL "${pid}" 2>/dev/null || true
+        for _ in $(seq 1 20); do kill -0 "${pid}" 2>/dev/null || break; sleep 0.1; done
+      fi
     done < "${PIDFILE}"
   fi
   rm -f "${PIDFILE}" "${WORK}"/*.pid 2>/dev/null || true
   "${HERE}/demo.sh" stop >/dev/null 2>&1 || true
   ok "已停掉验证用的节点"
+  return 0   # 上面几条 kill 在进程刚消失时可能返回非零，别让 set -e 借此引爆
 }
 
 case "${1:-all}" in

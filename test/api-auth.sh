@@ -81,8 +81,22 @@ contains() { # contains <说明> <文本> <子串>
 }
 
 # ── 本机非回环地址：证"从哪来已经不影响结论" ──────────────────────────────────
+# 判定只看凭据、不看来源地址 —— 要验"换个来源地址结论一样"，就得有一个真的非回环地址去打。
+# 两种系统的取法完全不同（Linux 没有 `route -n get`，macOS 没有 `ip route`），缺一边这个脚本
+# 就会在 0 秒直接 die 在下面那条提示上（而提示看起来像"环境没配好"，不像"脚本只写了 macOS"）。
 detect_lan_ip() {
-  local iface ip
+  local ip iface
+  # Linux：默认出口的源地址最准 —— `ip -4 route get` 的 src 就是它
+  if command -v ip >/dev/null 2>&1; then
+    ip="$(ip -4 route get 1.1.1.1 2>/dev/null \
+          | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+    [ -n "${ip}" ] && { printf '%s' "${ip}"; return 0; }
+  fi
+  # Linux 兜底：hostname -I 列出全部地址，取第一个私有段（避开 docker0 / 网桥之类的）
+  ip="$(hostname -I 2>/dev/null | tr ' ' '\n' \
+        | awk '/^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/{print; exit}')"
+  [ -n "${ip}" ] && { printf '%s' "${ip}"; return 0; }
+  # BSD / macOS：默认路由的网卡 + ipconfig
   for iface in $(route -n get default 2>/dev/null | awk '/interface:/{print $2}') en0 en1 en2; do
     ip="$(ipconfig getifaddr "${iface}" 2>/dev/null || true)"
     [ -n "${ip}" ] && { printf '%s' "${ip}"; return 0; }
@@ -90,7 +104,7 @@ detect_lan_ip() {
   return 1
 }
 LAN_IP="${API_AUTH_LAN_IP:-$(detect_lan_ip || true)}"
-[ -n "${LAN_IP}" ] || die "拿不到本机非回环地址 —— 没有它就验不了'从别的地址来也一样'这件事。可显式给：API_AUTH_LAN_IP=<你的网卡 IP> ./api-auth.sh"
+[ -n "${LAN_IP}" ] || die "拿不到本机非回环地址 —— 没有它就验不了「从别的地址来也一样」这件事。可显式给：API_AUTH_LAN_IP=<你的网卡 IP> ./api-auth.sh"
 
 # ── 进程管理 ────────────────────────────────────────────────────────────────
 start_root() {  # 每次启动前把上一份日志挪走（日志是追加的，留着会让"等日志出现"的断言假通过）
