@@ -60,14 +60,26 @@ api_token_bin() {
   printf '%s' "${REPO:-${HERE}/..}/bin/treecmd-node"
 }
 
-# ensure_api_token —— 还没 token 且有 API_TOKEN_DIR 时现签一份。
+# ensure_api_token —— 没有 token（或那份已经过期作废）时现签一份。
 #
-# 只有在 `<节点目录>/node.yaml` 已经存在时才签：脚本早期那些"等端口起来"的 healthz 探测
-# 可能跑在树被建出来之前，那时连配置都没有，不能因为签不出 token 就把脚本弄挂。
+# 三种情况都要重新签：
+#   · 还没签过；
+#   · `<节点目录>/node.yaml` 还没有 —— 树还没建出来，不签（脚本早期那些"等端口起来"的
+#     healthz 探测会跑在这里，不能因为签不出 token 就把脚本弄挂）；
+#   · **node.yaml 比 token 文件新** —— 树被重建过（`rm -rf demo` 之类），此时 CA 换了，
+#     旧 token 已经不被认（服务端会当"不是本节点 CA 签的"直接忽略）。
+#
+# 为什么值得多这两次 stat：这几条断言失真的代价很高 —— 拿旧 token 去打，看到的是 401，
+# 而 401 在这个项目里正是"访问控制生效"的正常表现，**假失败会伪装成正确答案**。
 api_token_ensure() {
-  [ -n "${API_TOKEN}" ] && return 0
+  local cfg tokfile
   [ -n "${API_TOKEN_DIR}" ] || return 0
-  [ -f "${API_TOKEN_DIR}/node.yaml" ] || return 0
+  cfg="${API_TOKEN_DIR}/node.yaml"
+  [ -f "${cfg}" ] || return 0
+  tokfile="${API_TOKEN_DIR}/user/${API_TOKEN_USER}"
+  if [ -n "${API_TOKEN}" ] && [ -f "${tokfile}" ] && [ ! "${cfg}" -nt "${tokfile}" ]; then
+    return 0
+  fi
   API_TOKEN="$(mint_api_token "$(api_token_bin)" "${API_TOKEN_DIR}")" || return 1
   return 0
 }
